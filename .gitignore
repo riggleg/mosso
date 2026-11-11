@@ -1,0 +1,26 @@
+# Local configuration, credentials, and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+credentials.json
+secrets.json
+**/.aws/
+**/.ssh/
+
+# Runtime databases, journals and Pi sessions
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+data/
+.pi/
+
+# Development outputs
+bin/
+dist/
+coverage.out
+.DS_Store

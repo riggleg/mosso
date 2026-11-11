@@ -1,0 +1,36 @@
+# Security
+
+Mosso runs coding agents capable of executing commands and reading repositories.
+**Treat each agent sandbox as untrusted compute.** The initial MUP is experimental
+and is not suitable for internet-facing deployment.
+
+## Reporting vulnerabilities
+
+Do not post credentials, exploit payloads containing live secrets, or sensitive
+data in public issues. Contact the repository owner privately before disclosure.
+
+## Credential rules
+
+- Never commit actual credentials, `.env` files, private keys, or session recordings
+  that might contain tokens.
+- Inject credentials only at runtime, preferably with short-lived, scoped tokens.
+- Do not place tokens in prompts, command arguments, git remotes, or URLs.
+- Keep GitHub access scoped to the target repository and the permissions needed
+  to create branches and pull requests.
+- Avoid logging environment variables, request bodies containing secrets, agent
+  tool input/output containing secrets, or process command lines containing secrets.
+- Remove credentials and destroy the sandbox when the session ends.
+- If a credential is exposed, **revoke or rotate it immediately**. Removing it
+  from a subsequent commit does not make the exposure safe.
+
+## CI secret scanning
+
+Gitleaks runs on pull requests and pushes to `main` to catch common secret
+patterns. It can miss secrets, and the GitHub history may already contain the
+value by the time CI executes. Local pre-commit scanning and careful credential
+handling are still necessary. AI code review is not a substitute for scanning.
+
+## Initial local server
+
+The MUP server binds to `127.0.0.1` by default and has no authentication.
+Do not bind to a public interface until access control is implemented.
