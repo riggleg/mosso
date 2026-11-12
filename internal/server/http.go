@@ -22,6 +22,10 @@ import (
 // maxCommandBytes bounds the size of a command submitted to /exec.
 const maxCommandBytes = 64 * 1024
 
+// maxSandboxes caps how many sandboxes may exist (or be in creation) at once,
+// bounding the cost of a runaway or buggy local client.
+const maxSandboxes = 5
+
 // Server serves Mosso's HTTP API and tracks the sandboxes it has created so
 // they can be destroyed on shutdown.
 type Server struct {
@@ -29,6 +33,7 @@ type Server struct {
 
 	mu        sync.Mutex
 	sandboxes map[string]vercel.Sandbox
+	creating  int  // creates in flight, counted against maxSandboxes
 	closed    bool // set by Shutdown; later creates are destroyed immediately
 }
 
@@ -144,16 +149,30 @@ func (s *Server) createSandbox(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, fmt.Sprintf("timeout_seconds must be between 0 and %d", maxSeconds))
 		return
 	}
+	// Reserve a slot before calling Vercel so concurrent requests cannot
+	// exceed the limit.
+	s.mu.Lock()
+	if len(s.sandboxes)+s.creating >= maxSandboxes {
+		s.mu.Unlock()
+		writeError(w, http.StatusTooManyRequests,
+			fmt.Sprintf("sandbox limit reached (%d); destroy one before creating another", maxSandboxes))
+		return
+	}
+	s.creating++
+	s.mu.Unlock()
+
 	name := vercel.NewSandboxName()
 	sb, err := s.vercel.Create(r.Context(), name, vercel.CreateOptions{
 		Timeout: time.Duration(req.TimeoutSeconds) * time.Second,
 	})
+	s.mu.Lock()
+	s.creating--
 	if err != nil {
+		s.mu.Unlock()
 		log.Printf("create sandbox %s: %v", name, err)
 		writeError(w, http.StatusBadGateway, err.Error())
 		return
 	}
-	s.mu.Lock()
 	closed := s.closed
 	if !closed {
 		s.sandboxes[sb.Name] = *sb

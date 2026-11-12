@@ -6,7 +6,6 @@
 package vercel
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"crypto/rand"
@@ -269,18 +268,17 @@ func (c *Client) logs(ctx context.Context, path string) (string, string, error) 
 
 	var stdout, stderr limitedBuffer
 	stdout.max, stderr.max = MaxOutputBytes, MaxOutputBytes
-	sc := bufio.NewScanner(resp.Body)
-	sc.Buffer(make([]byte, 64*1024), 4*MaxOutputBytes)
-	for sc.Scan() {
-		line := bytes.TrimSpace(sc.Bytes())
-		if len(line) == 0 {
-			continue
-		}
+	// A json.Decoder reads newline-delimited JSON with no per-line size limit,
+	// so one very large log chunk cannot fail the whole exec.
+	dec := json.NewDecoder(resp.Body)
+	for {
 		var entry struct {
 			Stream string          `json:"stream"`
 			Data   json.RawMessage `json:"data"`
 		}
-		if err := json.Unmarshal(line, &entry); err != nil {
+		if err := dec.Decode(&entry); err == io.EOF {
+			break
+		} else if err != nil {
 			return "", "", fmt.Errorf("decode log line: %w", err)
 		}
 		switch entry.Stream {
@@ -302,9 +300,6 @@ func (c *Client) logs(ctx context.Context, path string) (string, string, error) 
 			_ = json.Unmarshal(entry.Data, &e)
 			return "", "", fmt.Errorf("log stream error %s: %s", e.Code, e.Message)
 		}
-	}
-	if err := sc.Err(); err != nil {
-		return "", "", err
 	}
 	return stdout.String(), stderr.String(), nil
 }

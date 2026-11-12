@@ -72,6 +72,8 @@ Sandboxes are billed while running, so Mosso layers several safeguards:
   default) after which Vercel stops it, even if Mosso crashes.
   Mosso caps the timeout at 45 minutes, the Vercel Hobby plan maximum, so it
   works on every plan; Pro/Enterprise allow longer, but Mosso does not request it.
+- **Limit**: at most 5 sandboxes exist at once; further `POST /sandboxes`
+  requests get `429` until one is destroyed.
 - **Non-persistent**: sandboxes are created with `persistent: false`, so no
   snapshots are kept after they stop.
 - **Create failures**: Mosso picks the sandbox name before calling Vercel. If the

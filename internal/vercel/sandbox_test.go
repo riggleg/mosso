@@ -302,3 +302,21 @@ func TestDestroyStopRequestSendsEmptyJSONBody(t *testing.T) {
 		t.Errorf("second request = %s %s %v, want DELETE with projectId", del.Method, del.Path, del.Query)
 	}
 }
+
+func TestExecHandlesLogLineLargerThanOutputCap(t *testing.T) {
+	f, c := newFakeAPI(t)
+	f.handle("POST /v2/sandboxes/sessions/sbx_1/cmd", reply(200, `{"command":{"id":"cmd_1","exitCode":0}}`))
+	big := strings.Repeat("x", 5*MaxOutputBytes) // one log line well past any line-scanner limit
+	f.handle("GET /v2/sandboxes/sessions/sbx_1/cmd/cmd_1/logs", reply(200,
+		`{"stream":"stdout","data":"`+big+`"}`+"\n"+`{"stream":"stderr","data":"done"}`+"\n"))
+	res, err := c.Exec(context.Background(), "sbx_1", "cat big")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(res.Stdout, strings.Repeat("x", MaxOutputBytes)) || !strings.HasSuffix(res.Stdout, "[mosso: output truncated]") {
+		t.Fatalf("stdout not truncated as expected (len %d)", len(res.Stdout))
+	}
+	if res.Stderr != "done" {
+		t.Fatalf("stderr = %q, want later lines still read", res.Stderr)
+	}
+}

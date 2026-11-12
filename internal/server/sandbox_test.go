@@ -193,3 +193,48 @@ func TestCreateAfterShutdownIsDestroyed(t *testing.T) {
 		t.Fatalf("created=%v deleted=%v, want the late sandbox destroyed", fake.created, fake.deleted)
 	}
 }
+
+func TestSandboxLimit(t *testing.T) {
+	srv, fake := newTestServer(t)
+	h := srv.Handler()
+	var last vercel.Sandbox
+	for i := 0; i < maxSandboxes; i++ {
+		rec := do(t, h, http.MethodPost, "/sandboxes", "")
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("create %d: status = %d", i, rec.Code)
+		}
+		_ = json.Unmarshal(rec.Body.Bytes(), &last)
+	}
+	if rec := do(t, h, http.MethodPost, "/sandboxes", ""); rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("create over limit: status = %d, want 429", rec.Code)
+	}
+	if len(fake.created) != maxSandboxes {
+		t.Fatalf("Vercel saw %d creates, want %d", len(fake.created), maxSandboxes)
+	}
+	// Destroying one frees a slot.
+	if rec := do(t, h, http.MethodDelete, "/sandboxes/"+last.Name, ""); rec.Code != http.StatusNoContent {
+		t.Fatalf("destroy status = %d", rec.Code)
+	}
+	if rec := do(t, h, http.MethodPost, "/sandboxes", ""); rec.Code != http.StatusCreated {
+		t.Fatalf("create after destroy: status = %d", rec.Code)
+	}
+}
+
+func TestSandboxLimitConcurrent(t *testing.T) {
+	srv, fake := newTestServer(t)
+	h := srv.Handler()
+	var wg sync.WaitGroup
+	for i := 0; i < 3*maxSandboxes; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			do(t, h, http.MethodPost, "/sandboxes", "")
+		}()
+	}
+	wg.Wait()
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if len(fake.created) > maxSandboxes {
+		t.Fatalf("Vercel saw %d creates, want at most %d", len(fake.created), maxSandboxes)
+	}
+}
