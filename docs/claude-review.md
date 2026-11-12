@@ -45,6 +45,8 @@ succeeds without reviewing.
 - Never paste the key into the workflow, a commit, an issue or a PR comment. If
   it is exposed, revoke it in the Anthropic Console immediately and create a new
   one; deleting it from a later commit is not enough.
+- Only pull requests opened by `riggleg` are reviewed, to limit cost and
+  exposure. Edit the job's `if:` condition in the workflow to change this.
 - Pull requests from forks are skipped: GitHub does not pass secrets to them, and
   the workflow intentionally does not use `pull_request_target`, which would run
   with secrets on untrusted code.
