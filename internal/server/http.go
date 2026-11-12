@@ -140,8 +140,8 @@ func (s *Server) createSandbox(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if req.TimeoutSeconds < 0 || req.TimeoutSeconds > 5*60*60 {
-		writeError(w, http.StatusBadRequest, "timeout_seconds must be between 0 and 18000")
+	if maxSeconds := int(vercel.MaxTimeout.Seconds()); req.TimeoutSeconds < 0 || req.TimeoutSeconds > maxSeconds {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("timeout_seconds must be between 0 and %d", maxSeconds))
 		return
 	}
 	name := vercel.NewSandboxName()

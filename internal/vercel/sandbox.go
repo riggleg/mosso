@@ -24,13 +24,17 @@ import (
 )
 
 const (
-	// DefaultBaseURL is the Vercel API base used by the official SDK.
-	DefaultBaseURL = "https://vercel.com/api"
+	// DefaultBaseURL is Vercel's documented public REST API endpoint.
+	DefaultBaseURL = "https://api.vercel.com"
 	// DefaultRuntime is the sandbox image used when none is requested.
 	DefaultRuntime = "node22"
 	// DefaultTimeout is how long Vercel keeps a sandbox alive before stopping
 	// it on its own. It is the backstop against abandoned, chargeable sandboxes.
 	DefaultTimeout = 10 * time.Minute
+	// MaxTimeout is the longest sandbox lifetime Mosso will request. It is the
+	// Vercel Hobby plan limit (Pro/Enterprise allow more), so requests work on
+	// every plan and a forgotten sandbox cannot run for hours.
+	MaxTimeout = 45 * time.Minute
 	// MaxOutputBytes caps how much stdout/stderr is kept per stream.
 	MaxOutputBytes = 1 << 20
 
@@ -156,6 +160,9 @@ func (c *Client) Create(ctx context.Context, name string, opts CreateOptions) (s
 	}
 	if opts.Timeout <= 0 {
 		opts.Timeout = DefaultTimeout
+	}
+	if opts.Timeout > MaxTimeout {
+		return nil, fmt.Errorf("create sandbox: timeout %s exceeds the %s maximum", opts.Timeout, MaxTimeout)
 	}
 	body := map[string]any{
 		"projectId":  c.cfg.ProjectID,

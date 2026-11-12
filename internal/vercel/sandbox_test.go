@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 const testToken = "test-token-value"
@@ -256,5 +257,15 @@ func TestLimitedBufferKeepsUTF8Valid(t *testing.T) {
 	b.WriteString("aé") // 'é' is 2 bytes, so only "a" fits
 	if got := b.String(); got != "a\n[mosso: output truncated]" {
 		t.Fatalf("got %q", got)
+	}
+}
+
+func TestCreateRejectsTimeoutAboveMax(t *testing.T) {
+	f, c := newFakeAPI(t)
+	if _, err := c.Create(context.Background(), "mosso-abc", CreateOptions{Timeout: MaxTimeout + time.Second}); err == nil {
+		t.Fatal("expected error")
+	}
+	if got := f.calls(); len(got) != 0 {
+		t.Fatalf("calls = %v, want none", got)
 	}
 }

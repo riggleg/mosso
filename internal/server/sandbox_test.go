@@ -143,11 +143,16 @@ func TestExecValidationAndErrors(t *testing.T) {
 
 func TestCreateRejectsBadTimeout(t *testing.T) {
 	srv, fake := newTestServer(t)
-	if rec := do(t, srv.Handler(), http.MethodPost, "/sandboxes", `{"timeout_seconds":-1}`); rec.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d", rec.Code)
+	for _, body := range []string{`{"timeout_seconds":-1}`, `{"timeout_seconds":2701}`} {
+		if rec := do(t, srv.Handler(), http.MethodPost, "/sandboxes", body); rec.Code != http.StatusBadRequest {
+			t.Fatalf("%s: status = %d", body, rec.Code)
+		}
 	}
-	if len(fake.created) != 0 {
-		t.Fatal("sandbox should not be created")
+	if rec := do(t, srv.Handler(), http.MethodPost, "/sandboxes", `{"timeout_seconds":2700}`); rec.Code != http.StatusCreated {
+		t.Fatalf("45 minutes: status = %d", rec.Code)
+	}
+	if len(fake.created) != 1 {
+		t.Fatalf("created %d sandboxes, want only the valid request to create one", len(fake.created))
 	}
 }
 
