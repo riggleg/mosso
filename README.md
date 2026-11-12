@@ -6,4 +6,4 @@ The initial Minimum Usable Product (MUP) will run Pi in a Vercel Sandbox, offer 
 
 > Early development. No usable agent workflow has been implemented yet.
 
-See [docs/mup.md](docs/mup.md) for the first milestone and [SECURITY.md](SECURITY.md) for credential handling rules.
+See [docs/mup.md](docs/mup.md) for the first milestone and [SECURITY.md](SECURITY.md) for credential handling rules. Pull requests are reviewed automatically by Claude Code; see [docs/claude-review.md](docs/claude-review.md) for setup.
