@@ -16,7 +16,7 @@ implementations are acceptable for this first version.
 
 ## P0 acceptance criteria
 
-- [ ] Provision and destroy a Vercel Sandbox; prevent abandoned chargeable resources.
+- [x] Provision and destroy a Vercel Sandbox; prevent abandoned chargeable resources.
 - [ ] Securely provide runtime GitHub and model credentials without exposing them
       in prompts, URLs, process listings, or logs.
 - [ ] Clone a selected repository in the sandbox.
@@ -42,8 +42,10 @@ web interface once the end-to-end path works.
 
 ## Current skeleton
 
-`cmd/mosso`: localhost-only HTTP server with `GET /healthz`.
+`cmd/mosso`: localhost-only HTTP server with `GET /healthz` and Vercel Sandbox
+endpoints (see [vercel-sandbox.md](vercel-sandbox.md)).
 `cmd/mosso-worker`: placeholder binary, **not yet connected to Pi**.
-`internal/server`: minimal HTTP package and tests.
+`internal/server`: HTTP API and tests.
+`internal/vercel`: minimal Vercel Sandbox REST client (create, exec, destroy).
 
-No provisioning, persistence, chat, PR creation, or secret injection exists yet.
+No persistence, chat, PR creation, or secret injection into sandboxes exists yet.
