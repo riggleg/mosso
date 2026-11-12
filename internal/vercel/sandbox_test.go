@@ -250,3 +250,11 @@ func TestLimitedBuffer(t *testing.T) {
 		t.Fatalf("got %q", got)
 	}
 }
+
+func TestLimitedBufferKeepsUTF8Valid(t *testing.T) {
+	b := limitedBuffer{max: 2}
+	b.WriteString("aé") // 'é' is 2 bytes, so only "a" fits
+	if got := b.String(); got != "a\n[mosso: output truncated]" {
+		t.Fatalf("got %q", got)
+	}
+}

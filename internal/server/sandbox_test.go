@@ -173,3 +173,18 @@ func TestSandboxEndpointsWithoutCredentials(t *testing.T) {
 		t.Fatalf("status = %d, want 503", rec.Code)
 	}
 }
+
+func TestCreateAfterShutdownIsDestroyed(t *testing.T) {
+	srv, fake := newTestServer(t)
+	if err := srv.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	// Simulates a create request that was in flight when Shutdown ran.
+	rec := do(t, srv.Handler(), http.MethodPost, "/sandboxes", "")
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503: %s", rec.Code, rec.Body)
+	}
+	if len(fake.created) != 1 || len(fake.deleted) != 1 || fake.deleted[0] != fake.created[0] {
+		t.Fatalf("created=%v deleted=%v, want the late sandbox destroyed", fake.created, fake.deleted)
+	}
+}

@@ -29,6 +29,7 @@ type Server struct {
 
 	mu        sync.Mutex
 	sandboxes map[string]vercel.Sandbox
+	closed    bool // set by Shutdown; later creates are destroyed immediately
 }
 
 // New returns a Server. client may be nil, in which case sandbox endpoints
@@ -153,8 +154,21 @@ func (s *Server) createSandbox(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.mu.Lock()
-	s.sandboxes[sb.Name] = *sb
+	closed := s.closed
+	if !closed {
+		s.sandboxes[sb.Name] = *sb
+	}
 	s.mu.Unlock()
+	if closed {
+		// Shutdown already ran its destroy pass; don't leave this one behind.
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), time.Minute)
+		defer cancel()
+		if err := s.vercel.Destroy(ctx, *sb); err != nil {
+			log.Printf("destroy sandbox %s created during shutdown: %v", sb.Name, err)
+		}
+		writeError(w, http.StatusServiceUnavailable, "server is shutting down")
+		return
+	}
 	log.Printf("created sandbox %s (session %s)", sb.Name, sb.SessionID)
 	writeJSON(w, http.StatusCreated, sb)
 }
@@ -227,6 +241,7 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		return nil
 	}
 	s.mu.Lock()
+	s.closed = true
 	pending := make([]vercel.Sandbox, 0, len(s.sandboxes))
 	for _, sb := range s.sandboxes {
 		pending = append(pending, sb)

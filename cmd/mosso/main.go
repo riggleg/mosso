@@ -56,11 +56,19 @@ func main() {
 	}
 	stop()
 
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	defer cancel()
-	_ = httpSrv.Shutdown(shutdownCtx)
+	// Give in-flight requests a short grace period, then cut them off so a
+	// long-running /exec cannot eat into the time needed for cleanup.
+	drainCtx, cancelDrain := context.WithTimeout(context.Background(), 10*time.Second)
+	if err := httpSrv.Shutdown(drainCtx); err != nil {
+		_ = httpSrv.Close()
+	}
+	cancelDrain()
+
 	// Destroy any sandboxes still running so they do not keep accruing charges.
-	if err := srv.Shutdown(shutdownCtx); err != nil {
+	// This uses its own deadline so a slow drain cannot leave it pre-expired.
+	destroyCtx, cancelDestroy := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancelDestroy()
+	if err := srv.Shutdown(destroyCtx); err != nil {
 		log.Printf("some sandboxes could not be destroyed; check the Vercel dashboard: %v", err)
 	}
 	if exitErr != nil {

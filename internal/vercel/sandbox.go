@@ -20,6 +20,7 @@ import (
 	"os"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 const (
@@ -393,7 +394,12 @@ type limitedBuffer struct {
 
 func (b *limitedBuffer) WriteString(s string) {
 	if room := b.max - b.buf.Len(); room < len(s) {
-		s = s[:max(room, 0)]
+		room = max(room, 0)
+		// Back up to a rune boundary so the output stays valid UTF-8.
+		for room > 0 && !utf8.RuneStart(s[room]) {
+			room--
+		}
+		s = s[:room]
 		b.truncated = true
 	}
 	b.buf.WriteString(s)
