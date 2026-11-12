@@ -33,4 +33,7 @@ handling are still necessary. AI code review is not a substitute for scanning.
 ## Initial local server
 
 The MUP server binds to `127.0.0.1` by default and has no authentication.
-Do not bind to a public interface until access control is implemented.
+Mosso refuses to start on a non-loopback address, and rejects requests with a
+non-loopback `Host` or `Origin` header or a non-JSON `POST` body, to block
+browser-based CSRF and DNS rebinding. Do not work around these checks until
+access control is implemented.

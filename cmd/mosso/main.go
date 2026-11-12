@@ -22,6 +22,9 @@ func main() {
 	}
 	addr := flag.String("listen", defaultAddr, "HTTP listen address")
 	flag.Parse()
+	if err := server.CheckListenAddr(*addr); err != nil {
+		log.Fatal(err)
+	}
 
 	var client *vercel.Client
 	if cfg, err := vercel.ConfigFromEnv(); err != nil {

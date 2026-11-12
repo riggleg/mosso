@@ -68,8 +68,12 @@ func newTestServer(t *testing.T) (*Server, *fakeVercel) {
 
 func do(t *testing.T, h http.Handler, method, path, body string) *httptest.ResponseRecorder {
 	t.Helper()
+	req := httptest.NewRequest(method, "http://127.0.0.1:8080"+path, strings.NewReader(body))
+	if method == http.MethodPost {
+		req.Header.Set("Content-Type", "application/json")
+	}
 	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest(method, path, strings.NewReader(body)))
+	h.ServeHTTP(rec, req)
 	return rec
 }
 

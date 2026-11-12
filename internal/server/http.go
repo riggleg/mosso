@@ -5,9 +5,14 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
+	"mime"
+	"net"
 	"net/http"
+	"net/url"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -46,7 +51,60 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /sandboxes", s.requireVercel(s.createSandbox))
 	mux.HandleFunc("POST /sandboxes/{name}/exec", s.requireVercel(s.execSandbox))
 	mux.HandleFunc("DELETE /sandboxes/{name}", s.requireVercel(s.destroySandbox))
-	return mux
+	return localOnly(mux)
+}
+
+// CheckListenAddr rejects listen addresses that are not loopback. The server
+// has no authentication, so it must not be reachable from other machines.
+func CheckListenAddr(addr string) error {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("invalid listen address %q: %w", addr, err)
+	}
+	if !isLoopbackHost(host) {
+		return fmt.Errorf("refusing to listen on non-loopback address %q: the server has no authentication", addr)
+	}
+	return nil
+}
+
+func isLoopbackHost(host string) bool {
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(strings.Trim(host, "[]"))
+	return ip != nil && ip.IsLoopback()
+}
+
+// localOnly protects the unauthenticated API from browsers: it rejects
+// requests whose Host is not loopback (DNS rebinding), cross-origin requests
+// from non-loopback pages, and POSTs without a JSON content type (which would
+// otherwise be "simple" cross-site requests sent without a CORS preflight).
+func localOnly(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		host := r.Host
+		if h, _, err := net.SplitHostPort(host); err == nil {
+			host = h
+		}
+		if !isLoopbackHost(host) {
+			writeError(w, http.StatusForbidden, "requests must be addressed to a loopback host")
+			return
+		}
+		if origin := r.Header.Get("Origin"); origin != "" {
+			u, err := url.Parse(origin)
+			if err != nil || !isLoopbackHost(u.Hostname()) {
+				writeError(w, http.StatusForbidden, "cross-origin requests are not allowed")
+				return
+			}
+		}
+		if r.Method == http.MethodPost {
+			mt, _, _ := mime.ParseMediaType(r.Header.Get("Content-Type"))
+			if mt != "application/json" {
+				writeError(w, http.StatusUnsupportedMediaType, "Content-Type must be application/json")
+				return
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func (s *Server) requireVercel(h http.HandlerFunc) http.HandlerFunc {

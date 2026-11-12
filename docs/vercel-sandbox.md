@@ -35,11 +35,11 @@ shell commands in it, and destroy it through its local HTTP API. The Go client i
 
 ```bash
 # 1. Provision a sandbox (optional body: {"timeout_seconds": 300})
-curl -s -X POST localhost:8080/sandboxes
+curl -s -X POST -H 'Content-Type: application/json' localhost:8080/sandboxes
 # {"name":"mosso-1a2b3c4d5e6f","session_id":"sbx_...","status":"pending","created_at":"..."}
 
 # 2. Run a command
-curl -s -X POST localhost:8080/sandboxes/mosso-1a2b3c4d5e6f/exec -d '{"command":"echo hello"}'
+curl -s -X POST -H 'Content-Type: application/json' localhost:8080/sandboxes/mosso-1a2b3c4d5e6f/exec -d '{"command":"echo hello"}'
 # {"command_id":"cmd_...","exit_code":0,"stdout":"hello\n","stderr":""}
 
 # 3. Destroy it
@@ -54,6 +54,11 @@ curl -s -X DELETE localhost:8080/sandboxes/mosso-1a2b3c4d5e6f   # 204 No Content
 | `GET /sandboxes`                | List sandboxes created by this Mosso process that have not been destroyed. |
 | `POST /sandboxes/{name}/exec`   | Run `{"command": "..."}` with `bash -c`; waits and returns `exit_code`, `stdout`, `stderr` (each capped at 1 MiB). |
 | `DELETE /sandboxes/{name}`      | Stop the running session and delete the sandbox.                            |
+
+`POST` requests must send `Content-Type: application/json`. Mosso also rejects
+requests whose `Host` or `Origin` is not loopback, so a web page you visit cannot
+drive the API (CSRF / DNS rebinding), and it refuses to start on a non-loopback
+`-listen`/`MOSSO_LISTEN` address because the API has no authentication.
 
 A non-zero exit code is a successful `200` response; `502` means the Vercel API
 call itself failed. Command text is not logged, but stdout/stderr are returned
