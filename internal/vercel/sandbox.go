@@ -332,6 +332,11 @@ func (c *Client) deleteSandbox(ctx context.Context, name string) error {
 
 // doJSON sends a JSON request and decodes a JSON response into out (if non-nil).
 func (c *Client) doJSON(ctx context.Context, method, path string, q url.Values, in, out any) error {
+	if in == nil && method == http.MethodPost {
+		// Vercel rejects body-less POSTs (e.g. /stop) with 415 Unsupported
+		// Media Type, so always send an empty JSON object.
+		in = struct{}{}
+	}
 	var body io.Reader
 	if in != nil {
 		b, err := json.Marshal(in)

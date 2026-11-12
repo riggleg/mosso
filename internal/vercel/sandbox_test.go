@@ -16,10 +16,12 @@ import (
 const testToken = "test-token-value"
 
 type recordedRequest struct {
-	Method string
-	Path   string
-	Query  map[string][]string
-	Body   map[string]any
+	Method      string
+	Path        string
+	Query       map[string][]string
+	ContentType string
+	RawBody     string
+	Body        map[string]any
 }
 
 // fakeAPI is a scripted stand-in for the Vercel Sandbox API.
@@ -47,13 +49,20 @@ func (f *fakeAPI) serve(w http.ResponseWriter, r *http.Request) {
 	if got := r.URL.Query().Get("teamId"); got != "team_1" {
 		f.t.Errorf("%s %s: teamId = %q", r.Method, r.URL.Path, got)
 	}
-	rec := recordedRequest{Method: r.Method, Path: r.URL.Path, Query: r.URL.Query()}
-	if b, _ := io.ReadAll(r.Body); len(b) > 0 {
+	rec := recordedRequest{Method: r.Method, Path: r.URL.Path, Query: r.URL.Query(), ContentType: r.Header.Get("Content-Type")}
+	b, _ := io.ReadAll(r.Body)
+	rec.RawBody = string(b)
+	if len(b) > 0 {
 		_ = json.Unmarshal(b, &rec.Body)
 	}
 	f.mu.Lock()
 	f.requests = append(f.requests, rec)
 	f.mu.Unlock()
+	// Like the real API, reject POSTs that are not a JSON body.
+	if r.Method == http.MethodPost && (rec.ContentType != "application/json" || !json.Valid(b)) {
+		http.Error(w, `{"error":{"message":"Unsupported Media Type"}}`, http.StatusUnsupportedMediaType)
+		return
+	}
 	h, ok := f.routes[r.Method+" "+r.URL.Path]
 	if !ok {
 		http.Error(w, `{"error":{"message":"not found"}}`, http.StatusNotFound)
@@ -267,5 +276,29 @@ func TestCreateRejectsTimeoutAboveMax(t *testing.T) {
 	}
 	if got := f.calls(); len(got) != 0 {
 		t.Fatalf("calls = %v, want none", got)
+	}
+}
+
+// Regression test: Vercel answered a body-less POST /stop with 415, which made
+// DELETE /sandboxes/{name} fail even though the sandbox was cleaned up.
+func TestDestroyStopRequestSendsEmptyJSONBody(t *testing.T) {
+	f, c := newFakeAPI(t)
+	f.handle("POST /v2/sandboxes/sessions/sbx_1/stop", reply(200, `{"session":{"id":"sbx_1","status":"stopping"}}`))
+	f.handle("DELETE /v2/sandboxes/mosso-abc", reply(200, `{"sandbox":{}}`))
+	if err := c.Destroy(context.Background(), Sandbox{Name: "mosso-abc", SessionID: "sbx_1"}); err != nil {
+		t.Fatalf("Destroy = %v, want nil when stop and delete succeed", err)
+	}
+	stop := f.requests[0]
+	if stop.Method != http.MethodPost || stop.Path != "/v2/sandboxes/sessions/sbx_1/stop" {
+		t.Fatalf("first request = %s %s, want POST stop", stop.Method, stop.Path)
+	}
+	if stop.ContentType != "application/json" {
+		t.Errorf("stop Content-Type = %q, want application/json", stop.ContentType)
+	}
+	if stop.RawBody != "{}" {
+		t.Errorf("stop body = %q, want {}", stop.RawBody)
+	}
+	if del := f.requests[1]; del.Method != http.MethodDelete || del.Query["projectId"][0] != "prj_1" {
+		t.Errorf("second request = %s %s %v, want DELETE with projectId", del.Method, del.Path, del.Query)
 	}
 }
