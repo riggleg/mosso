@@ -18,11 +18,12 @@ jobs:
   review:
     name: Claude review
     # Secrets are not available to pull requests from forks; only review
-    # branches pushed to this repository, and only PRs opened by the
-    # maintainer, to limit cost and exposure.
+    # branches pushed to this repository, and only PRs opened and updated by
+    # the maintainer, to limit cost and exposure.
     if: |
       github.event.pull_request.head.repo.full_name == github.repository &&
-      github.event.pull_request.user.login == 'riggleg'
+      github.event.pull_request.user.login == 'riggleg' &&
+      github.actor == 'riggleg'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
