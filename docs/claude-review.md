@@ -13,38 +13,46 @@ it does not replace secret scanning.
 
 ## Configure secrets
 
-Only one repository secret is required:
+The review runs on a Claude Pro/Max subscription, so it uses subscription
+usage limits instead of pay-as-you-go API billing. Only one repository secret is
+required:
 
-| Secret              | Purpose                              |
-| ------------------- | ------------------------------------ |
-| `ANTHROPIC_API_KEY` | Authenticates the action to Claude.  |
+| Secret                    | Purpose                                                  |
+| ------------------------- | -------------------------------------------------------- |
+| `CLAUDE_CODE_OAUTH_TOKEN` | Authenticates the action to Claude with the subscription. |
 
-1. Create an API key in the [Anthropic Console](https://console.anthropic.com/).
-   Use a dedicated key for this repository and set a spend limit on its
-   workspace.
+1. On your own machine, signed in to Claude Code with the subscription account,
+   run `claude setup-token`. It opens a browser login and prints a long-lived
+   token starting with `sk-ant-oat01-`.
 2. In GitHub, open **Settings → Secrets and variables → Actions → New repository
    secret**.
-3. Name it `ANTHROPIC_API_KEY`, paste the key and save.
+3. Name it `CLAUDE_CODE_OAUTH_TOKEN`, paste the token and save.
 
 Or with the GitHub CLI (prompts for the value, so it stays out of shell history):
 
 ```bash
-gh secret set ANTHROPIC_API_KEY --repo riggleg/mosso
+gh secret set CLAUDE_CODE_OAUTH_TOKEN --repo riggleg/mosso
 ```
+
+Do not put the subscription token in `ANTHROPIC_API_KEY`: that input expects a
+Console API key (`sk-ant-api03-…`), which is billed per token, and the
+subscription token is rejected there. If an `ANTHROPIC_API_KEY` secret exists
+only for this workflow, delete it so nothing falls back to API billing.
 
 GitHub access uses the workflow's built-in `GITHUB_TOKEN`, scoped to
 `contents: read` and `pull-requests: write` for the review job. No personal
 access token or extra GitHub App is needed. Comments appear from
 `github-actions[bot]`.
 
-Until `ANTHROPIC_API_KEY` is set, the job runs a single notice step and
+Until `CLAUDE_CODE_OAUTH_TOKEN` is set, the job runs a single notice step and
 succeeds without reviewing.
 
 ## Security notes
 
-- Never paste the key into the workflow, a commit, an issue or a PR comment. If
-  it is exposed, revoke it in the Anthropic Console immediately and create a new
-  one; deleting it from a later commit is not enough.
+- Never paste the token into the workflow, a commit, an issue or a PR comment. If
+  it is exposed, revoke it immediately (log out other sessions / revoke it from
+  your Claude account settings) and run `claude setup-token` again; deleting it
+  from a later commit is not enough.
 - Only pull requests opened by `riggleg`, on events triggered by `riggleg`
   (for example their own pushes), are reviewed, to limit cost and exposure.
   A commit pushed by someone else is reviewed on `riggleg`'s next push. This
