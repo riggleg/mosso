@@ -24,6 +24,12 @@ data in public issues. Contact the repository owner privately before disclosure.
   to a sandbox only in the environment of the Claude Code process. Code running
   in that sandbox can still read it, so only run Claude on trusted content; see
   [docs/claude-code.md](docs/claude-code.md#security-model-and-limitations).
+- The GitHub token (a fine-grained personal access token limited to the target
+  repositories, with Contents and Pull requests write access) is stored in the
+  macOS Keychain. It is used by the Mosso server for pushes and pull requests
+  through the GitHub API. It enters a sandbox only in the environment of the
+  initial `git clone` of a private repository, before any agent or repository
+  code runs there; see [docs/github.md](docs/github.md#security-model-and-limitations).
 - If a credential is exposed, **revoke or rotate it immediately**. Removing it
   from a subsequent commit does not make the exposure safe.
 

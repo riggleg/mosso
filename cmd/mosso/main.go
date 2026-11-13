@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/riggleg/mosso/internal/claude"
+	"github.com/riggleg/mosso/internal/github"
 	"github.com/riggleg/mosso/internal/server"
 	"github.com/riggleg/mosso/internal/vercel"
 )
@@ -45,6 +46,11 @@ func main() {
 		log.Printf("Claude Code messages disabled until a token is configured: %v", err)
 	} else {
 		log.Printf("Claude Code token found (%s)", source)
+	}
+	if _, source, err := github.LoadToken(context.Background()); err != nil {
+		log.Printf("GitHub workspaces disabled until a token is configured: %v", err)
+	} else {
+		log.Printf("GitHub token found (%s)", source)
 	}
 	srv := server.New(client)
 	httpSrv := &http.Server{Addr: *addr, Handler: srv.Handler(), ReadHeaderTimeout: 10 * time.Second}

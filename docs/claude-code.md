@@ -6,7 +6,8 @@ authenticate once on your Mac. Every sandbox then reuses that login, and a
 conversation can continue across messages by its session ID.
 
 The code lives in `internal/claude`; the HTTP endpoints are in
-`internal/server/claude.go`.
+`internal/server/claude.go`. To run Claude on a GitHub repository and open a
+pull request, use a workspace; see [github.md](github.md).
 
 ## How it works
 
@@ -27,7 +28,8 @@ The code lives in `internal/claude`; the HTTP endpoints are in
    (`curl -fsSL https://claude.ai/install.sh | bash -s stable`) into
    `~/.local/bin`, unmodified. This adds some time to the first message and
    does not use the token.
-4. **Run**: each message is one non-interactive run in `/vercel/sandbox`:
+4. **Run**: each message is one non-interactive run in `/vercel/sandbox` (or
+   the repository checkout, for a workspace):
 
    ```
    claude -p --output-format stream-json --verbose --permission-mode bypassPermissions [--resume <session_id>]

@@ -18,12 +18,17 @@ implementations are acceptable for this first version.
 
 - [x] Provision and destroy a Vercel Sandbox; prevent abandoned chargeable resources.
 - [ ] Securely provide runtime GitHub and model credentials without exposing them
-      in prompts, URLs, process listings, or logs.
-- [ ] Clone a selected repository in the sandbox.
+      in prompts, URLs, process listings, or logs. Partly done: neither token
+      is in prompts, URLs, arguments or logs, and the GitHub token stays on the
+      server except during a private clone. The Claude token remains readable
+      by code in the sandbox while Claude runs; see
+      [github.md](github.md#security-model-and-limitations) and
+      [claude-code.md](claude-code.md#security-model-and-limitations).
+- [x] Clone a selected repository in the sandbox.
 - [ ] Start Pi and send an instruction via its RPC mode.
 - [ ] Stream agent responses, status and tool events to Mosso.
 - [ ] Support follow-up messages and steering while Pi is active.
-- [ ] Commit, push and open a PR; show the PR URL.
+- [x] Commit, push and open a PR; show the PR URL (with Claude Code for now).
 - [ ] Persist session metadata and chat events across UI reloads.
 - [ ] Show sessions and offer a terminate action.
 - [ ] Run Go CI and PR secret scanning.
@@ -50,5 +55,10 @@ endpoints (see [vercel-sandbox.md](vercel-sandbox.md)).
 `internal/claude`: runs Claude Code headlessly in a sandbox with a
 subscription token from the macOS Keychain, and resumes conversations by
 session ID (see [claude-code.md](claude-code.md)).
+`internal/github`: clones a GitHub repository into a sandbox on a `mosso/*`
+branch and publishes the result as a pull request through the GitHub API
+(see [github.md](github.md)).
+`internal/keychain`: macOS Keychain storage shared by the Claude and GitHub
+tokens.
 
-No persistence, streaming chat, repository cloning or PR creation exists yet.
+No persistence, streaming chat or UI exists yet.

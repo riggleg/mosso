@@ -1,16 +1,15 @@
 package claude
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
-	"runtime"
 	"strings"
 	"unicode"
+
+	"github.com/riggleg/mosso/internal/keychain"
 )
 
 const (
@@ -19,16 +18,12 @@ const (
 	EnvToken = "CLAUDE_CODE_OAUTH_TOKEN"
 	// KeychainService and KeychainAccount identify the macOS Keychain item
 	// that holds the token.
-	KeychainService = "mosso"
+	KeychainService = keychain.Service
 	KeychainAccount = "claude-code-oauth-token"
 
 	// SourceKeychain and SourceEnv report where a token was loaded from.
 	SourceKeychain = "keychain"
 	SourceEnv      = "env"
-
-	securityTool = "/usr/bin/security"
-	// errSecItemNotFound is the exit status of `security` for a missing item.
-	errSecItemNotFound = 44
 )
 
 // ErrNoToken means neither the Keychain nor the environment has a token.
@@ -56,22 +51,7 @@ func redact(s, secret string) string {
 // readKeychain returns the stored token, or "" if there is none. It is a
 // variable so tests can replace it.
 var readKeychain = func(ctx context.Context) (string, error) {
-	if runtime.GOOS != "darwin" {
-		return "", nil
-	}
-	// The secret arrives on stdout; it is never passed as an argument.
-	cmd := exec.CommandContext(ctx, securityTool, "find-generic-password",
-		"-s", KeychainService, "-a", KeychainAccount, "-w")
-	var out bytes.Buffer
-	cmd.Stdout = &out
-	if err := cmd.Run(); err != nil {
-		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) && exitErr.ExitCode() == errSecItemNotFound {
-			return "", nil
-		}
-		return "", fmt.Errorf("read macOS Keychain: %w", err)
-	}
-	return strings.TrimSpace(out.String()), nil
+	return keychain.Read(ctx, KeychainAccount)
 }
 
 // LoadToken returns the Claude Code OAuth token and where it came from. It
@@ -111,15 +91,8 @@ func validateToken(v string) error {
 // existing one. `security` prompts for the value on the terminal without
 // echoing it, so the token never appears in arguments or shell history.
 func StoreInKeychain(ctx context.Context, stdin io.Reader, stdout, stderr io.Writer) error {
-	if runtime.GOOS != "darwin" {
+	if !keychain.Available() {
 		return fmt.Errorf("the macOS Keychain is only available on macOS; set %s in the server's environment instead", EnvToken)
 	}
-	cmd := exec.CommandContext(ctx, securityTool, "add-generic-password", "-U",
-		"-s", KeychainService, "-a", KeychainAccount, "-l", "Mosso: Claude Code OAuth token",
-		"-w") // -w last: prompt for the password
-	cmd.Stdin, cmd.Stdout, cmd.Stderr = stdin, stdout, stderr
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("store token in macOS Keychain: %w", err)
-	}
-	return nil
+	return keychain.Store(ctx, KeychainAccount, "Mosso: Claude Code OAuth token", stdin, stdout, stderr)
 }

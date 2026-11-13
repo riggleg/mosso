@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/riggleg/mosso/internal/claude"
+	"github.com/riggleg/mosso/internal/github"
 	"github.com/riggleg/mosso/internal/vercel"
 )
 
@@ -34,14 +35,18 @@ type Server struct {
 
 	// claudeToken loads the Claude Code token; replaced in tests.
 	claudeToken func(context.Context) (claude.Token, string, error)
+	// githubClient returns a GitHub client with the current token and
+	// where the token came from; replaced in tests.
+	githubClient func(context.Context) (*github.Client, string, error)
 
 	mu        sync.Mutex
 	sandboxes map[string]vercel.Sandbox
 	creating  int  // creates in flight, counted against maxSandboxes
 	closed    bool // set by Shutdown; later creates are destroyed immediately
-	// Per-sandbox Claude Code state, keyed by sandbox name.
+	// Per-sandbox state, keyed by sandbox name.
 	claudeInstalled map[string]bool
-	claudeBusy      map[string]bool // a turn is running; turns are serialized
+	busy            map[string]bool // a Claude turn, clone or publish is running
+	workspaces      map[string]*workspace
 }
 
 // New returns a Server. client may be nil, in which case sandbox endpoints
@@ -50,9 +55,11 @@ func New(client *vercel.Client) *Server {
 	return &Server{
 		vercel:          client,
 		claudeToken:     claude.LoadToken,
+		githubClient:    loadGitHubClient,
 		sandboxes:       map[string]vercel.Sandbox{},
 		claudeInstalled: map[string]bool{},
-		claudeBusy:      map[string]bool{},
+		busy:            map[string]bool{},
+		workspaces:      map[string]*workspace{},
 	}
 }
 
@@ -72,6 +79,13 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("DELETE /sandboxes/{name}", s.requireVercel(s.destroySandbox))
 	mux.HandleFunc("GET /claude/auth", s.claudeAuthStatus)
 	mux.HandleFunc("POST /sandboxes/{name}/claude/messages", s.requireVercel(s.claudeMessage))
+	mux.HandleFunc("GET /github/auth", s.githubAuthStatus)
+	mux.HandleFunc("GET /workspaces", s.requireVercel(s.listWorkspaces))
+	mux.HandleFunc("POST /workspaces", s.requireVercel(s.createWorkspace))
+	mux.HandleFunc("GET /workspaces/{name}", s.requireVercel(s.getWorkspace))
+	mux.HandleFunc("POST /workspaces/{name}/claude/messages", s.requireVercel(s.workspaceClaudeMessage))
+	mux.HandleFunc("POST /workspaces/{name}/pull-request", s.requireVercel(s.workspacePullRequest))
+	mux.HandleFunc("DELETE /workspaces/{name}", s.requireVercel(s.destroySandbox))
 	return localOnly(mux)
 }
 
@@ -164,29 +178,36 @@ func (s *Server) createSandbox(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, fmt.Sprintf("timeout_seconds must be between 0 and %d", maxSeconds))
 		return
 	}
+	sb, status, err := s.provision(r.Context(), time.Duration(req.TimeoutSeconds)*time.Second)
+	if err != nil {
+		writeError(w, status, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusCreated, sb)
+}
+
+// provision creates a sandbox and tracks it so it is destroyed on shutdown.
+// On error it returns the HTTP status to report.
+func (s *Server) provision(ctx context.Context, timeout time.Duration) (*vercel.Sandbox, int, error) {
 	// Reserve a slot before calling Vercel so concurrent requests cannot
 	// exceed the limit.
 	s.mu.Lock()
 	if len(s.sandboxes)+s.creating >= maxSandboxes {
 		s.mu.Unlock()
-		writeError(w, http.StatusTooManyRequests,
-			fmt.Sprintf("sandbox limit reached (%d); destroy one before creating another", maxSandboxes))
-		return
+		return nil, http.StatusTooManyRequests,
+			fmt.Errorf("sandbox limit reached (%d); destroy one before creating another", maxSandboxes)
 	}
 	s.creating++
 	s.mu.Unlock()
 
 	name := vercel.NewSandboxName()
-	sb, err := s.vercel.Create(r.Context(), name, vercel.CreateOptions{
-		Timeout: time.Duration(req.TimeoutSeconds) * time.Second,
-	})
+	sb, err := s.vercel.Create(ctx, name, vercel.CreateOptions{Timeout: timeout})
 	s.mu.Lock()
 	s.creating--
 	if err != nil {
 		s.mu.Unlock()
 		log.Printf("create sandbox %s: %v", name, err)
-		writeError(w, http.StatusBadGateway, err.Error())
-		return
+		return nil, http.StatusBadGateway, err
 	}
 	closed := s.closed
 	if !closed {
@@ -195,16 +216,15 @@ func (s *Server) createSandbox(w http.ResponseWriter, r *http.Request) {
 	s.mu.Unlock()
 	if closed {
 		// Shutdown already ran its destroy pass; don't leave this one behind.
-		ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), time.Minute)
+		dctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Minute)
 		defer cancel()
-		if err := s.vercel.Destroy(ctx, *sb); err != nil {
+		if err := s.vercel.Destroy(dctx, *sb); err != nil {
 			log.Printf("destroy sandbox %s created during shutdown: %v", sb.Name, err)
 		}
-		writeError(w, http.StatusServiceUnavailable, "server is shutting down")
-		return
+		return nil, http.StatusServiceUnavailable, errors.New("server is shutting down")
 	}
 	log.Printf("created sandbox %s (session %s)", sb.Name, sb.SessionID)
-	writeJSON(w, http.StatusCreated, sb)
+	return sb, 0, nil
 }
 
 func (s *Server) lookup(w http.ResponseWriter, r *http.Request) (vercel.Sandbox, bool) {
@@ -262,10 +282,33 @@ func (s *Server) destroySandbox(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// acquire marks a sandbox busy so that Claude turns, clones and publishes in
+// it run one at a time. It reports false if something else is running.
+func (s *Server) acquire(name string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.busy[name] {
+		return false
+	}
+	s.busy[name] = true
+	return true
+}
+
+func (s *Server) release(name string) {
+	s.mu.Lock()
+	delete(s.busy, name)
+	s.mu.Unlock()
+}
+
+func writeBusy(w http.ResponseWriter) {
+	writeError(w, http.StatusConflict, "another request is still running in this sandbox; wait for it to finish")
+}
+
 func (s *Server) forget(name string) {
 	s.mu.Lock()
 	delete(s.sandboxes, name)
 	delete(s.claudeInstalled, name)
+	delete(s.workspaces, name)
 	s.mu.Unlock()
 }
 

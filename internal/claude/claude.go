@@ -20,7 +20,7 @@ import (
 )
 
 const (
-	// WorkDir is where Claude Code runs. Every turn uses the same directory.
+	// WorkDir is where Claude Code runs unless a request sets Dir.
 	WorkDir = "/vercel/sandbox"
 	// MaxPromptBytes bounds a prompt. It is passed in an environment
 	// variable, and Linux limits each one to 128 KiB.
@@ -77,6 +77,10 @@ type Request struct {
 	// SessionID continues an earlier conversation in the same sandbox.
 	// Empty starts a new one.
 	SessionID string
+	// Dir is the absolute working directory; empty uses WorkDir. Claude
+	// Code stores sessions per directory, so a conversation must keep the
+	// same one.
+	Dir string
 }
 
 // Turn is the outcome of one message: Claude's final answer plus the text
@@ -122,6 +126,13 @@ func Send(ctx context.Context, vc *vercel.Client, sandboxSession string, token T
 	if len(req.Prompt) > MaxPromptBytes || strings.ContainsRune(req.Prompt, 0) {
 		return nil, fmt.Errorf("prompt must be at most %d bytes of text", MaxPromptBytes)
 	}
+	dir := req.Dir
+	if dir == "" {
+		dir = WorkDir
+	}
+	if !strings.HasPrefix(dir, "/") {
+		return nil, errors.New("dir must be an absolute path")
+	}
 	args := []string{"-c", runScript, "claude"}
 	if req.SessionID != "" {
 		if !ValidSessionID(req.SessionID) {
@@ -132,7 +143,7 @@ func Send(ctx context.Context, vc *vercel.Client, sandboxSession string, token T
 	res, err := vc.Run(ctx, sandboxSession, vercel.Command{
 		Name: "bash",
 		Args: args,
-		Cwd:  WorkDir,
+		Cwd:  dir,
 		Env: map[string]string{
 			EnvToken:              token.Reveal(),
 			"MOSSO_PROMPT":        req.Prompt,
