@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -318,5 +319,60 @@ func TestExecHandlesLogLineLargerThanOutputCap(t *testing.T) {
 	}
 	if res.Stderr != "done" {
 		t.Fatalf("stderr = %q, want later lines still read", res.Stderr)
+	}
+}
+
+func TestRunSendsEnvAndCwd(t *testing.T) {
+	f, c := newFakeAPI(t)
+	f.handle("POST /v2/sandboxes/sessions/sbx_1/cmd", reply(200, `{"command":{"id":"cmd_1","exitCode":0}}`))
+	f.handle("GET /v2/sandboxes/sessions/sbx_1/cmd/cmd_1/logs", reply(200,
+		`{"stream":"stdout","data":"0123456789"}`+"\n"))
+
+	res, err := c.Run(context.Background(), "sbx_1", Command{
+		Name: "bash", Args: []string{"-c", `echo "$SECRET"`},
+		Env: map[string]string{"SECRET": "s3cr3t"}, Cwd: "/vercel/sandbox", MaxOutputBytes: 4,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(res.Stdout, "0123\n") {
+		t.Fatalf("stdout = %q, want truncated to 4 bytes", res.Stdout)
+	}
+	body := f.requests[0].Body
+	env, _ := body["env"].(map[string]any)
+	if env["SECRET"] != "s3cr3t" || body["cwd"] != "/vercel/sandbox" {
+		t.Fatalf("unexpected cmd body: %v", body)
+	}
+	if strings.Contains(f.requests[0].Path+fmt.Sprint(f.requests[0].Query), "s3cr3t") {
+		t.Fatal("env value leaked into the URL")
+	}
+}
+
+func TestRunKillsCommandWhenContextEnds(t *testing.T) {
+	f, c := newFakeAPI(t)
+	f.handle("POST /v2/sandboxes/sessions/sbx_1/cmd", reply(200, `{"command":{"id":"cmd_1","exitCode":null}}`))
+	ctx, cancel := context.WithCancel(context.Background())
+	f.handle("GET /v2/sandboxes/sessions/sbx_1/cmd/cmd_1", func(w http.ResponseWriter, r *http.Request) {
+		cancel() // the caller gives up while the command is still running
+		reply(200, `{"command":{"id":"cmd_1","exitCode":null}}`)(w, r)
+	})
+	killed := make(chan map[string]any, 1)
+	f.handle("POST /v2/sandboxes/sessions/sbx_1/cmd/cmd_1/kill", func(w http.ResponseWriter, r *http.Request) {
+		f.mu.Lock()
+		killed <- f.requests[len(f.requests)-1].Body
+		f.mu.Unlock()
+		reply(200, `{"command":{"id":"cmd_1"}}`)(w, r)
+	})
+
+	if _, err := c.Run(ctx, "sbx_1", Command{Name: "sleep", Args: []string{"60"}}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled", err)
+	}
+	select {
+	case body := <-killed:
+		if body["signal"] != float64(15) {
+			t.Fatalf("kill body = %v, want SIGTERM (15)", body)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("command was not killed")
 	}
 }

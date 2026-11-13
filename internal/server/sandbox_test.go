@@ -20,6 +20,10 @@ type fakeVercel struct {
 	deleted []string
 	stopped []string // session ids
 	failCmd bool
+	// cmds records each command request body; stdoutFor, if set, scripts
+	// the stdout of a command from its request body.
+	cmds      []map[string]any
+	stdoutFor func(cmd map[string]any) string
 }
 
 func (f *fakeVercel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -41,10 +45,17 @@ func (f *fakeVercel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			_, _ = io.WriteString(w, `{"error":{"message":"cmd failed"}}`)
 			return
 		}
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		f.cmds = append(f.cmds, body)
 		_, _ = io.WriteString(w, `{"command":{"id":"cmd_1","exitCode":null}}`)
 	case r.Method == http.MethodGet && strings.HasSuffix(p, "/cmd/cmd_1"):
 		_, _ = io.WriteString(w, `{"command":{"id":"cmd_1","exitCode":0}}`)
 	case r.Method == http.MethodGet && strings.HasSuffix(p, "/cmd/cmd_1/logs"):
+		if f.stdoutFor != nil {
+			_ = json.NewEncoder(w).Encode(map[string]string{"stream": "stdout", "data": f.stdoutFor(f.cmds[len(f.cmds)-1])})
+			return
+		}
 		_, _ = io.WriteString(w, `{"stream":"stdout","data":"hello\n"}`+"\n")
 	case r.Method == http.MethodPost && strings.HasSuffix(p, "/stop"):
 		f.stopped = append(f.stopped, strings.Split(p, "/")[4])

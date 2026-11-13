@@ -55,6 +55,8 @@ curl -s -X DELETE localhost:8080/sandboxes/mosso-1a2b3c4d5e6f   # 204 No Content
 | `POST /sandboxes/{name}/exec`   | Run `{"command": "..."}` with `bash -c`; waits and returns `exit_code`, `stdout`, `stderr` (each capped at 1 MiB). |
 | `DELETE /sandboxes/{name}`      | Stop the running session and delete the sandbox.                            |
 
+To run Claude Code in a sandbox, see [claude-code.md](claude-code.md).
+
 `POST` requests must send `Content-Type: application/json`. Mosso also rejects
 requests whose `Host` or `Origin` is not loopback, so a web page you visit cannot
 drive the API (CSRF / DNS rebinding), and it refuses to start on a non-loopback
