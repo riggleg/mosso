@@ -168,7 +168,7 @@ func TestClaudeMessageRejectsConcurrentTurns(t *testing.T) {
 	<-started
 
 	srv.mu.Lock()
-	busy := srv.claudeBusy[sb.Name]
+	busy := srv.busy[sb.Name]
 	srv.mu.Unlock()
 	if !busy {
 		t.Fatal("sandbox should be marked busy during a turn")

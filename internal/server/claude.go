@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/riggleg/mosso/internal/claude"
+	"github.com/riggleg/mosso/internal/vercel"
 )
 
 // claudeAuthStatus reports whether a Claude Code token is available and where
@@ -28,6 +29,11 @@ func (s *Server) claudeMessage(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	s.sendClaude(w, r, sb, claude.WorkDir)
+}
+
+// sendClaude runs one Claude Code turn in dir and writes the response.
+func (s *Server) sendClaude(w http.ResponseWriter, r *http.Request, sb vercel.Sandbox, dir string) {
 	var req struct {
 		Prompt    string `json:"prompt"`
 		SessionID string `json:"session_id"`
@@ -61,20 +67,14 @@ func (s *Server) claudeMessage(w http.ResponseWriter, r *http.Request) {
 
 	// One turn at a time per sandbox: concurrent turns could resume the same
 	// session and interleave its transcript.
-	s.mu.Lock()
-	if s.claudeBusy[sb.Name] {
-		s.mu.Unlock()
-		writeError(w, http.StatusConflict, "Claude is already working in this sandbox; wait for the current message to finish")
+	if !s.acquire(sb.Name) {
+		writeBusy(w)
 		return
 	}
-	s.claudeBusy[sb.Name] = true
+	defer s.release(sb.Name)
+	s.mu.Lock()
 	installed := s.claudeInstalled[sb.Name]
 	s.mu.Unlock()
-	defer func() {
-		s.mu.Lock()
-		delete(s.claudeBusy, sb.Name)
-		s.mu.Unlock()
-	}()
 
 	if !installed {
 		version, err := claude.Install(r.Context(), s.vercel, sb.SessionID)
@@ -94,6 +94,7 @@ func (s *Server) claudeMessage(w http.ResponseWriter, r *http.Request) {
 	turn, err := claude.Send(r.Context(), s.vercel, sb.SessionID, token, claude.Request{
 		Prompt:    req.Prompt,
 		SessionID: req.SessionID,
+		Dir:       dir,
 	})
 	if err != nil {
 		// Prompt text is deliberately not logged.

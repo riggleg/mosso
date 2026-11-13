@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -24,6 +25,8 @@ type fakeVercel struct {
 	// the stdout of a command from its request body.
 	cmds      []map[string]any
 	stdoutFor func(cmd map[string]any) string
+	// exitFor, if set, scripts a command's exit code.
+	exitFor func(cmd map[string]any) int
 }
 
 func (f *fakeVercel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -50,7 +53,11 @@ func (f *fakeVercel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		f.cmds = append(f.cmds, body)
 		_, _ = io.WriteString(w, `{"command":{"id":"cmd_1","exitCode":null}}`)
 	case r.Method == http.MethodGet && strings.HasSuffix(p, "/cmd/cmd_1"):
-		_, _ = io.WriteString(w, `{"command":{"id":"cmd_1","exitCode":0}}`)
+		code := 0
+		if f.exitFor != nil {
+			code = f.exitFor(f.cmds[len(f.cmds)-1])
+		}
+		_, _ = fmt.Fprintf(w, `{"command":{"id":"cmd_1","exitCode":%d}}`, code)
 	case r.Method == http.MethodGet && strings.HasSuffix(p, "/cmd/cmd_1/logs"):
 		if f.stdoutFor != nil {
 			_ = json.NewEncoder(w).Encode(map[string]string{"stream": "stdout", "data": f.stdoutFor(f.cmds[len(f.cmds)-1])})

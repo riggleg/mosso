@@ -17,6 +17,8 @@ Mosso is an experimental, self-hosted Go coding-agent orchestrator. The goal is 
 - `internal/server/` — HTTP API and server-side coordination.
 - `internal/vercel/` — Vercel Sandbox integration.
 - `internal/claude/` — Claude Code CLI integration (headless runs in a sandbox, subscription token handling).
+- `internal/github/` — GitHub integration (clone into a sandbox, publish changes as a pull request via the REST API, token handling).
+- `internal/keychain/` — macOS Keychain storage for Mosso's tokens.
 - `docs/` — architecture notes, MUP scope, and setup instructions.
 
 Follow existing conventions and avoid creating unrelated packages or reorganizing the repository without a concrete need.
