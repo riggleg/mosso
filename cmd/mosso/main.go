@@ -54,13 +54,15 @@ func main() {
 	}
 	srv := server.New(client)
 	httpSrv := &http.Server{Addr: *addr, Handler: srv.Handler(), ReadHeaderTimeout: 10 * time.Second}
+	// Browsers keep event streams open; end them so shutdown need not wait.
+	httpSrv.RegisterOnShutdown(srv.CloseStreams)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	errCh := make(chan error, 1)
 	go func() {
-		log.Printf("mosso listening on %s", *addr)
+		log.Printf("mosso listening on %s; open http://%s in your browser", *addr, *addr)
 		errCh <- httpSrv.ListenAndServe()
 	}()
 

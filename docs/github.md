@@ -81,9 +81,10 @@ GitHub.
 | Method & path                                | Description |
 | -------------------------------------------- | ----------- |
 | `GET /github/auth`                           | `{"configured": true, "source": "keychain"\|"env", "login": "..."}`. Never returns the token. |
-| `POST /workspaces`                           | Body: `{"repo": "owner/repo", "base": "main", "timeout_seconds": 1800}`. `base` defaults to the repository's default branch; `timeout_seconds` defaults to 1800 (max 2700). Returns `201` with the workspace. |
-| `GET /workspaces`, `GET /workspaces/{name}`  | Workspaces of this Mosso process, including `pull_request` once one exists. |
-| `POST /workspaces/{name}/claude/messages`    | Same body and response as `POST /sandboxes/{name}/claude/messages`, run in the checkout. |
+| `POST /workspaces`                           | Body: `{"repo": "owner/repo", "base": "main", "timeout_seconds": 1800}`. `base` defaults to the repository's default branch; `timeout_seconds` defaults to 1800 (max 2700). Clones, installs Claude Code and returns `201` with the workspace. Setup continues if the client disconnects. |
+| `GET /workspaces`, `GET /workspaces/{name}`  | Workspaces of this Mosso process with their `status`, including ones still being created and `pull_request` once one exists. |
+| `POST /workspaces/{name}/claude/messages`    | Same body and response as `POST /sandboxes/{name}/claude/messages`, run in the checkout. The turn is also recorded in the workspace's chat. |
+| `POST /workspaces/{name}/chat`, `GET /workspaces/{name}/events` | Asynchronous chat with streamed progress, used by the web UI; see [web-ui.md](web-ui.md#api-used-by-the-ui). |
 | `POST /workspaces/{name}/pull-request`       | Body (all optional): `{"title": "...", "body": "...", "draft": false}`. `201` when it opened the pull request, `200` when it already existed. |
 | `DELETE /workspaces/{name}`                  | Destroy the sandbox (same as `DELETE /sandboxes/{name}`). The branch and pull request stay on GitHub. |
 
@@ -98,7 +99,9 @@ Workspace:
   "branch": "mosso/0a1b2c3d4e5f",
   "dir": "/vercel/sandbox/project",
   "sandbox": {"name": "mosso-1a2b3c4d5e6f", "session_id": "sbx_…", "status": "running", "created_at": "…"},
-  "pull_request": {"number": 12, "url": "https://github.com/you/project/pull/12"}
+  "expires_at": "…",
+  "pull_request": {"number": 12, "url": "https://github.com/you/project/pull/12"},
+  "status": "ready"
 }
 ```
 
@@ -112,7 +115,7 @@ Errors (`{"error": "..."}`):
 
 - `400` invalid input; `404` unknown workspace, or the repository does not
   exist or the token cannot see it (no sandbox is created).
-- `409` Claude or another publish is still running in the workspace.
+- `409` Claude or another publish is still running in the workspace (a publish finishes even if the client disconnects).
 - `422` no changes to publish: the working tree matches the base commit and
   nothing was published before. If an earlier publish exists and the work was
   reverted, the branch is updated back to the base tree instead.

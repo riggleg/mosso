@@ -91,6 +91,8 @@ type fakeSandbox struct {
 	exitCode int
 	stdout   string
 	stderr   string
+	// chunks, if set, replaces stdout with several log entries.
+	chunks []string
 }
 
 func (f *fakeSandbox) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -105,6 +107,9 @@ func (f *fakeSandbox) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		_, _ = fmt.Fprintf(w, `{"command":{"id":"cmd_1","exitCode":%d}}`, f.exitCode)
 	case strings.HasSuffix(r.URL.Path, "/cmd/cmd_1/logs"):
 		enc := json.NewEncoder(w)
+		for _, c := range f.chunks {
+			_ = enc.Encode(map[string]string{"stream": "stdout", "data": c})
+		}
 		_ = enc.Encode(map[string]string{"stream": "stdout", "data": f.stdout})
 		_ = enc.Encode(map[string]string{"stream": "stderr", "data": f.stderr})
 	default:
@@ -192,6 +197,40 @@ func TestSendRedactsToken(t *testing.T) {
 	}
 }
 
+func TestSendStreamsEvents(t *testing.T) {
+	raw, _ := os.ReadFile("testdata/stream.jsonl")
+	secret := `{"type":"assistant","message":{"content":[{"type":"text","text":"see ` + testToken + `"}]}}` + "\n"
+	all := secret + string(raw)
+	// Split the output into chunks that cut lines (and the token) in half.
+	var chunks []string
+	for i := 0; i < len(all); i += 37 {
+		chunks = append(chunks, all[i:min(i+37, len(all))])
+	}
+	vc := newFakeSandbox(t, &fakeSandbox{chunks: chunks})
+
+	var sessions []string
+	var events []Event
+	turn, err := Send(context.Background(), vc, "sbx_1", Token(testToken), Request{
+		Prompt:    "hi",
+		OnSession: func(id string) { sessions = append(sessions, id) },
+		OnEvent:   func(e Event) { events = append(events, e) },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sessions) != 1 || sessions[0] != testSession {
+		t.Fatalf("OnSession calls = %v", sessions)
+	}
+	got, _ := json.Marshal(events)
+	want, _ := json.Marshal(turn.Events)
+	if string(got) != string(want) || len(events) != 7 {
+		t.Fatalf("streamed events %s\nwant %s", got, want)
+	}
+	if strings.Contains(string(got), testToken) || events[0].Text != "see [REDACTED]" {
+		t.Fatalf("streamed events are not redacted: %s", got)
+	}
+}
+
 func TestSendValidatesInput(t *testing.T) {
 	vc := newFakeSandbox(t, &fakeSandbox{})
 	for name, req := range map[string]Request{
@@ -275,5 +314,23 @@ func TestLoadToken(t *testing.T) {
 	stubKeychain(t, "", io.ErrUnexpectedEOF)
 	if _, _, err := LoadToken(ctx); err == nil {
 		t.Fatal("keychain errors must be reported, not silently skipped")
+	}
+}
+
+func TestParseStreamBoundsKeptEvents(t *testing.T) {
+	line := `{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t","content":"` + strings.Repeat("x", 1<<20) + `"}]}}`
+	n := maxEventBytes/len(line) + 3
+	out := strings.Repeat(line+"\n", n) + `{"type":"result","result":"done","session_id":"` + testSession + `"}`
+	var streamed int
+	p := &parser{turn: Turn{Events: []Event{}}, onEvent: func(Event) { streamed++ }}
+	for _, l := range strings.Split(out, "\n") {
+		p.line(l)
+	}
+	turn, err := p.finish()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if streamed != n || len(turn.Events) >= n || len(turn.Events) == 0 || turn.Result != "done" {
+		t.Fatalf("streamed %d, kept %d of %d events, result %q", streamed, len(turn.Events), n, turn.Result)
 	}
 }

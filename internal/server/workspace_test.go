@@ -50,6 +50,10 @@ func (f *fakeGitHubAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case p == "/user":
 		reply(200, map[string]any{"login": "octo", "id": 42, "name": "Octo Cat"})
+	case p == "/user/repos":
+		reply(200, []map[string]any{{"full_name": "octo/widgets", "default_branch": "main", "private": f.private}})
+	case p == repo+"/branches":
+		reply(200, []map[string]string{{"name": "main"}, {"name": "dev"}})
 	case p == repo:
 		reply(200, map[string]any{"full_name": "octo/widgets", "default_branch": "main", "private": f.private})
 	case strings.HasPrefix(p, repo+"/git/ref/heads/"):

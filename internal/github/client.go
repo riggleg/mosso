@@ -134,6 +134,31 @@ func (c *Client) Repo(ctx context.Context, repo string) (*Repository, error) {
 	return &r, nil
 }
 
+// Repos returns up to 100 repositories the token can access, most recently
+// pushed first.
+func (c *Client) Repos(ctx context.Context) ([]Repository, error) {
+	repos := []Repository{}
+	if err := c.do(ctx, http.MethodGet, "/user/repos?per_page=100&sort=pushed", nil, &repos); err != nil {
+		return nil, fmt.Errorf("list repositories: %w", err)
+	}
+	return repos, nil
+}
+
+// Branches returns the names of up to 100 branches of repo ("owner/repo").
+func (c *Client) Branches(ctx context.Context, repo string) ([]string, error) {
+	var branches []struct {
+		Name string `json:"name"`
+	}
+	if err := c.do(ctx, http.MethodGet, "/repos/"+repo+"/branches?per_page=100", nil, &branches); err != nil {
+		return nil, fmt.Errorf("list branches of %s: %w", repo, err)
+	}
+	names := make([]string, 0, len(branches))
+	for _, b := range branches {
+		names = append(names, b.Name)
+	}
+	return names, nil
+}
+
 // PullRequest is a created or existing pull request.
 type PullRequest struct {
 	Number int    `json:"number"`

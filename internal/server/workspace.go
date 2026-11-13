@@ -21,17 +21,51 @@ import (
 // request does not set one: long enough for a coding task and a pull request.
 const defaultWorkspaceTimeout = 30 * time.Minute
 
+// setupTimeout bounds provisioning, cloning and installing Claude Code.
+const setupTimeout = 10 * time.Minute
+
+// publishTimeout bounds committing and pushing a workspace's changes.
+const publishTimeout = 5 * time.Minute
+
 // workspace is a GitHub repository checked out on a working branch in a
 // sandbox. Its name is the sandbox's name.
 type workspace struct {
-	Name        string              `json:"name"`
-	Repo        string              `json:"repo"`
-	Base        string              `json:"base"`
-	BaseSHA     string              `json:"base_sha"`
-	Branch      string              `json:"branch"`
-	Dir         string              `json:"dir"`
-	Sandbox     vercel.Sandbox      `json:"sandbox"`
+	Name    string         `json:"name"`
+	Repo    string         `json:"repo"`
+	Base    string         `json:"base"`
+	BaseSHA string         `json:"base_sha"`
+	Branch  string         `json:"branch"`
+	Dir     string         `json:"dir"`
+	Sandbox vercel.Sandbox `json:"sandbox"`
+	// ExpiresAt is roughly when Vercel stops the sandbox.
+	ExpiresAt   time.Time           `json:"expires_at"`
 	PullRequest *github.PullRequest `json:"pull_request,omitempty"`
+	// Status is "creating", "ready", "working" (Claude or a publish is
+	// running) or "error" (the last turn or publish failed, or the sandbox
+	// expired); Error says why. Both are computed by snapshotLocked.
+	Status string `json:"status"`
+	Error  string `json:"error,omitempty"`
+
+	creating bool
+	chat     *chat
+}
+
+// snapshotLocked returns a copy of ws with its current status.
+func (s *Server) snapshotLocked(ws *workspace) workspace {
+	c := *ws
+	switch {
+	case ws.creating:
+		c.Status = "creating"
+	case s.busy[ws.Name]:
+		c.Status = "working"
+	case time.Now().After(ws.ExpiresAt):
+		c.Status, c.Error = "error", "The sandbox has expired. Terminate this workspace and create a new one."
+	case ws.chat.err != "":
+		c.Status, c.Error = "error", ws.chat.err
+	default:
+		c.Status = "ready"
+	}
+	return c
 }
 
 func loadGitHubClient(ctx context.Context) (*github.Client, string, error) {
@@ -77,7 +111,7 @@ func (s *Server) listWorkspaces(w http.ResponseWriter, _ *http.Request) {
 	s.mu.Lock()
 	list := make([]workspace, 0, len(s.workspaces))
 	for _, ws := range s.workspaces {
-		list = append(list, *ws)
+		list = append(list, s.snapshotLocked(ws))
 	}
 	s.mu.Unlock()
 	sort.Slice(list, func(i, j int) bool { return list[i].Sandbox.CreatedAt.Before(list[j].Sandbox.CreatedAt) })
@@ -89,7 +123,7 @@ func (s *Server) lookupWorkspace(w http.ResponseWriter, r *http.Request) (worksp
 	ws, ok := s.workspaces[r.PathValue("name")]
 	var copied workspace
 	if ok {
-		copied = *ws
+		copied = s.snapshotLocked(ws)
 	}
 	s.mu.Unlock()
 	if !ok {
@@ -161,39 +195,54 @@ func (s *Server) createWorkspace(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	sb, status, err := s.provision(r.Context(), timeout)
+	// Setup continues if the client disconnects (for example, the browser
+	// reloads), so the workspace still appears; Shutdown cancels it.
+	ctx, cancel := context.WithTimeout(s.ctx, setupTimeout)
+	defer cancel()
+	sb, status, err := s.provision(ctx, timeout)
 	if err != nil {
 		writeError(w, status, err.Error())
 		return
 	}
-	// Hold the sandbox while cloning so nothing else runs in it, and destroy
-	// it if the workspace does not come up.
-	s.acquire(sb.Name)
-	defer s.release(sb.Name)
-	ready := false
-	defer func() {
-		if !ready {
-			ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), time.Minute)
-			defer cancel()
-			if err := s.vercel.Destroy(ctx, *sb); err != nil {
-				log.Printf("destroy sandbox %s after failed workspace setup: %v (check the Vercel dashboard)", sb.Name, err)
-				return
-			}
-			s.forget(sb.Name)
-		}
-	}()
-
 	ws := &workspace{
-		Name:    sb.Name,
-		Repo:    repo.FullName,
-		Base:    base,
-		Branch:  github.NewBranchName(),
-		Dir:     path.Join(claude.WorkDir, req.Repo[strings.IndexByte(req.Repo, '/')+1:]),
-		Sandbox: *sb,
+		Name:      sb.Name,
+		Repo:      repo.FullName,
+		Base:      base,
+		Branch:    github.NewBranchName(),
+		Dir:       path.Join(claude.WorkDir, req.Repo[strings.IndexByte(req.Repo, '/')+1:]),
+		Sandbox:   *sb,
+		ExpiresAt: sb.CreatedAt.Add(timeout),
+		creating:  true,
+		chat:      newChat(),
 	}
 	if !github.ValidRepo(ws.Repo) {
 		ws.Repo = req.Repo
 	}
+	// List the workspace as "creating" and hold it while cloning so nothing
+	// else runs in it. Destroy it if it does not come up.
+	s.mu.Lock()
+	s.busy[sb.Name] = true
+	s.workspaces[sb.Name] = ws
+	s.mu.Unlock()
+	ready := false
+	defer func() {
+		if ready {
+			return
+		}
+		s.mu.Lock()
+		s.dropWorkspaceLocked(sb.Name)
+		s.mu.Unlock()
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), time.Minute)
+		defer cancel()
+		if err := s.vercel.Destroy(ctx, *sb); err != nil {
+			// Still tracked, so Shutdown tries again.
+			log.Printf("destroy sandbox %s after failed workspace setup: %v (check the Vercel dashboard)", sb.Name, err)
+		} else {
+			s.forget(sb.Name)
+		}
+		s.release(sb.Name)
+	}()
+
 	name, email := user.CommitIdentity()
 	opts := github.CloneOptions{
 		Repo: ws.Repo, Base: base, Branch: ws.Branch, Dir: ws.Dir,
@@ -206,37 +255,35 @@ func (s *Server) createWorkspace(w http.ResponseWriter, r *http.Request) {
 		opts.Token = gh.Token()
 	}
 	start := time.Now()
-	ws.BaseSHA, err = github.Clone(r.Context(), s.vercel, sb.SessionID, opts)
+	baseSHA, err := github.Clone(ctx, s.vercel, sb.SessionID, opts)
 	if err != nil {
 		log.Printf("workspace %s: %v", sb.Name, err)
 		writeError(w, http.StatusBadGateway, err.Error())
 		return
 	}
+	log.Printf("workspace %s: cloned %s@%s (%s) onto %s in %s",
+		sb.Name, ws.Repo, base, baseSHA[:12], ws.Branch, time.Since(start).Round(time.Millisecond))
+	// Install Claude Code now so the first message is quick. If this
+	// fails, the first message tries again.
+	_ = s.ensureClaude(ctx, sb.Name, sb.SessionID)
 
 	s.mu.Lock()
 	_, live := s.sandboxes[sb.Name]
-	if live {
-		s.workspaces[sb.Name] = ws
+	var snapshot workspace
+	if live && s.workspaces[sb.Name] == ws {
+		ws.BaseSHA = baseSHA
+		ws.creating = false
+		delete(s.busy, sb.Name)
+		ws.chat.notify()
+		snapshot = s.snapshotLocked(ws)
 		ready = true
 	}
 	s.mu.Unlock()
-	if !live {
-		writeError(w, http.StatusServiceUnavailable, "the sandbox was destroyed while the repository was being cloned")
+	if !ready {
+		writeError(w, http.StatusServiceUnavailable, "the sandbox was destroyed while the workspace was being set up")
 		return
 	}
-	log.Printf("workspace %s: cloned %s@%s (%s) onto %s in %s",
-		sb.Name, ws.Repo, base, ws.BaseSHA[:12], ws.Branch, time.Since(start).Round(time.Millisecond))
-	writeJSON(w, http.StatusCreated, ws)
-}
-
-// workspaceClaudeMessage runs a Claude Code turn in the workspace checkout.
-// The GitHub token is not available to Claude.
-func (s *Server) workspaceClaudeMessage(w http.ResponseWriter, r *http.Request) {
-	ws, ok := s.lookupWorkspace(w, r)
-	if !ok {
-		return
-	}
-	s.sendClaude(w, r, ws.Sandbox, ws.Dir)
+	writeJSON(w, http.StatusCreated, snapshot)
 }
 
 // workspacePullRequest commits the workspace's changes, pushes them to its
@@ -282,17 +329,27 @@ func (s *Server) workspacePullRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer s.release(ws.Name)
+	s.addEntry(ws.chat, chatEntry{Type: "notice", Text: "Publishing changes to GitHub…"})
 
-	pub, err := github.Publish(r.Context(), s.vercel, ws.Sandbox.SessionID, gh, github.PublishOptions{
+	// Finish the publish even if the client disconnects, so the branch and
+	// pull request are not left half-updated; Shutdown cancels it.
+	ctx, cancel := context.WithTimeout(s.ctx, publishTimeout)
+	defer cancel()
+	pub, err := github.Publish(ctx, s.vercel, ws.Sandbox.SessionID, gh, github.PublishOptions{
 		Repo: ws.Repo, Base: ws.Base, BaseSHA: ws.BaseSHA, Branch: ws.Branch, Dir: ws.Dir,
 		Title: req.Title, Body: req.Body, Draft: req.Draft, Secrets: secrets,
 	})
 	if errors.Is(err, github.ErrNoChanges) {
+		s.addEntry(ws.chat, chatEntry{Type: "notice", Text: "Nothing to publish yet: there are no changes against " + ws.Base + "."})
 		writeError(w, http.StatusUnprocessableEntity, err.Error())
 		return
 	}
 	if err != nil {
 		log.Printf("workspace %s: publish: %v", ws.Name, err)
+		s.mu.Lock()
+		ws.chat.err = "Publishing failed: " + err.Error()
+		ws.chat.add(chatEntry{Type: "error", Text: ws.chat.err})
+		s.mu.Unlock()
 		writeError(w, http.StatusBadGateway, err.Error())
 		return
 	}
@@ -300,6 +357,8 @@ func (s *Server) workspacePullRequest(w http.ResponseWriter, r *http.Request) {
 	if cur, ok := s.workspaces[ws.Name]; ok {
 		cur.PullRequest = &pub.PullRequest
 	}
+	ws.chat.err = ""
+	ws.chat.add(chatEntry{Type: "pull_request", PullRequest: pub})
 	s.mu.Unlock()
 	log.Printf("workspace %s: pushed %s to %s, pull request %s (created=%t)", ws.Name, pub.Commit, ws.Branch, pub.URL, pub.Created)
 	status := http.StatusOK
@@ -307,4 +366,42 @@ func (s *Server) workspacePullRequest(w http.ResponseWriter, r *http.Request) {
 		status = http.StatusCreated
 	}
 	writeJSON(w, status, pub)
+}
+
+// githubRepos lists repositories the GitHub token can access, for the web
+// UI's repository picker.
+func (s *Server) githubRepos(w http.ResponseWriter, r *http.Request) {
+	gh, ok := s.gitHub(w, r)
+	if !ok {
+		return
+	}
+	repos, err := gh.Repos(r.Context())
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"repos": repos})
+}
+
+// githubBranches lists a repository's branches, for the base branch picker.
+func (s *Server) githubBranches(w http.ResponseWriter, r *http.Request) {
+	repo := r.PathValue("owner") + "/" + r.PathValue("repo")
+	if !github.ValidRepo(repo) {
+		writeError(w, http.StatusBadRequest, `repository must be "owner/repo"`)
+		return
+	}
+	gh, ok := s.gitHub(w, r)
+	if !ok {
+		return
+	}
+	branches, err := gh.Branches(r.Context(), repo)
+	if err != nil {
+		status := http.StatusBadGateway
+		if github.IsNotFound(err) {
+			status = http.StatusNotFound
+		}
+		writeError(w, status, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"branches": branches})
 }
