@@ -38,6 +38,16 @@ type Server struct {
 	// githubClient returns a GitHub client with the current token and
 	// where the token came from; replaced in tests.
 	githubClient func(context.Context) (*github.Client, string, error)
+	// newGitHubClient returns a client for a token pasted into the web
+	// UI, to check it; replaced in tests.
+	newGitHubClient func(github.Token) *github.Client
+	// saveGitHubToken stores a pasted token in the Keychain, or returns
+	// github.ErrNoKeychain; replaced in tests.
+	saveGitHubToken func(context.Context, github.Token) error
+	// gitSync and gitPublish run a workspace's authenticated Git
+	// operations on this server; replaced in tests.
+	gitSync    func(*github.Mirror, context.Context, github.Token) (github.Synced, error)
+	gitPublish func(*github.Mirror, context.Context, *github.Client, github.PublishOptions) (*github.Published, error)
 
 	// ctx is cancelled by Shutdown; background work (Claude turns,
 	// workspace setup) derives from it instead of from a request.
@@ -55,24 +65,36 @@ type Server struct {
 	claudeInstalled map[string]bool
 	busy            map[string]bool // a Claude turn, clone or publish is running
 	workspaces      map[string]*workspace
+	// memoryToken is a GitHub token pasted into the web UI on a system
+	// without a Keychain. It lasts until Mosso stops and takes precedence
+	// over MOSSO_GITHUB_TOKEN.
+	memoryToken github.Token
+
+	// cleanups tracks removal of workspaces' server-side Git repositories.
+	cleanups sync.WaitGroup
 }
 
 // New returns a Server. client may be nil, in which case sandbox endpoints
 // respond with 503 Service Unavailable.
 func New(client *vercel.Client) *Server {
 	ctx, cancel := context.WithCancel(context.Background())
-	return &Server{
+	s := &Server{
 		ctx:             ctx,
 		cancel:          cancel,
 		streamsDone:     make(chan struct{}),
 		vercel:          client,
 		claudeToken:     claude.LoadToken,
-		githubClient:    loadGitHubClient,
+		newGitHubClient: github.NewClient,
+		saveGitHubToken: github.SaveToken,
+		gitSync:         (*github.Mirror).Sync,
+		gitPublish:      (*github.Mirror).Publish,
 		sandboxes:       map[string]vercel.Sandbox{},
 		claudeInstalled: map[string]bool{},
 		busy:            map[string]bool{},
 		workspaces:      map[string]*workspace{},
 	}
+	s.githubClient = s.loadGitHubClient
+	return s
 }
 
 // NewHandler returns a handler without sandbox support.
@@ -92,6 +114,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /claude/auth", s.claudeAuthStatus)
 	mux.HandleFunc("POST /sandboxes/{name}/claude/messages", s.requireVercel(s.claudeMessage))
 	mux.HandleFunc("GET /github/auth", s.githubAuthStatus)
+	mux.HandleFunc("POST /github/auth", s.githubConnect)
 	mux.HandleFunc("GET /workspaces", s.requireVercel(s.listWorkspaces))
 	mux.HandleFunc("POST /workspaces", s.requireVercel(s.createWorkspace))
 	mux.HandleFunc("GET /workspaces/{name}", s.requireVercel(s.getWorkspace))
@@ -353,12 +376,23 @@ func (s *Server) dropWorkspaceLocked(name string) {
 		ws.chat.running.cancel()
 	}
 	ws.chat.notify()
+	if ws.git != nil {
+		// Close waits for a fetch or push in progress, so not under mu.
+		s.cleanups.Add(1)
+		go func() {
+			defer s.cleanups.Done()
+			if err := ws.git.Close(); err != nil {
+				log.Printf("workspace %s: remove the server-side Git repository: %v", name, err)
+			}
+		}()
+	}
 }
 
 // Shutdown destroys every sandbox this server created and has not yet
 // destroyed. Call it before the process exits.
 func (s *Server) Shutdown(ctx context.Context) error {
 	s.cancel() // stop Claude turns and workspace setup
+	defer s.cleanups.Wait()
 	if s.vercel == nil {
 		return nil
 	}

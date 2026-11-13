@@ -14,6 +14,7 @@ import (
 
 	"github.com/riggleg/mosso/internal/claude"
 	"github.com/riggleg/mosso/internal/github"
+	"github.com/riggleg/mosso/internal/keychain"
 	"github.com/riggleg/mosso/internal/vercel"
 )
 
@@ -48,6 +49,8 @@ type workspace struct {
 
 	creating bool
 	chat     *chat
+	// git fetches and pushes for the workspace; nil until it is cloned.
+	git *github.Mirror
 }
 
 // snapshotLocked returns a copy of ws with its current status.
@@ -68,12 +71,22 @@ func (s *Server) snapshotLocked(ws *workspace) workspace {
 	return c
 }
 
-func loadGitHubClient(ctx context.Context) (*github.Client, string, error) {
+// loadGitHubClient returns a client with the current GitHub token: one
+// pasted into the web UI this session (without a Keychain), else the
+// Keychain's, else MOSSO_GITHUB_TOKEN. It reads the token on every call, so
+// a replaced token is used from the next request on.
+func (s *Server) loadGitHubClient(ctx context.Context) (*github.Client, string, error) {
+	s.mu.Lock()
+	mem := s.memoryToken
+	s.mu.Unlock()
+	if mem != "" {
+		return s.newGitHubClient(mem), github.SourceMemory, nil
+	}
 	tok, source, err := github.LoadToken(ctx)
 	if err != nil {
 		return nil, "", err
 	}
-	return github.NewClient(tok), source, nil
+	return s.newGitHubClient(tok), source, nil
 }
 
 // gitHub returns a GitHub client or writes an error response.
@@ -91,20 +104,98 @@ func (s *Server) gitHub(w http.ResponseWriter, r *http.Request) (*github.Client,
 	return gh, true
 }
 
+// githubAuth is the GitHub connection status. It never includes the token.
+type githubAuth struct {
+	Configured bool   `json:"configured"`
+	Source     string `json:"source,omitempty"` // keychain, env or memory
+	Login      string `json:"login,omitempty"`
+	// ExpiresAt is when the token expires, if GitHub reports it.
+	ExpiresAt *time.Time `json:"expires_at,omitempty"`
+	Error     string     `json:"error,omitempty"`
+	// CreateURL opens GitHub's token form with Mosso's permissions.
+	CreateURL string `json:"create_url"`
+	// Storage is where a token saved with POST /github/auth goes:
+	// "keychain", or "memory" (until Mosso stops) without a Keychain.
+	Storage string `json:"storage"`
+}
+
+func (s *Server) authStatus(gh *github.Client, source string, user *github.User, err error) githubAuth {
+	st := githubAuth{Configured: gh != nil, Source: source, CreateURL: github.NewTokenURL, Storage: "keychain"}
+	if !keychain.Available() {
+		st.Storage = github.SourceMemory
+	}
+	if err != nil {
+		st.Error = err.Error()
+	}
+	if user != nil {
+		st.Login = user.Login
+	}
+	if gh != nil {
+		if t := gh.TokenExpiration(); !t.IsZero() {
+			st.ExpiresAt = &t
+		}
+	}
+	return st
+}
+
 // githubAuthStatus reports whether a GitHub token is configured and which
 // account it belongs to. It never returns the token.
 func (s *Server) githubAuthStatus(w http.ResponseWriter, r *http.Request) {
 	gh, source, err := s.githubClient(r.Context())
 	if err != nil {
-		writeJSON(w, http.StatusOK, map[string]any{"configured": false, "error": err.Error()})
+		writeJSON(w, http.StatusOK, s.authStatus(nil, "", nil, err))
 		return
 	}
 	user, err := gh.User(r.Context())
-	if err != nil {
-		writeJSON(w, http.StatusOK, map[string]any{"configured": true, "source": source, "error": err.Error()})
+	writeJSON(w, http.StatusOK, s.authStatus(gh, source, user, err))
+}
+
+// githubConnect stores a GitHub token pasted into the web UI, after
+// checking it with GitHub: in the Keychain on macOS, otherwise in memory
+// until Mosso stops. It replaces the previous token for every workspace,
+// without a restart. The token is never logged or echoed back.
+func (s *Server) githubConnect(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Token string `json:"token"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"configured": true, "source": source, "login": user.Login})
+	tok, err := github.ParseToken(req.Token)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	gh := s.newGitHubClient(tok)
+	user, err := gh.User(r.Context())
+	if err != nil {
+		var apiErr *github.APIError
+		if errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusUnauthorized {
+			writeError(w, http.StatusUnprocessableEntity, "GitHub rejected this token: it is invalid, expired or revoked. Generate a new one.")
+			return
+		}
+		writeError(w, http.StatusBadGateway, "could not check the token with GitHub: "+err.Error())
+		return
+	}
+	source := github.SourceKeychain
+	switch err := s.saveGitHubToken(r.Context(), tok); {
+	case errors.Is(err, github.ErrNoKeychain):
+		source = github.SourceMemory
+	case err != nil:
+		log.Printf("save github token: %v", err)
+		writeError(w, http.StatusInternalServerError, "could not save the token: "+err.Error())
+		return
+	}
+	s.mu.Lock()
+	if source == github.SourceMemory {
+		s.memoryToken = tok
+	} else {
+		s.memoryToken = ""
+	}
+	s.mu.Unlock()
+	log.Printf("GitHub connected as %s (token saved: %s)", user.Login, source)
+	writeJSON(w, http.StatusOK, s.authStatus(gh, source, user, nil))
 }
 
 func (s *Server) listWorkspaces(w http.ResponseWriter, _ *http.Request) {
@@ -263,14 +354,33 @@ func (s *Server) createWorkspace(w http.ResponseWriter, r *http.Request) {
 	}
 	log.Printf("workspace %s: cloned %s@%s (%s) onto %s in %s",
 		sb.Name, ws.Repo, base, baseSHA[:12], ws.Branch, time.Since(start).Round(time.Millisecond))
+	mirror, err := github.NewMirror(s.vercel, sb.SessionID, github.MirrorOptions{
+		Repo: ws.Repo, Base: base, BaseSHA: baseSHA, Branch: ws.Branch, Dir: ws.Dir,
+	})
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	// Meanwhile, fetch the base branch into the server's Git repository
+	// so the first sync and publish are quick. Failures are retried then.
+	primed := make(chan struct{})
+	go func() {
+		defer close(primed)
+		if _, err := s.gitSync(mirror, ctx, gh.Token()); err != nil {
+			log.Printf("workspace %s: %v", sb.Name, err)
+			s.addEntry(ws.chat, chatEntry{Type: "notice", Text: "Could not fetch from GitHub on the Mosso server: " + err.Error() + " Mosso tries again before each message and when publishing."})
+		}
+	}()
 	// Install Claude Code now so the first message is quick. If this
 	// fails, the first message tries again.
 	_ = s.ensureClaude(ctx, sb.Name, sb.SessionID)
+	<-primed
 
 	s.mu.Lock()
 	_, live := s.sandboxes[sb.Name]
 	var snapshot workspace
 	if live && s.workspaces[sb.Name] == ws {
+		ws.git = mirror
 		ws.BaseSHA = baseSHA
 		ws.creating = false
 		delete(s.busy, sb.Name)
@@ -280,6 +390,7 @@ func (s *Server) createWorkspace(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mu.Unlock()
 	if !ready {
+		_ = mirror.Close()
 		writeError(w, http.StatusServiceUnavailable, "the sandbox was destroyed while the workspace was being set up")
 		return
 	}
@@ -314,6 +425,10 @@ func (s *Server) workspacePullRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if ws.git == nil {
+		writeError(w, http.StatusConflict, "the workspace is still being set up")
+		return
+	}
 	gh, ok := s.gitHub(w, r)
 	if !ok {
 		return
@@ -335,12 +450,11 @@ func (s *Server) workspacePullRequest(w http.ResponseWriter, r *http.Request) {
 	// pull request are not left half-updated; Shutdown cancels it.
 	ctx, cancel := context.WithTimeout(s.ctx, publishTimeout)
 	defer cancel()
-	pub, err := github.Publish(ctx, s.vercel, ws.Sandbox.SessionID, gh, github.PublishOptions{
-		Repo: ws.Repo, Base: ws.Base, BaseSHA: ws.BaseSHA, Branch: ws.Branch, Dir: ws.Dir,
+	pub, err := s.gitPublish(ws.git, ctx, gh, github.PublishOptions{
 		Title: req.Title, Body: req.Body, Draft: req.Draft, Secrets: secrets,
 	})
 	if errors.Is(err, github.ErrNoChanges) {
-		s.addEntry(ws.chat, chatEntry{Type: "notice", Text: "Nothing to publish yet: there are no changes against " + ws.Base + "."})
+		s.addEntry(ws.chat, chatEntry{Type: "notice", Text: "Nothing to publish yet: the branch has no commits or changes beyond " + ws.Base + "."})
 		writeError(w, http.StatusUnprocessableEntity, err.Error())
 		return
 	}
@@ -360,7 +474,7 @@ func (s *Server) workspacePullRequest(w http.ResponseWriter, r *http.Request) {
 	ws.chat.err = ""
 	ws.chat.add(chatEntry{Type: "pull_request", PullRequest: pub})
 	s.mu.Unlock()
-	log.Printf("workspace %s: pushed %s to %s, pull request %s (created=%t)", ws.Name, pub.Commit, ws.Branch, pub.URL, pub.Created)
+	log.Printf("workspace %s: pushed %s to %s (forced=%t), pull request %s (created=%t)", ws.Name, pub.Commit, ws.Branch, pub.Forced, pub.URL, pub.Created)
 	status := http.StatusOK
 	if pub.Created {
 		status = http.StatusCreated

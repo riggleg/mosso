@@ -18,6 +18,7 @@ const state = {
   sending: false,
   publishing: false,
   repos: null,
+  github: null, // GET /github/auth: whether GitHub is connected (never the token)
 };
 
 // ---------- helpers ----------
@@ -101,15 +102,90 @@ const authHint = /\b(401|403)\b|auth|log ?in|oauth|token|credential|unauthori[sz
 
 async function loadChecks() {
   const list = $("checks");
-  const item = (label, ok, detail) =>
-    h("li", {}, h("span", { class: ok ? "check-ok" : "check-bad", text: ok ? "●" : "○" }), h("span", { text: label }), h("span", { class: "check-detail", title: detail || "", text: detail || "" }));
+  const item = (label, ok, detail, action) =>
+    h(
+      "li",
+      {},
+      h("span", { class: ok ? "check-ok" : "check-bad", text: ok ? "●" : "○" }),
+      h("span", { text: label }),
+      h("span", { class: "check-detail", title: detail || "", text: detail || "" }),
+      action || null,
+    );
   const [claude, github] = await Promise.all([api("GET", "/claude/auth").catch((e) => ({ error: e.message })), api("GET", "/github/auth").catch((e) => ({ error: e.message }))]);
+  state.github = github;
+  const ghOK = github.configured && !github.error;
+  let ghDetail = !github.configured ? "not connected" : github.login ? "@" + github.login : "token problem";
+  const days = github.expires_at ? Math.floor((new Date(github.expires_at).getTime() - Date.now()) / 86400000) : null;
+  if (ghOK && days !== null && days < 14) ghDetail += days < 0 ? " · expired" : ` · expires in ${days}d`;
+  const ghButton = h("button", { type: "button", class: "small check-action", text: github.configured ? "Replace" : "Connect", onclick: openGitHub });
   list.replaceChildren(
     item("Vercel", !(state.listError && state.listError.status === 503), state.listError && state.listError.status === 503 ? "not configured" : ""),
     item("Claude", claude.configured, claude.configured ? claude.source : "run mosso auth claude"),
-    item("GitHub", github.configured && !github.error, !github.configured ? "run mosso auth github" : github.login ? "@" + github.login : "token problem"),
+    item("GitHub", ghOK, ghDetail, ghButton),
   );
-  if (github.error && github.configured) list.lastChild.title = github.error;
+  const ghItem = list.lastChild;
+  ghItem.title = github.error || (github.expires_at ? "Token expires " + new Date(github.expires_at).toLocaleDateString() : "");
+  if (ghOK && days !== null && days < 14) ghItem.querySelector(".check-detail").classList.add("soon");
+  render();
+}
+
+// ---------- connecting GitHub ----------
+
+function openGitHub() {
+  const gh = state.github || {};
+  $("github-heading").textContent = gh.configured ? "Replace the GitHub token" : "Connect GitHub";
+  const current = $("github-current");
+  if (gh.configured) {
+    const where = { keychain: "the macOS Keychain", env: "MOSSO_GITHUB_TOKEN", memory: "memory, until Mosso stops" }[gh.source] || gh.source;
+    let text = gh.login ? `Connected as @${gh.login}, with a token from ${where}.` : `A token is configured (${where}), but GitHub reports a problem: ${gh.error || "unknown"}.`;
+    if (gh.expires_at) text += ` It expires on ${new Date(gh.expires_at).toLocaleDateString()}.`;
+    current.textContent = text + " A new token replaces it for every workspace, without a restart.";
+    current.classList.remove("hidden");
+  } else {
+    current.classList.add("hidden");
+  }
+  $("github-create").href = gh.create_url || "https://github.com/settings/personal-access-tokens/new";
+  $("github-storage").textContent =
+    gh.storage === "memory"
+      ? "This system has no macOS Keychain, so Mosso keeps the token in memory until it stops (set MOSSO_GITHUB_TOKEN to keep it across restarts). The browser does not store it."
+      : "Mosso checks the token with GitHub and saves it in your macOS Keychain; it is used for every workspace and never sent into a sandbox. The browser does not store it.";
+  $("github-token").value = "";
+  $("github-error").classList.add("hidden");
+  $("github-submit").disabled = false;
+  $("github-submit").textContent = "Connect";
+  $("github-dialog").showModal();
+  $("github-token").focus();
+}
+
+function closeGitHub() {
+  $("github-token").value = "";
+  $("github-dialog").close();
+}
+
+async function submitGitHub(ev) {
+  ev.preventDefault();
+  const input = $("github-token");
+  const token = input.value.trim();
+  if (!token) return;
+  // Clear the field at once: the token lives only in this request.
+  input.value = "";
+  const err = $("github-error");
+  err.classList.add("hidden");
+  $("github-submit").disabled = true;
+  $("github-submit").textContent = "Checking…";
+  try {
+    await api("POST", "/github/auth", { token });
+    closeGitHub();
+    state.repos = null; // the new token may see other repositories
+    hideBanner();
+    await loadChecks();
+  } catch (e) {
+    err.textContent = e.message;
+    err.classList.remove("hidden");
+    $("github-submit").disabled = false;
+    $("github-submit").textContent = "Try again";
+    input.focus();
+  }
 }
 
 // ---------- workspace list ----------
@@ -234,10 +310,14 @@ function lastEntryOf(types) {
 
 function claudeRunning() {
   // A turn is running if the latest prompt has not been followed by its end.
-  const last = lastEntryOf(["user", "result", "error", "pull_request", "notice"]);
-  if (!last) return false;
-  if (last.type === "user") return true;
-  return last.type === "notice" && last.text.startsWith("Installing");
+  // Notices during a turn (installing, fetching from GitHub) do not end it.
+  for (let i = state.entries.length - 1; i >= 0; i--) {
+    const e = state.entries[i];
+    if (e.type === "user") return true;
+    if (["result", "error", "pull_request"].includes(e.type)) return false;
+    if (e.type === "notice" && /^(Stopped|Publishing|Nothing to publish)/.test(e.text)) return false;
+  }
+  return false;
 }
 
 function renderWorking() {
@@ -292,6 +372,7 @@ function render() {
     emptyErr.classList.add("hidden");
   }
   $("empty-new").disabled = !!state.listError;
+  $("empty-connect").classList.toggle("hidden", !state.github || !!state.github.configured);
   $("new-workspace").disabled = !!state.listError;
   if (hasWs) {
     renderHeader();
@@ -399,7 +480,7 @@ function renderEntry(e) {
         h(
           "div",
           { class: "entry pr-card" },
-          h("strong", { text: pr.created ? "Opened pull request" : "Updated pull request" }),
+          h("strong", { text: pr.created ? "Opened pull request" : pr.forced ? "Updated pull request (rebased, pushed with --force-with-lease)" : "Updated pull request" }),
           h("a", { href: pr.url, target: "_blank", rel: "noopener noreferrer", text: `#${pr.number} ↗` }),
           h("span", { class: "muted", text: `${pr.branch} @ ${pr.commit.slice(0, 7)}` }),
         ),
@@ -415,9 +496,12 @@ function errorBox(text, forHint) {
     box.appendChild(
       h("span", {
         class: "hint",
-        text: "If this is an authentication problem, store a fresh token with `mosso auth claude` (or `mosso auth github` for GitHub errors); Mosso reads it again on the next request, without a restart.",
+        text: "If this is an authentication problem, store a fresh token with `mosso auth claude`, or for GitHub errors use Connect GitHub (Replace) in the sidebar; Mosso uses the new token from the next request on, without a restart.",
       }),
     );
+  }
+  if (/github|token|push/i.test(forHint || "") && /expired|revoked|lacks access|not found/i.test(forHint || "")) {
+    box.appendChild(h("button", { type: "button", class: "small", text: "Replace the GitHub token", onclick: openGitHub }));
   }
   return box;
 }
@@ -745,6 +829,10 @@ async function submitCreate(ev) {
   } catch (e) {
     err.textContent = e.message;
     err.classList.remove("hidden");
+    if (e.status === 503 && /GitHub is not connected/.test(e.message)) {
+      $("create-dialog").close();
+      openGitHub();
+    }
   } finally {
     clearInterval(poll);
     setCreating(false);
@@ -768,6 +856,10 @@ function init() {
   $("publish-form").addEventListener("submit", submitPublish);
   $("publish-cancel").addEventListener("click", () => $("publish-dialog").close());
   $("terminate").addEventListener("click", terminate);
+  $("empty-connect").addEventListener("click", openGitHub);
+  $("github-form").addEventListener("submit", submitGitHub);
+  $("github-cancel").addEventListener("click", closeGitHub);
+  $("github-dialog").addEventListener("close", () => ($("github-token").value = ""));
   $("stop").addEventListener("click", stopTurn);
   $("banner-close").addEventListener("click", hideBanner);
   $("composer").addEventListener("submit", (e) => {

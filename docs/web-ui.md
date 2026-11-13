@@ -15,7 +15,11 @@ frontend build step, Node.js dependency or separate frontend server.
    [vercel-sandbox.md](vercel-sandbox.md), [claude-code.md](claude-code.md)
    and [github.md](github.md).
 2. Run `make run` and open <http://127.0.0.1:8080>. The sidebar footer shows
-   whether Vercel, Claude and GitHub are configured.
+   whether Vercel, Claude and GitHub are configured. Click **Connect** next to
+   *GitHub* (or **Connect GitHub** on the welcome screen), open the
+   preconfigured GitHub token link, choose the repositories, generate the
+   token and paste it into the password field. **Replace** swaps in a new
+   token later. See [github.md](github.md#connect-github).
 3. Click **+ New** and pick or type a repository (`owner/repo`) and, optionally,
    a base branch. The suggestions list the repositories and branches your
    GitHub token can access. Mosso provisions a sandbox, clones the base branch
@@ -31,7 +35,10 @@ frontend build step, Node.js dependency or separate frontend server.
    request link and whether it was opened or updated, and the header links
    to it. If nothing changed, the chat says so and nothing is pushed.
 7. Keep working and click **Update PR** to push the new work to the same pull
-   request.
+   request. Before each message Mosso fetches the base branch, so you can ask
+   Claude to rebase onto `origin/<base>` when the pull request has conflicts;
+   the rebased branch is pushed with `--force-with-lease`. See
+   [github.md](github.md#rebasing-an-open-pull-request).
 8. Click **Terminate** and confirm to destroy the sandbox. The branch and pull
    request stay on GitHub.
 
@@ -96,7 +103,7 @@ browser ──POST /workspaces/{name}/chat──────────▶ Moss
 These come in addition to the endpoints in [github.md](github.md) and
 [claude-code.md](claude-code.md), which the UI also uses (`POST /workspaces`,
 `POST …/pull-request`, `DELETE /workspaces/{name}`, `GET /claude/auth`,
-`GET /github/auth`).
+`GET /github/auth`, `POST /github/auth`).
 
 | Method & path                              | Description |
 | ------------------------------------------ | ----------- |

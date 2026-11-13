@@ -2,13 +2,13 @@ package github
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestValidRepoAndBranch(t *testing.T) {
@@ -70,19 +70,30 @@ func TestRepoNotFound(t *testing.T) {
 	}
 }
 
-func TestTreeEntryJSON(t *testing.T) {
-	content, sha := "hi", strings.Repeat("a", 40)
-	for _, tc := range []struct {
-		e    treeEntry
-		want string
-	}{
-		{treeEntry{Path: "a", Mode: "100644", Type: "blob", Content: &content}, `{"content":"hi","mode":"100644","path":"a","type":"blob"}`},
-		{treeEntry{Path: "a", Mode: "100644", Type: "blob", SHA: &sha}, `{"mode":"100644","path":"a","sha":"` + sha + `","type":"blob"}`},
-		{treeEntry{Path: "a", Mode: "100644", Type: "blob"}, `{"mode":"100644","path":"a","sha":null,"type":"blob"}`},
-	} {
-		got, _ := json.Marshal(tc.e)
-		if string(got) != tc.want {
-			t.Errorf("got %s, want %s", got, tc.want)
+func TestClientReportsTokenExpirationAndPermissionHints(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("GitHub-Authentication-Token-Expiration", "2026-12-01 08:00:00 UTC")
+		if r.URL.Path == "/user" {
+			_, _ = io.WriteString(w, `{"login":"octo","id":42}`)
+			return
 		}
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = io.WriteString(w, `{"message":"Resource not accessible by personal access token"}`)
+	}))
+	defer srv.Close()
+	c := NewClient("tok")
+	c.BaseURL = srv.URL
+	if !c.TokenExpiration().IsZero() {
+		t.Fatal("expiration should be unknown before a request")
+	}
+	if _, err := c.User(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := c.TokenExpiration(); got.Format(time.RFC3339) != "2026-12-01T08:00:00Z" {
+		t.Fatalf("expiration = %v", got)
+	}
+	_, err := c.createPullRequest(context.Background(), testRepo, NewPullRequest{Title: "x", Head: "mosso/x", Base: "main"})
+	if err == nil || !strings.Contains(err.Error(), "Pull requests set to Read and write") {
+		t.Fatalf("err = %v, want a permissions hint", err)
 	}
 }

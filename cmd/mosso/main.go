@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"syscall"
 	"time"
@@ -51,6 +52,10 @@ func main() {
 		log.Printf("GitHub workspaces disabled until a token is configured: %v", err)
 	} else {
 		log.Printf("GitHub token found (%s)", source)
+	}
+	// Fetches and pushes for workspaces run here, not in the sandbox.
+	if _, err := exec.LookPath("git"); err != nil {
+		log.Print("git is not installed on this machine: workspaces cannot fetch from or push to GitHub until it is (on macOS: xcode-select --install)")
 	}
 	srv := server.New(client)
 	httpSrv := &http.Server{Addr: *addr, Handler: srv.Handler(), ReadHeaderTimeout: 10 * time.Second}

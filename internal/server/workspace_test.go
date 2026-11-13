@@ -2,8 +2,8 @@ package server
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -17,19 +17,27 @@ import (
 const (
 	testGitHubToken = "github_pat_11SERVERTEST_secretvalue"
 	testBaseSHA     = "1111111111111111111111111111111111111111"
-	testBaseTree    = "2222222222222222222222222222222222222222"
-	testHeadTree    = "3333333333333333333333333333333333333333"
+	testNewBaseSHA  = "2222222222222222222222222222222222222222"
 	testCommitSHA   = "4444444444444444444444444444444444444444"
-	testBlobSHA     = "5555555555555555555555555555555555555555"
 )
 
-// fakeGitHubAPI is an in-memory GitHub REST API for octo/widgets.
+// fakeGitHubAPI is an in-memory GitHub for octo/widgets: the REST
+// endpoints Mosso calls directly, plus fakes of the server-side Git
+// operations (sync and publish), which internal/github tests with real Git.
 type fakeGitHubAPI struct {
 	mu       sync.Mutex
 	private  bool
+	token    string // accepted token; testGitHubToken if empty
 	requests []string
-	head     string // working branch head; "" until created
 	pulls    []map[string]any
+
+	base      string // base branch head on "GitHub"; the clone's if empty
+	seen      string // base head the last sync reported
+	syncErr   error
+	syncs     int
+	noChanges bool
+	publishes []github.PublishOptions
+	pubTokens []github.Token
 }
 
 func (f *fakeGitHubAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -41,13 +49,17 @@ func (f *fakeGitHubAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(status)
 		_ = json.NewEncoder(w).Encode(v)
 	}
-	if r.Header.Get("Authorization") != "Bearer "+testGitHubToken {
+	token := f.token
+	if token == "" {
+		token = testGitHubToken
+	}
+	if r.Header.Get("Authorization") != "Bearer "+token {
 		reply(401, map[string]string{"message": "Bad credentials"})
 		return
 	}
+	w.Header().Set("GitHub-Authentication-Token-Expiration", "2026-12-01 00:00:00 UTC")
 	const repo = "/repos/octo/widgets"
-	p := r.URL.Path
-	switch {
+	switch p := r.URL.Path; {
 	case p == "/user":
 		reply(200, map[string]any{"login": "octo", "id": 42, "name": "Octo Cat"})
 	case p == "/user/repos":
@@ -56,53 +68,59 @@ func (f *fakeGitHubAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		reply(200, []map[string]string{{"name": "main"}, {"name": "dev"}})
 	case p == repo:
 		reply(200, map[string]any{"full_name": "octo/widgets", "default_branch": "main", "private": f.private})
-	case strings.HasPrefix(p, repo+"/git/ref/heads/"):
-		if f.head == "" {
-			reply(404, map[string]string{"message": "Not Found"})
-			return
-		}
-		reply(200, map[string]any{"object": map[string]string{"sha": f.head}})
-	case strings.HasPrefix(p, repo+"/git/commits/"):
-		reply(200, map[string]any{"tree": map[string]string{"sha": testHeadTree}})
-	case p == repo+"/git/blobs":
-		reply(201, map[string]string{"sha": testBlobSHA})
-	case p == repo+"/git/trees":
-		reply(201, map[string]string{"sha": testHeadTree})
-	case p == repo+"/git/commits":
-		reply(201, map[string]string{"sha": testCommitSHA})
-	case p == repo+"/git/refs" || strings.HasPrefix(p, repo+"/git/refs/heads/"):
-		f.head = testCommitSHA
-		reply(201, map[string]string{})
-	case p == repo+"/pulls" && r.Method == http.MethodGet:
-		reply(200, f.pulls)
-	case p == repo+"/pulls" && r.Method == http.MethodPost:
-		var in map[string]any
-		_ = json.NewDecoder(r.Body).Decode(&in)
-		in["number"], in["html_url"] = 7, "https://github.com/octo/widgets/pull/7"
-		f.pulls = append(f.pulls, in)
-		reply(201, in)
 	default:
 		reply(404, map[string]string{"message": "Not Found"})
 	}
 }
 
-// fakeRepoSandbox scripts the sandbox side of a workspace: clone prints the
-// base commit, commit reports one modified file (unless noChanges), and the
-// read script returns its content. Anything else is a Claude Code run.
-func fakeRepoSandbox(noChanges *bool) func(cmd map[string]any) string {
+// sync fakes Mirror.Sync: origin/main follows f.base.
+func (f *fakeGitHubAPI) sync(m *github.Mirror, _ context.Context, tok github.Token) (github.Synced, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.syncs++
+	if f.syncErr != nil {
+		return github.Synced{}, f.syncErr
+	}
+	if tok.Reveal() == "" {
+		return github.Synced{}, errors.New("sync without a token")
+	}
+	if f.seen == "" {
+		f.seen = m.Options().BaseSHA
+	}
+	if f.base == "" {
+		f.base = f.seen
+	}
+	out := github.Synced{Before: github.Heads{Base: f.seen}, After: github.Heads{Base: f.base}}
+	f.seen = f.base
+	return out, nil
+}
+
+// publish fakes Mirror.Publish: it opens pull request #7 once.
+func (f *fakeGitHubAPI) publish(m *github.Mirror, _ context.Context, gh *github.Client, opts github.PublishOptions) (*github.Published, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.publishes = append(f.publishes, opts)
+	f.pubTokens = append(f.pubTokens, gh.Token())
+	if f.noChanges {
+		return nil, github.ErrNoChanges
+	}
+	branch := m.Options().Branch
+	out := &github.Published{Branch: branch, Commit: testCommitSHA,
+		PullRequest: github.PullRequest{Number: 7, URL: "https://github.com/octo/widgets/pull/7"}}
+	if len(f.pulls) == 0 {
+		f.pulls = append(f.pulls, map[string]any{"head": branch, "base": "main", "title": opts.Title, "draft": opts.Draft})
+		out.Created = true
+	}
+	return out, nil
+}
+
+// fakeRepoSandbox scripts the sandbox side of a workspace: the clone
+// prints the base commit; anything else is a Claude Code run.
+func fakeRepoSandbox() func(cmd map[string]any) string {
 	return func(cmd map[string]any) string {
 		args, _ := json.Marshal(cmd["args"])
-		switch s := string(args); {
-		case strings.Contains(s, "clone --quiet"):
+		if strings.Contains(string(args), "clone --quiet") {
 			return testBaseSHA + "\n"
-		case strings.Contains(s, "git diff-tree"):
-			diff := ""
-			if !*noChanges {
-				diff = ":100644 100644 " + testBaseSHA + " " + testBlobSHA + " M\x00README.md\x00"
-			}
-			return testBaseTree + "\n" + testHeadTree + "\n" + base64.StdEncoding.EncodeToString([]byte(diff)) + "\n"
-		case strings.Contains(s, "cat-file --batch-check"):
-			return base64.StdEncoding.EncodeToString([]byte("# widgets, improved\n")) + "\n"
 		}
 		return fakeClaude(cmd)
 	}
@@ -112,11 +130,16 @@ func withGitHub(t *testing.T, srv *Server, api *fakeGitHubAPI) {
 	t.Helper()
 	ts := httptest.NewServer(api)
 	t.Cleanup(ts.Close)
-	srv.githubClient = func(context.Context) (*github.Client, string, error) {
-		c := github.NewClient(testGitHubToken)
+	srv.newGitHubClient = func(tok github.Token) *github.Client {
+		c := github.NewClient(tok)
 		c.BaseURL = ts.URL
-		return c, github.SourceKeychain, nil
+		return c
 	}
+	srv.githubClient = func(context.Context) (*github.Client, string, error) {
+		return srv.newGitHubClient(testGitHubToken), github.SourceKeychain, nil
+	}
+	srv.gitSync = api.sync
+	srv.gitPublish = api.publish
 }
 
 type testWorkspace struct {
@@ -137,8 +160,7 @@ func TestWorkspaceToPullRequest(t *testing.T) {
 	withToken(srv, testClaudeToken, nil)
 	api := &fakeGitHubAPI{}
 	withGitHub(t, srv, api)
-	noChanges := false
-	fake.stdoutFor = fakeRepoSandbox(&noChanges)
+	fake.stdoutFor = fakeRepoSandbox()
 	h := srv.Handler()
 
 	rec := do(t, h, http.MethodPost, "/workspaces", `{"repo":"octo/widgets"}`)
@@ -161,8 +183,17 @@ func TestWorkspaceToPullRequest(t *testing.T) {
 	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "you said improve the readme") {
 		t.Fatalf("message status = %d: %s", rec.Code, rec.Body)
 	}
-	if run := fake.cmds[len(fake.cmds)-1]; run["cwd"] != ws.Dir {
+	run := fake.cmds[len(fake.cmds)-1]
+	if run["cwd"] != ws.Dir {
 		t.Fatalf("claude ran in %v, want %s", run["cwd"], ws.Dir)
+	}
+	// Claude is told how Git works here, and origin/* was refreshed first.
+	if args, _ := json.Marshal(run["args"]); !strings.Contains(string(args), "--append-system-prompt") ||
+		!strings.Contains(string(args), "origin/main") || !strings.Contains(string(args), ws.Branch) {
+		t.Fatalf("claude args lack the workspace prompt: %s", args)
+	}
+	if api.syncs != 2 { // once while creating, once before the turn
+		t.Fatalf("syncs = %d, want 2", api.syncs)
 	}
 
 	rec = do(t, h, http.MethodPost, "/workspaces/"+ws.Name+"/pull-request", `{"title":"Improve README","draft":true}`)
@@ -179,16 +210,21 @@ func TestWorkspaceToPullRequest(t *testing.T) {
 		t.Fatalf("unexpected pull request: %v", pr)
 	}
 
-	// Again with nothing new: same pull request, nothing pushed.
-	pushes := len(api.requests)
+	// Publishes refuse to push the Claude token, and use the GitHub token.
+	if p := api.publishes[0]; p.Title != "Improve README" || !p.Draft || len(p.Secrets) != 1 || p.Secrets[0] != testClaudeToken {
+		t.Fatalf("unexpected publish options: %+v", p)
+	}
+	if api.pubTokens[0].Reveal() != testGitHubToken {
+		t.Fatal("publish did not use the GitHub token")
+	}
+
+	// Again: the same pull request is updated.
 	rec = do(t, h, http.MethodPost, "/workspaces/"+ws.Name+"/pull-request", `{}`)
 	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"created":false`) {
 		t.Fatalf("second pull request status = %d: %s", rec.Code, rec.Body)
 	}
-	for _, r := range api.requests[pushes:] {
-		if strings.HasPrefix(r, "POST") || strings.HasPrefix(r, "PATCH") {
-			t.Fatalf("unexpected write on a no-op publish: %s", r)
-		}
+	if p := api.publishes[1]; !strings.HasPrefix(p.Title, "Changes from Mosso workspace ") {
+		t.Fatalf("default title = %q", p.Title)
 	}
 
 	rec = do(t, h, http.MethodGet, "/workspaces/"+ws.Name, "")
@@ -225,8 +261,7 @@ func TestWorkspacePrivateRepoSendsTokenOnlyToClone(t *testing.T) {
 	srv, fake := newTestServer(t)
 	withToken(srv, testClaudeToken, nil)
 	withGitHub(t, srv, &fakeGitHubAPI{private: true})
-	noChanges := false
-	fake.stdoutFor = fakeRepoSandbox(&noChanges)
+	fake.stdoutFor = fakeRepoSandbox()
 	h := srv.Handler()
 
 	rec := do(t, h, http.MethodPost, "/workspaces", `{"repo":"octo/widgets","base":"main"}`)
@@ -258,8 +293,8 @@ func TestWorkspacePullRequestWithoutChanges(t *testing.T) {
 	srv, fake := newTestServer(t)
 	api := &fakeGitHubAPI{}
 	withGitHub(t, srv, api)
-	noChanges := true
-	fake.stdoutFor = fakeRepoSandbox(&noChanges)
+	api.noChanges = true
+	fake.stdoutFor = fakeRepoSandbox()
 	h := srv.Handler()
 	var ws testWorkspace
 	_ = json.Unmarshal(do(t, h, http.MethodPost, "/workspaces", `{"repo":"octo/widgets"}`).Body.Bytes(), &ws)
@@ -268,16 +303,15 @@ func TestWorkspacePullRequestWithoutChanges(t *testing.T) {
 	if rec.Code != http.StatusUnprocessableEntity || !strings.Contains(rec.Body.String(), "no changes") {
 		t.Fatalf("status = %d: %s", rec.Code, rec.Body)
 	}
-	if len(api.pulls) != 0 || api.head != "" {
-		t.Fatal("nothing should be pushed or opened")
+	if len(api.pulls) != 0 {
+		t.Fatal("nothing should be opened")
 	}
 }
 
 func TestWorkspaceCloneFailureDestroysSandbox(t *testing.T) {
 	srv, fake := newTestServer(t)
 	withGitHub(t, srv, &fakeGitHubAPI{})
-	noChanges := false
-	fake.stdoutFor = fakeRepoSandbox(&noChanges)
+	fake.stdoutFor = fakeRepoSandbox()
 	fake.exitFor = func(map[string]any) int { return 128 }
 	h := srv.Handler()
 
