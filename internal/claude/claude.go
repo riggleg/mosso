@@ -28,6 +28,10 @@ const (
 
 	// maxLineBytes caps one stream-json line; longer lines are skipped.
 	maxLineBytes = 16 << 20
+	// maxEventBytes caps the stream-json output whose events are kept in
+	// a Turn. Later events still reach Request.OnEvent, and the final
+	// result is still read.
+	maxEventBytes = 16 << 20
 	// maxToolResultBytes caps each tool result returned to API callers.
 	maxToolResultBytes = 16 << 10
 )
@@ -238,6 +242,7 @@ func ParseStream(out string) (*Turn, error) {
 type parser struct {
 	turn      Turn
 	sawResult bool
+	bytes     int // stream-json bytes whose events are in turn.Events
 	onSession func(string)
 	onEvent   func(Event)
 }
@@ -263,8 +268,14 @@ func (p *parser) line(line string) {
 			p.turn.Model = m.Model
 		}
 	case "assistant", "user":
+		keep := p.bytes+len(line) <= maxEventBytes
+		if keep {
+			p.bytes += len(line)
+		}
 		for _, e := range contentEvents(m.Message.Content, m.ParentToolUseID) {
-			p.turn.Events = append(p.turn.Events, e)
+			if keep {
+				p.turn.Events = append(p.turn.Events, e)
+			}
 			if p.onEvent != nil {
 				p.onEvent(e)
 			}

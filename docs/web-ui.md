@@ -49,6 +49,9 @@ replayed from the server when you come back.
 - **Sandboxes expire.** A workspace sandbox lives 30 minutes (Vercel stops
   it then). The header counts down. After expiry the workspace shows an error:
   publish before then, and terminate and recreate the workspace afterwards.
+- Each chat log is capped at about 32 MiB in memory. Past that, new tool
+  inputs and outputs are replaced with a placeholder (the chat says so);
+  Claude's messages and progress are still shown.
 - Claude's progress streams one message at a time (each text block, tool call
   and tool result), not token by token.
 - Single user, local only: the server has no authentication and only listens

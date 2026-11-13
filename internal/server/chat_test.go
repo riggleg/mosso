@@ -464,3 +464,27 @@ func TestWorkspaceMessageStopsWhenClientDisconnects(t *testing.T) {
 		t.Fatalf("entries = %s, want the turn stopped", entryTypes(e))
 	}
 }
+
+func TestChatLogIsBounded(t *testing.T) {
+	c := newChat()
+	big := strings.Repeat("x", 1<<20)
+	for i := 0; i < maxChatBytes/len(big)+5; i++ {
+		c.add(chatEntry{Type: "claude", Event: &claude.Event{Type: "tool_result", ToolUseID: "t", Content: big}})
+	}
+	if c.size > maxChatBytes || !c.full {
+		t.Fatalf("size = %d (full=%t), want at most %d", c.size, c.full, maxChatBytes)
+	}
+	last := c.entries[len(c.entries)-1]
+	if last.Event.Content != omitted || last.Event.ToolUseID != "t" {
+		t.Fatalf("last entry = %+v, want its content omitted", last.Event)
+	}
+	notices := 0
+	for _, e := range c.entries {
+		if e.Type == "notice" {
+			notices++
+		}
+	}
+	if notices != 1 {
+		t.Fatalf("got %d notices, want one", notices)
+	}
+}

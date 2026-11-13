@@ -18,6 +18,13 @@ import (
 // streamPing is how often an idle event stream sends a keep-alive comment.
 const streamPing = 15 * time.Second
 
+// maxChatBytes bounds the memory one chat log uses. Past it, tool inputs and
+// outputs are no longer kept; Claude's progress is still recorded.
+const maxChatBytes = 32 << 20
+
+// omitted replaces tool data once a chat log is full.
+const omitted = "[mosso: not kept, the chat log is full]"
+
 // chat is a workspace's conversation with Claude Code: a log of prompts,
 // Claude's activity and pull request results that every browser tab replays.
 // It lives in memory, so it is lost when the workspace is destroyed or Mosso
@@ -31,6 +38,8 @@ type chat struct {
 	changed chan struct{}
 	running *turnRun // the Claude Code turn in progress, if any
 	err     string   // why the last turn or publish failed
+	size    int      // approximate bytes held by entries
+	full    bool     // size reached maxChatBytes
 }
 
 func newChat() *chat { return &chat{changed: make(chan struct{})} }
@@ -41,6 +50,31 @@ func (c *chat) notify() {
 }
 
 func (c *chat) add(e chatEntry) {
+	n := len(e.Text)
+	if e.Event != nil {
+		n += len(e.Event.Text) + len(e.Event.Input) + len(e.Event.Content)
+	}
+	if e.Result != nil {
+		n += len(e.Result.Text)
+	}
+	if c.size+n > maxChatBytes && e.Event != nil {
+		if !c.full {
+			c.full = true
+			c.append(chatEntry{Type: "notice", Text: "This chat reached Mosso's size limit, so further tool inputs and outputs are not shown. Claude keeps working."})
+		}
+		ev := *e.Event
+		ev.Input = nil
+		if ev.Content != "" {
+			ev.Content = omitted
+		}
+		e.Event = &ev
+		n = len(ev.Text)
+	}
+	c.size += n
+	c.append(e)
+}
+
+func (c *chat) append(e chatEntry) {
 	e.ID = len(c.entries)
 	e.Time = time.Now().UTC()
 	c.entries = append(c.entries, e)

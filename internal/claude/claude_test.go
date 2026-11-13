@@ -316,3 +316,21 @@ func TestLoadToken(t *testing.T) {
 		t.Fatal("keychain errors must be reported, not silently skipped")
 	}
 }
+
+func TestParseStreamBoundsKeptEvents(t *testing.T) {
+	line := `{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t","content":"` + strings.Repeat("x", 1<<20) + `"}]}}`
+	n := maxEventBytes/len(line) + 3
+	out := strings.Repeat(line+"\n", n) + `{"type":"result","result":"done","session_id":"` + testSession + `"}`
+	var streamed int
+	p := &parser{turn: Turn{Events: []Event{}}, onEvent: func(Event) { streamed++ }}
+	for _, l := range strings.Split(out, "\n") {
+		p.line(l)
+	}
+	turn, err := p.finish()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if streamed != n || len(turn.Events) >= n || len(turn.Events) == 0 || turn.Result != "done" {
+		t.Fatalf("streamed %d, kept %d of %d events, result %q", streamed, len(turn.Events), n, turn.Result)
+	}
+}
