@@ -3,6 +3,8 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"strings"
@@ -49,7 +51,6 @@ func TestGitHubEndToEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Logf("GitHub token source: %s", source)
-	gh := github.NewClient(ghToken)
 
 	srv := New(vercel.NewClient(cfg))
 	t.Cleanup(func() {
@@ -77,15 +78,12 @@ func TestGitHubEndToEnd(t *testing.T) {
 			t.Logf("keeping branch %s and pull request #%d; close and delete them when done", ws.Branch, prNumber)
 			return
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
-		defer cancel()
 		if prNumber != 0 {
-			if err := gh.ClosePullRequest(ctx, ws.Repo, prNumber); err != nil {
-				t.Errorf("%v: close it by hand", err)
-			}
+			e2eGitHub(t, ghToken, http.MethodPatch, fmt.Sprintf("/repos/%s/pulls/%d", ws.Repo, prNumber), `{"state":"closed"}`)
 		}
-		if err := gh.DeleteBranch(ctx, ws.Repo, ws.Branch); err != nil {
-			t.Errorf("%v: delete it by hand", err)
+		// Only ever delete the branch this test created.
+		if strings.HasPrefix(ws.Branch, github.BranchPrefix) && github.ValidBranch(ws.Branch) {
+			e2eGitHub(t, ghToken, http.MethodDelete, "/repos/"+ws.Repo+"/git/refs/heads/"+ws.Branch, "")
 		}
 	})
 
@@ -125,5 +123,26 @@ func TestGitHubEndToEnd(t *testing.T) {
 	rec = do(t, h, http.MethodPost, prPath, `{}`)
 	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), pub.URL) {
 		t.Fatalf("second publish: %d %s", rec.Code, rec.Body)
+	}
+}
+
+// e2eGitHub sends one cleanup request to the GitHub API and reports a
+// failure (without the token) so the resource can be removed by hand.
+func e2eGitHub(t *testing.T, token github.Token, method, path, body string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	req, _ := http.NewRequestWithContext(ctx, method, github.DefaultBaseURL+path, strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+token.Reveal())
+	req.Header.Set("Accept", "application/vnd.github+json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Errorf("cleanup %s %s: %v: clean up by hand", method, path, err)
+		return
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
+	if resp.StatusCode >= 300 && resp.StatusCode != http.StatusNotFound && resp.StatusCode != http.StatusUnprocessableEntity {
+		t.Errorf("cleanup %s %s: status %d: clean up by hand", method, path, resp.StatusCode)
 	}
 }

@@ -194,9 +194,6 @@ func Publish(ctx context.Context, vc *vercel.Client, sandboxSession string, gh *
 	if err != nil {
 		return nil, err
 	}
-	if len(changes) == 0 {
-		return nil, ErrNoChanges
-	}
 	if err := readContents(ctx, vc, sandboxSession, opts.Dir, changes); err != nil {
 		return nil, err
 	}
@@ -213,6 +210,12 @@ func Publish(ctx context.Context, vc *vercel.Client, sandboxSession string, gh *
 	if err != nil {
 		return nil, err
 	}
+	// Nothing differs from the base and nothing was published before. (If
+	// an earlier publish exists and the work was since reverted, fall
+	// through so the branch is updated back to the base tree.)
+	if len(changes) == 0 && head == "" {
+		return nil, ErrNoChanges
+	}
 	parent, parentTree := opts.BaseSHA, baseTree
 	if head != "" {
 		if parentTree, err = gh.commitTree(ctx, opts.Repo, head); err != nil {
@@ -223,7 +226,10 @@ func Publish(ctx context.Context, vc *vercel.Client, sandboxSession string, gh *
 	// Trees are content-addressed, so if GitHub's tree matches the
 	// sandbox's HEAD tree the pushed files are exactly Claude's.
 	if parentTree != headTree {
-		tree, err := createTree(ctx, gh, opts.Repo, baseTree, changes, true)
+		tree := baseTree // no changes against the base: reuse its tree
+		if len(changes) > 0 {
+			tree, err = createTree(ctx, gh, opts.Repo, baseTree, changes, true)
+		}
 		if err == nil && tree != headTree {
 			// Retry without inline text content in case GitHub
 			// normalized something.

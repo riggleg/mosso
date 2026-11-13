@@ -177,27 +177,6 @@ func (c *Client) createPullRequest(ctx context.Context, repo string, pr NewPullR
 	return &PullRequest{Number: out.Number, URL: out.HTMLURL}, nil
 }
 
-// ClosePullRequest closes a pull request without merging it.
-func (c *Client) ClosePullRequest(ctx context.Context, repo string, number int) error {
-	path := fmt.Sprintf("/repos/%s/pulls/%d", repo, number)
-	if err := c.do(ctx, http.MethodPatch, path, map[string]string{"state": "closed"}, nil); err != nil {
-		return fmt.Errorf("close pull request #%d: %w", number, err)
-	}
-	return nil
-}
-
-// DeleteBranch deletes a Mosso working branch. It refuses any branch outside
-// the mosso/ prefix so it cannot remove a user's branch by mistake.
-func (c *Client) DeleteBranch(ctx context.Context, repo, branch string) error {
-	if !strings.HasPrefix(branch, BranchPrefix) || !ValidBranch(branch) {
-		return fmt.Errorf("refusing to delete branch %q: not a Mosso working branch", branch)
-	}
-	if err := c.do(ctx, http.MethodDelete, "/repos/"+repo+"/git/refs/heads/"+branch, nil, nil); err != nil && !IsNotFound(err) {
-		return fmt.Errorf("delete branch %s: %w", branch, err)
-	}
-	return nil
-}
-
 // branchHead returns the commit a branch points to, or "" if it does not
 // exist.
 func (c *Client) branchHead(ctx context.Context, repo, branch string) (string, error) {

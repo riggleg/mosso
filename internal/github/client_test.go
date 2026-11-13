@@ -70,28 +70,6 @@ func TestRepoNotFound(t *testing.T) {
 	}
 }
 
-func TestDeleteBranchOnlyDeletesMossoBranches(t *testing.T) {
-	var deleted []string
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		deleted = append(deleted, r.Method+" "+r.URL.Path)
-		w.WriteHeader(http.StatusNoContent)
-	}))
-	defer srv.Close()
-	c := NewClient("tok")
-	c.BaseURL = srv.URL
-	for _, b := range []string{"main", "feature/x", "mosso/../main"} {
-		if err := c.DeleteBranch(context.Background(), testRepo, b); err == nil {
-			t.Errorf("DeleteBranch(%q) should be refused", b)
-		}
-	}
-	if err := c.DeleteBranch(context.Background(), testRepo, "mosso/0a1b2c"); err != nil {
-		t.Fatal(err)
-	}
-	if len(deleted) != 1 || deleted[0] != "DELETE /repos/octo/widgets/git/refs/heads/mosso/0a1b2c" {
-		t.Fatalf("requests = %v", deleted)
-	}
-}
-
 func TestTreeEntryJSON(t *testing.T) {
 	content, sha := "hi", strings.Repeat("a", 40)
 	for _, tc := range []struct {

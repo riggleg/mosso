@@ -113,7 +113,9 @@ Errors (`{"error": "..."}`):
 - `400` invalid input; `404` unknown workspace, or the repository does not
   exist or the token cannot see it (no sandbox is created).
 - `409` Claude or another publish is still running in the workspace.
-- `422` no changes to publish: the working tree matches the base commit.
+- `422` no changes to publish: the working tree matches the base commit and
+  nothing was published before. If an earlier publish exists and the work was
+  reverted, the branch is updated back to the base tree instead.
 - `429` sandbox limit reached; `503` Vercel or the GitHub token is not
   configured (or the Claude token, for messages).
 - `502` the sandbox, clone, Git or GitHub API failed. The message includes

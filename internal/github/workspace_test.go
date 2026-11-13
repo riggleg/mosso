@@ -257,6 +257,31 @@ func TestPublishWithoutChanges(t *testing.T) {
 	}
 }
 
+func TestPublishAfterRevertUpdatesBranch(t *testing.T) {
+	e := newWorkspace(t, false)
+	writeFile(t, filepath.Join(e.opts.Dir, "README.md"), "changed\n")
+	first, err := e.publish(t, "Change")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Claude undoes everything: the branch must follow, not stay stale.
+	e.git(t, "reset", "--quiet", "--hard", e.base)
+	reverted, err := e.publish(t, "Revert")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref := "refs/heads/" + e.opts.Branch
+	if reverted.Created || reverted.Number != first.Number || reverted.Commit == first.Commit {
+		t.Fatalf("unexpected result: %+v", reverted)
+	}
+	if got, want := e.remote(t, "rev-parse", ref+"^{tree}"), e.remote(t, "rev-parse", "main^{tree}"); got != want {
+		t.Fatalf("branch tree %s, want the base tree %s", got, want)
+	}
+	if got := e.remote(t, "rev-parse", ref+"^"); got != first.Commit {
+		t.Fatalf("revert commit parent = %s, want %s", got, first.Commit)
+	}
+}
+
 func TestPublishRefusesCredentials(t *testing.T) {
 	const claudeToken = "sk-ant-oat01-claude-secret-token"
 	for name, content := range map[string]string{
