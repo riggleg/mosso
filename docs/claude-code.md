@@ -38,10 +38,12 @@ pull request, use a workspace; see [github.md](github.md).
    The prompt is fed on stdin. The token and prompt are passed as environment
    variables of that single command through the Vercel API request body, so they never appear
    in command arguments, URLs or logs. Auto-updates are disabled for the run.
-5. **Output**: Mosso parses the stream-json events into Claude's text, tool
-   calls and tool results, plus the final result and session ID. Any
-   occurrence of the token in the output is replaced with `[REDACTED]` before
-   it is parsed or returned.
+5. **Output**: Mosso reads the command's output while it runs and parses
+   each stream-json line as it arrives into Claude's text, tool calls and tool
+   results, plus the final result and session ID. Any occurrence of the token
+   in a line is replaced with `[REDACTED]` before it is parsed, returned or
+   streamed. Workspaces stream these events to the web UI as they happen; see
+   [web-ui.md](web-ui.md).
 6. **Follow-ups** pass the previous `session_id`; Mosso runs
    `claude -p --resume <session_id>`. Claude Code keeps the transcript on the
    sandbox's disk, so **a conversation only lives as long as its sandbox**.

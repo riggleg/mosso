@@ -26,11 +26,17 @@ implementations are acceptable for this first version.
       [claude-code.md](claude-code.md#security-model-and-limitations).
 - [x] Clone a selected repository in the sandbox.
 - [ ] Start Pi and send an instruction via its RPC mode.
-- [ ] Stream agent responses, status and tool events to Mosso.
-- [ ] Support follow-up messages and steering while Pi is active.
+- [ ] Stream agent responses, status and tool events to Mosso. Done for
+      Claude Code: events stream to the web UI while Claude runs (see
+      [web-ui.md](web-ui.md)); Pi is not integrated yet.
+- [ ] Support follow-up messages and steering while Pi is active. With Claude
+      Code: follow-ups continue the conversation and a running turn can be
+      stopped; steering a turn while it runs is not supported.
 - [x] Commit, push and open a PR; show the PR URL (with Claude Code for now).
-- [ ] Persist session metadata and chat events across UI reloads.
-- [ ] Show sessions and offer a terminate action.
+- [ ] Persist session metadata and chat events across UI reloads. Partly
+      done: the server keeps them in memory, so they survive reloads and
+      reconnects but not a Mosso restart or the end of the sandbox.
+- [x] Show sessions and offer a terminate action (web UI).
 - [ ] Run Go CI and PR secret scanning.
 
 ## P1 / defer
@@ -61,4 +67,8 @@ branch and publishes the result as a pull request through the GitHub API
 `internal/keychain`: macOS Keychain storage shared by the Claude and GitHub
 tokens.
 
-No persistence, streaming chat or UI exists yet.
+`internal/server/web`: the browser UI (plain HTML/CSS/JS embedded in the
+binary), with streaming chat over server-sent events
+(see [web-ui.md](web-ui.md)).
+
+There is no persistence yet: workspaces and chats live in memory.

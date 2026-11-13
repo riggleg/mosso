@@ -91,6 +91,8 @@ type fakeSandbox struct {
 	exitCode int
 	stdout   string
 	stderr   string
+	// chunks, if set, replaces stdout with several log entries.
+	chunks []string
 }
 
 func (f *fakeSandbox) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -105,6 +107,9 @@ func (f *fakeSandbox) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		_, _ = fmt.Fprintf(w, `{"command":{"id":"cmd_1","exitCode":%d}}`, f.exitCode)
 	case strings.HasSuffix(r.URL.Path, "/cmd/cmd_1/logs"):
 		enc := json.NewEncoder(w)
+		for _, c := range f.chunks {
+			_ = enc.Encode(map[string]string{"stream": "stdout", "data": c})
+		}
 		_ = enc.Encode(map[string]string{"stream": "stdout", "data": f.stdout})
 		_ = enc.Encode(map[string]string{"stream": "stderr", "data": f.stderr})
 	default:
@@ -189,6 +194,40 @@ func TestSendRedactsToken(t *testing.T) {
 	_, err = Send(context.Background(), vc, "sbx_1", Token(testToken), Request{Prompt: "hi"})
 	if err == nil || strings.Contains(err.Error(), testToken) || !strings.Contains(err.Error(), "[REDACTED]") {
 		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestSendStreamsEvents(t *testing.T) {
+	raw, _ := os.ReadFile("testdata/stream.jsonl")
+	secret := `{"type":"assistant","message":{"content":[{"type":"text","text":"see ` + testToken + `"}]}}` + "\n"
+	all := secret + string(raw)
+	// Split the output into chunks that cut lines (and the token) in half.
+	var chunks []string
+	for i := 0; i < len(all); i += 37 {
+		chunks = append(chunks, all[i:min(i+37, len(all))])
+	}
+	vc := newFakeSandbox(t, &fakeSandbox{chunks: chunks})
+
+	var sessions []string
+	var events []Event
+	turn, err := Send(context.Background(), vc, "sbx_1", Token(testToken), Request{
+		Prompt:    "hi",
+		OnSession: func(id string) { sessions = append(sessions, id) },
+		OnEvent:   func(e Event) { events = append(events, e) },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sessions) != 1 || sessions[0] != testSession {
+		t.Fatalf("OnSession calls = %v", sessions)
+	}
+	got, _ := json.Marshal(events)
+	want, _ := json.Marshal(turn.Events)
+	if string(got) != string(want) || len(events) != 7 {
+		t.Fatalf("streamed events %s\nwant %s", got, want)
+	}
+	if strings.Contains(string(got), testToken) || events[0].Text != "see [REDACTED]" {
+		t.Fatalf("streamed events are not redacted: %s", got)
 	}
 }
 

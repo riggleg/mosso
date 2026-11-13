@@ -39,6 +39,14 @@ type Server struct {
 	// where the token came from; replaced in tests.
 	githubClient func(context.Context) (*github.Client, string, error)
 
+	// ctx is cancelled by Shutdown; background work (Claude turns,
+	// workspace setup) derives from it instead of from a request.
+	ctx    context.Context
+	cancel context.CancelFunc
+	// streamsDone is closed by CloseStreams to end event streams.
+	streamsDone  chan struct{}
+	closeStreams sync.Once
+
 	mu        sync.Mutex
 	sandboxes map[string]vercel.Sandbox
 	creating  int  // creates in flight, counted against maxSandboxes
@@ -52,7 +60,11 @@ type Server struct {
 // New returns a Server. client may be nil, in which case sandbox endpoints
 // respond with 503 Service Unavailable.
 func New(client *vercel.Client) *Server {
+	ctx, cancel := context.WithCancel(context.Background())
 	return &Server{
+		ctx:             ctx,
+		cancel:          cancel,
+		streamsDone:     make(chan struct{}),
 		vercel:          client,
 		claudeToken:     claude.LoadToken,
 		githubClient:    loadGitHubClient,
@@ -86,6 +98,14 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /workspaces/{name}/claude/messages", s.requireVercel(s.workspaceClaudeMessage))
 	mux.HandleFunc("POST /workspaces/{name}/pull-request", s.requireVercel(s.workspacePullRequest))
 	mux.HandleFunc("DELETE /workspaces/{name}", s.requireVercel(s.destroySandbox))
+	mux.HandleFunc("POST /workspaces/{name}/chat", s.requireVercel(s.workspaceChat))
+	mux.HandleFunc("POST /workspaces/{name}/chat/stop", s.requireVercel(s.workspaceStop))
+	mux.HandleFunc("GET /workspaces/{name}/events", s.requireVercel(s.workspaceEvents))
+	mux.HandleFunc("GET /github/repos", s.githubRepos)
+	mux.HandleFunc("GET /github/repos/{owner}/{repo}/branches", s.githubBranches)
+	ui := webUI()
+	mux.Handle("GET /{$}", ui)
+	mux.Handle("GET /assets/", ui)
 	return localOnly(mux)
 }
 
@@ -291,13 +311,22 @@ func (s *Server) acquire(name string) bool {
 		return false
 	}
 	s.busy[name] = true
+	s.changedLocked(name)
 	return true
 }
 
 func (s *Server) release(name string) {
 	s.mu.Lock()
 	delete(s.busy, name)
+	s.changedLocked(name)
 	s.mu.Unlock()
+}
+
+// changedLocked wakes the event streams of a workspace whose status changed.
+func (s *Server) changedLocked(name string) {
+	if ws, ok := s.workspaces[name]; ok {
+		ws.chat.notify()
+	}
 }
 
 func writeBusy(w http.ResponseWriter) {
@@ -308,13 +337,28 @@ func (s *Server) forget(name string) {
 	s.mu.Lock()
 	delete(s.sandboxes, name)
 	delete(s.claudeInstalled, name)
-	delete(s.workspaces, name)
+	s.dropWorkspaceLocked(name)
 	s.mu.Unlock()
+}
+
+// dropWorkspaceLocked removes a workspace and its chat, stops its running
+// turn and ends its event streams.
+func (s *Server) dropWorkspaceLocked(name string) {
+	ws, ok := s.workspaces[name]
+	if !ok {
+		return
+	}
+	delete(s.workspaces, name)
+	if ws.chat.running != nil {
+		ws.chat.running.cancel()
+	}
+	ws.chat.notify()
 }
 
 // Shutdown destroys every sandbox this server created and has not yet
 // destroyed. Call it before the process exits.
 func (s *Server) Shutdown(ctx context.Context) error {
+	s.cancel() // stop Claude turns and workspace setup
 	if s.vercel == nil {
 		return nil
 	}

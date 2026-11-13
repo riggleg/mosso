@@ -85,6 +85,8 @@ func ConfigFromEnv() (Config, error) {
 type Client struct {
 	cfg  Config
 	http *http.Client
+	// stream is http without an overall timeout, for log streams.
+	stream *http.Client
 }
 
 // NewClient returns a client for cfg.
@@ -97,7 +99,9 @@ func NewClient(cfg Config) *Client {
 	if hc == nil {
 		hc = &http.Client{Timeout: 15 * time.Minute}
 	}
-	return &Client{cfg: cfg, http: hc}
+	stream := *hc
+	stream.Timeout = 0
+	return &Client{cfg: cfg, http: hc, stream: &stream}
 }
 
 // Sandbox identifies a provisioned sandbox. Commands run in its session.
@@ -231,6 +235,11 @@ type Command struct {
 	Cwd string
 	// MaxOutputBytes caps stdout and stderr each; zero uses MaxOutputBytes.
 	MaxOutputBytes int
+	// Stdout, if set, receives the command's stdout while it runs, in
+	// order and exactly once, instead of collecting it: the result's
+	// Stdout is then empty. It is called from Run's goroutine and never
+	// after Run returns.
+	Stdout func(chunk string)
 }
 
 // Exec runs script with `bash -c` in the sandbox session, waits for it to
@@ -262,6 +271,14 @@ func (c *Client) Run(ctx context.Context, sessionID string, cmd Command) (*Comma
 	}
 	cmdPath := "/v2/sandboxes/sessions/" + sid + "/cmd/" + url.PathEscape(started.Command.ID)
 
+	limit := cmd.MaxOutputBytes
+	if limit <= 0 {
+		limit = MaxOutputBytes
+	}
+	if cmd.Stdout != nil {
+		return c.follow(ctx, cmdPath, started.Command, cmd.Stdout, limit)
+	}
+
 	finished, err := c.wait(ctx, cmdPath, started.Command)
 	if err != nil {
 		if ctx.Err() != nil {
@@ -270,10 +287,6 @@ func (c *Client) Run(ctx context.Context, sessionID string, cmd Command) (*Comma
 		return nil, err
 	}
 
-	limit := cmd.MaxOutputBytes
-	if limit <= 0 {
-		limit = MaxOutputBytes
-	}
 	stdout, stderr, err := c.logs(ctx, cmdPath+"/logs", limit)
 	if err != nil {
 		return nil, fmt.Errorf("read command logs: %w", err)
@@ -309,16 +322,33 @@ func (c *Client) kill(cmdPath string) {
 	_ = c.doJSON(ctx, http.MethodPost, cmdPath+"/kill", nil, map[string]int{"signal": 15}, nil)
 }
 
-// logs reads the newline-delimited JSON log stream of a finished command.
+// logs reads the complete output of a finished command.
 func (c *Client) logs(ctx context.Context, path string, limit int) (string, string, error) {
-	resp, err := c.do(ctx, http.MethodGet, path, nil, nil)
+	var stdout, stderr limitedBuffer
+	stdout.max, stderr.max = limit, limit
+	err := c.readLogs(ctx, path, func(stream, data string) {
+		if stream == "stdout" {
+			stdout.WriteString(data)
+		} else {
+			stderr.WriteString(data)
+		}
+	})
 	if err != nil {
 		return "", "", err
 	}
-	defer resp.Body.Close()
+	return stdout.String(), stderr.String(), nil
+}
 
-	var stdout, stderr limitedBuffer
-	stdout.max, stderr.max = limit, limit
+// readLogs reads a command's newline-delimited JSON log stream and calls fn
+// with each stdout or stderr chunk. Vercel keeps the stream open while the
+// command runs, so chunks arrive as the command produces them, and ends it
+// when the command exits. Every request replays the output from the start.
+func (c *Client) readLogs(ctx context.Context, path string, fn func(stream, data string)) error {
+	resp, err := c.doStream(ctx, path)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
 	// A json.Decoder reads newline-delimited JSON with no per-line size limit,
 	// so one very large log chunk cannot fail the whole exec.
 	dec := json.NewDecoder(resp.Body)
@@ -328,31 +358,85 @@ func (c *Client) logs(ctx context.Context, path string, limit int) (string, stri
 			Data   json.RawMessage `json:"data"`
 		}
 		if err := dec.Decode(&entry); err == io.EOF {
-			break
+			return nil
 		} else if err != nil {
-			return "", "", fmt.Errorf("decode log line: %w", err)
+			return fmt.Errorf("decode log line: %w", err)
 		}
 		switch entry.Stream {
 		case "stdout", "stderr":
 			var s string
 			if err := json.Unmarshal(entry.Data, &s); err != nil {
-				return "", "", fmt.Errorf("decode log data: %w", err)
+				return fmt.Errorf("decode log data: %w", err)
 			}
-			if entry.Stream == "stdout" {
-				stdout.WriteString(s)
-			} else {
-				stderr.WriteString(s)
-			}
+			fn(entry.Stream, s)
 		case "error":
 			var e struct {
 				Code    string `json:"code"`
 				Message string `json:"message"`
 			}
 			_ = json.Unmarshal(entry.Data, &e)
-			return "", "", fmt.Errorf("log stream error %s: %s", e.Code, e.Message)
+			return fmt.Errorf("log stream error %s: %s", e.Code, e.Message)
 		}
 	}
-	return stdout.String(), stderr.String(), nil
+}
+
+// followRetries is how many times in a row follow reconnects to a log
+// stream that fails without delivering anything new.
+const followRetries = 3
+
+// follow streams a running command's stdout to onStdout until the command
+// exits. Like the official SDK, it reconnects if the log stream breaks and
+// skips the output it has already delivered. If ctx ends first, it asks
+// Vercel to terminate the command.
+func (c *Client) follow(ctx context.Context, cmdPath string, cmd apiCommand, onStdout func(string), limit int) (*CommandResult, error) {
+	var stderr limitedBuffer
+	stderr.max = limit
+	delivered := map[string]int{} // bytes delivered so far, per stream
+	for failures := 0; ; {
+		skip := map[string]int{"stdout": delivered["stdout"], "stderr": delivered["stderr"]}
+		before := delivered["stdout"] + delivered["stderr"]
+		err := c.readLogs(ctx, cmdPath+"/logs", func(stream, data string) {
+			n := min(skip[stream], len(data))
+			skip[stream] -= n
+			if data = data[n:]; data == "" {
+				return
+			}
+			delivered[stream] += len(data)
+			if stream == "stdout" {
+				onStdout(data)
+			} else {
+				stderr.WriteString(data)
+			}
+		})
+		if err == nil {
+			// The stream ended because the command exited.
+			finished, err := c.wait(ctx, cmdPath, cmd)
+			if err == nil {
+				return &CommandResult{CommandID: cmd.ID, ExitCode: *finished.ExitCode, Stderr: stderr.String()}, nil
+			}
+			if ctx.Err() != nil {
+				c.kill(cmdPath)
+			}
+			return nil, err
+		}
+		if ctx.Err() != nil {
+			c.kill(cmdPath)
+			return nil, ctx.Err()
+		}
+		if delivered["stdout"]+delivered["stderr"] > before {
+			failures = 0
+		}
+		if failures++; failures > followRetries {
+			c.kill(cmdPath)
+			return nil, fmt.Errorf("follow command output: %w", err)
+		}
+		select {
+		case <-ctx.Done():
+			c.kill(cmdPath)
+			return nil, ctx.Err()
+		case <-time.After(time.Duration(200<<failures) * time.Millisecond):
+		}
+	}
 }
 
 // Destroy stops the sandbox's running session and deletes the sandbox. It is
@@ -406,8 +490,19 @@ func (c *Client) doJSON(ctx context.Context, method, path string, q url.Values, 
 	return nil
 }
 
+// doStream is do for a long-lived GET whose body is read as it arrives. It
+// has no overall deadline (the client's Timeout would cut off a long
+// command's log stream); ctx bounds it instead.
+func (c *Client) doStream(ctx context.Context, path string) (*http.Response, error) {
+	return c.send(ctx, c.stream, http.MethodGet, path, nil, nil)
+}
+
 // do sends an authenticated request and returns the response if it is 2xx.
 func (c *Client) do(ctx context.Context, method, path string, q url.Values, body io.Reader) (*http.Response, error) {
+	return c.send(ctx, c.http, method, path, q, body)
+}
+
+func (c *Client) send(ctx context.Context, hc *http.Client, method, path string, q url.Values, body io.Reader) (*http.Response, error) {
 	if q == nil {
 		q = url.Values{}
 	}
@@ -421,7 +516,7 @@ func (c *Client) do(ctx context.Context, method, path string, q url.Values, body
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	resp, err := c.http.Do(req)
+	resp, err := hc.Do(req)
 	if err != nil {
 		return nil, err
 	}

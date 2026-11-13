@@ -14,7 +14,7 @@ Mosso is an experimental, self-hosted Go coding-agent orchestrator. The goal is 
 
 - `cmd/mosso/` — main server entry point.
 - `cmd/mosso-worker/` — worker running alongside Pi in the sandbox; only modify when the task requires it.
-- `internal/server/` — HTTP API and server-side coordination.
+- `internal/server/` — HTTP API and server-side coordination; `internal/server/web/` is the embedded browser UI (plain HTML/CSS/JS, no build step).
 - `internal/vercel/` — Vercel Sandbox integration.
 - `internal/claude/` — Claude Code CLI integration (headless runs in a sandbox, subscription token handling).
 - `internal/github/` — GitHub integration (clone into a sandbox, publish changes as a pull request via the REST API, token handling).

@@ -26,8 +26,8 @@ const (
 	// variable, and Linux limits each one to 128 KiB.
 	MaxPromptBytes = 64 * 1024
 
-	// maxStreamBytes caps the stream-json output kept from one run.
-	maxStreamBytes = 16 << 20
+	// maxLineBytes caps one stream-json line; longer lines are skipped.
+	maxLineBytes = 16 << 20
 	// maxToolResultBytes caps each tool result returned to API callers.
 	maxToolResultBytes = 16 << 10
 )
@@ -81,6 +81,13 @@ type Request struct {
 	// Code stores sessions per directory, so a conversation must keep the
 	// same one.
 	Dir string
+
+	// OnSession, if set, is called with the session ID as soon as Claude
+	// Code reports it, so an interrupted turn can still be resumed.
+	OnSession func(id string)
+	// OnEvent, if set, is called with each event as Claude produces it,
+	// before Send returns. The same events are in the returned Turn.
+	OnEvent func(Event)
 }
 
 // Turn is the outcome of one message: Claude's final answer plus the text
@@ -140,6 +147,11 @@ func Send(ctx context.Context, vc *vercel.Client, sandboxSession string, token T
 		}
 		args = append(args, "--resume", req.SessionID)
 	}
+	// Output is parsed line by line as it streams out of the sandbox. The
+	// token cannot contain a newline, so redacting whole lines is enough.
+	p := &parser{turn: Turn{Events: []Event{}}, onSession: req.OnSession, onEvent: req.OnEvent}
+	var line strings.Builder
+	skipping := false // inside a line longer than maxLineBytes
 	res, err := vc.Run(ctx, sandboxSession, vercel.Command{
 		Name: "bash",
 		Args: args,
@@ -149,12 +161,33 @@ func Send(ctx context.Context, vc *vercel.Client, sandboxSession string, token T
 			"MOSSO_PROMPT":        req.Prompt,
 			"DISABLE_AUTOUPDATER": "1",
 		},
-		MaxOutputBytes: maxStreamBytes,
+		Stdout: func(chunk string) {
+			for chunk != "" {
+				part, rest, complete := strings.Cut(chunk, "\n")
+				chunk = rest
+				if !skipping && line.Len()+len(part) <= maxLineBytes {
+					line.WriteString(part)
+				} else {
+					skipping = true
+					line.Reset()
+				}
+				if complete {
+					if !skipping {
+						p.line(token.redact(line.String()))
+					}
+					line.Reset()
+					skipping = false
+				}
+			}
+		},
 	})
 	if err != nil {
 		return nil, fmt.Errorf("run claude code: %w", err)
 	}
-	turn, err := ParseStream(token.redact(res.Stdout))
+	if !skipping {
+		p.line(token.redact(line.String()))
+	}
+	turn, err := p.finish()
 	if err != nil {
 		return nil, fmt.Errorf("run claude code: exit code %d: %w: %s", res.ExitCode, err, tail(token.redact(res.Stderr)))
 	}
@@ -194,40 +227,64 @@ type contentBlock struct {
 // into a Turn. Lines that are not JSON, and message types Mosso does not use,
 // are skipped. It fails if the stream has no final result message.
 func ParseStream(out string) (*Turn, error) {
-	turn := &Turn{Events: []Event{}}
-	var sawResult bool
+	p := &parser{turn: Turn{Events: []Event{}}}
 	for _, line := range strings.Split(out, "\n") {
-		line = strings.TrimSpace(line)
-		if !strings.HasPrefix(line, "{") {
-			continue
-		}
-		var m streamMessage
-		if err := json.Unmarshal([]byte(line), &m); err != nil {
-			continue
-		}
-		if m.SessionID != "" && turn.SessionID == "" {
-			turn.SessionID = m.SessionID
-		}
-		switch m.Type {
-		case "system":
-			if m.Subtype == "init" && m.Model != "" {
-				turn.Model = m.Model
-			}
-		case "assistant", "user":
-			turn.Events = append(turn.Events, contentEvents(m.Message.Content, m.ParentToolUseID)...)
-		case "result":
-			sawResult = true
-			if m.SessionID != "" {
-				turn.SessionID = m.SessionID
-			}
-			turn.Result, turn.IsError, turn.Subtype = m.Result, m.IsError, m.Subtype
-			turn.NumTurns, turn.DurationMS, turn.TotalCostUSD = m.NumTurns, m.DurationMS, m.TotalCostUSD
+		p.line(line)
+	}
+	return p.finish()
+}
+
+// parser builds a Turn from stream-json output one line at a time.
+type parser struct {
+	turn      Turn
+	sawResult bool
+	onSession func(string)
+	onEvent   func(Event)
+}
+
+func (p *parser) line(line string) {
+	line = strings.TrimSpace(line)
+	if !strings.HasPrefix(line, "{") {
+		return
+	}
+	var m streamMessage
+	if err := json.Unmarshal([]byte(line), &m); err != nil {
+		return
+	}
+	if m.SessionID != "" && p.turn.SessionID == "" {
+		p.turn.SessionID = m.SessionID
+		if p.onSession != nil {
+			p.onSession(m.SessionID)
 		}
 	}
-	if !sawResult {
+	switch m.Type {
+	case "system":
+		if m.Subtype == "init" && m.Model != "" {
+			p.turn.Model = m.Model
+		}
+	case "assistant", "user":
+		for _, e := range contentEvents(m.Message.Content, m.ParentToolUseID) {
+			p.turn.Events = append(p.turn.Events, e)
+			if p.onEvent != nil {
+				p.onEvent(e)
+			}
+		}
+	case "result":
+		p.sawResult = true
+		if m.SessionID != "" {
+			p.turn.SessionID = m.SessionID
+		}
+		t := &p.turn
+		t.Result, t.IsError, t.Subtype = m.Result, m.IsError, m.Subtype
+		t.NumTurns, t.DurationMS, t.TotalCostUSD = m.NumTurns, m.DurationMS, m.TotalCostUSD
+	}
+}
+
+func (p *parser) finish() (*Turn, error) {
+	if !p.sawResult {
 		return nil, errors.New("claude code produced no result")
 	}
-	return turn, nil
+	return &p.turn, nil
 }
 
 func contentEvents(raw json.RawMessage, parent string) []Event {

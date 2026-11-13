@@ -376,3 +376,108 @@ func TestRunKillsCommandWhenContextEnds(t *testing.T) {
 		t.Fatal("command was not killed")
 	}
 }
+
+func TestRunStreamsStdoutWhileRunning(t *testing.T) {
+	f, c := newFakeAPI(t)
+	f.handle("POST /v2/sandboxes/sessions/sbx_1/cmd", reply(200, `{"command":{"id":"cmd_1","exitCode":null}}`))
+	f.handle("GET /v2/sandboxes/sessions/sbx_1/cmd/cmd_1", reply(200, `{"command":{"id":"cmd_1","exitCode":0}}`))
+	more := make(chan struct{})
+	f.handle("GET /v2/sandboxes/sessions/sbx_1/cmd/cmd_1/logs", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		_, _ = io.WriteString(w, `{"stream":"stdout","data":"first\n"}`+"\n")
+		w.(http.Flusher).Flush()
+		<-more // the command is still running
+		_, _ = io.WriteString(w, `{"stream":"stderr","data":"oops"}`+"\n"+`{"stream":"stdout","data":"second\n"}`+"\n")
+	})
+
+	var mu sync.Mutex
+	var got []string
+	first := make(chan struct{})
+	done := make(chan *CommandResult)
+	go func() {
+		res, err := c.Run(context.Background(), "sbx_1", Command{Name: "bash", Stdout: func(s string) {
+			mu.Lock()
+			got = append(got, s)
+			mu.Unlock()
+			if s == "first\n" {
+				close(first)
+			}
+		}})
+		if err != nil {
+			t.Error(err)
+		}
+		done <- res
+	}()
+	select {
+	case <-first:
+	case <-time.After(5 * time.Second):
+		t.Fatal("stdout was not delivered while the command was running")
+	}
+	close(more)
+	res := <-done
+	if res == nil {
+		return
+	}
+	if res.Stdout != "" || res.Stderr != "oops" || res.ExitCode != 0 {
+		t.Fatalf("result = %+v", res)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if strings.Join(got, "") != "first\nsecond\n" {
+		t.Fatalf("stdout = %q", got)
+	}
+}
+
+func TestRunStreamReconnectsWithoutDuplicates(t *testing.T) {
+	f, c := newFakeAPI(t)
+	f.handle("POST /v2/sandboxes/sessions/sbx_1/cmd", reply(200, `{"command":{"id":"cmd_1","exitCode":null}}`))
+	f.handle("GET /v2/sandboxes/sessions/sbx_1/cmd/cmd_1", reply(200, `{"command":{"id":"cmd_1","exitCode":0}}`))
+	attempts := 0
+	f.handle("GET /v2/sandboxes/sessions/sbx_1/cmd/cmd_1/logs", func(w http.ResponseWriter, _ *http.Request) {
+		attempts++
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		if attempts == 1 {
+			// Deliver part of the output, then break the connection mid-line.
+			_, _ = io.WriteString(w, `{"stream":"stdout","data":"abc"}`+"\n"+`{"stream":"std`)
+			w.(http.Flusher).Flush()
+			conn, _, _ := w.(http.Hijacker).Hijack()
+			_ = conn.Close()
+			return
+		}
+		// The replay is chunked differently but has the same content.
+		_, _ = io.WriteString(w, `{"stream":"stdout","data":"ab"}`+"\n"+`{"stream":"stdout","data":"cdef"}`+"\n")
+	})
+	var out strings.Builder
+	if _, err := c.Run(context.Background(), "sbx_1", Command{Name: "bash", Stdout: func(s string) { out.WriteString(s) }}); err != nil {
+		t.Fatal(err)
+	}
+	if out.String() != "abcdef" || attempts != 2 {
+		t.Fatalf("stdout = %q after %d attempts, want abcdef after 2", out.String(), attempts)
+	}
+}
+
+func TestRunStreamKillsCommandWhenContextEnds(t *testing.T) {
+	f, c := newFakeAPI(t)
+	f.handle("POST /v2/sandboxes/sessions/sbx_1/cmd", reply(200, `{"command":{"id":"cmd_1","exitCode":null}}`))
+	ctx, cancel := context.WithCancel(context.Background())
+	f.handle("GET /v2/sandboxes/sessions/sbx_1/cmd/cmd_1/logs", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		_, _ = io.WriteString(w, `{"stream":"stdout","data":"working"}`+"\n")
+		w.(http.Flusher).Flush()
+		cancel()
+		<-r.Context().Done()
+	})
+	killed := make(chan struct{}, 1)
+	f.handle("POST /v2/sandboxes/sessions/sbx_1/cmd/cmd_1/kill", func(w http.ResponseWriter, r *http.Request) {
+		killed <- struct{}{}
+		reply(200, `{"command":{"id":"cmd_1"}}`)(w, r)
+	})
+	if _, err := c.Run(ctx, "sbx_1", Command{Name: "bash", Stdout: func(string) {}}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled", err)
+	}
+	select {
+	case <-killed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("command was not killed")
+	}
+}

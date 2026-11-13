@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Mosso</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="/assets/style.css">
+  <script src="/assets/markdown.js" defer></script>
+  <script src="/assets/app.js" defer></script>
+</head>
+<body>
+  <aside id="sidebar">
+    <header class="brand">
+      <span class="logo">Mosso</span>
+      <button id="new-workspace" class="primary small" type="button" title="Create a workspace">+ New</button>
+    </header>
+    <nav id="workspace-list" aria-label="Workspaces"></nav>
+    <footer id="sidebar-footer">
+      <ul id="checks" aria-label="Configuration"></ul>
+      <p class="limitation">Workspaces and chats are kept in memory only. They are lost when Mosso stops or a sandbox is terminated or expires; branches and pull requests stay on GitHub.</p>
+    </footer>
+  </aside>
+
+  <main id="main">
+    <div id="banner" class="banner hidden" role="alert">
+      <span id="banner-text"></span>
+      <button id="banner-close" class="link" type="button" aria-label="Dismiss">×</button>
+    </div>
+
+    <section id="empty" class="empty hidden">
+      <h1>Welcome to Mosso</h1>
+      <p>A workspace is a GitHub repository checked out on a new <code>mosso/*</code> branch in a Vercel Sandbox, with Claude Code ready to work on it.</p>
+      <button id="empty-new" class="primary" type="button">Create a workspace</button>
+      <p id="empty-error" class="error-text hidden"></p>
+    </section>
+
+    <section id="workspace" class="hidden">
+      <header id="ws-header">
+        <div class="ws-title">
+          <a id="ws-repo" target="_blank" rel="noopener noreferrer"></a>
+          <span id="ws-branch" class="branch"></span>
+          <span id="ws-status" class="status"></span>
+        </div>
+        <div class="ws-meta">
+          <span id="ws-expiry" class="muted"></span>
+          <a id="ws-pr" class="pr-link hidden" target="_blank" rel="noopener noreferrer"></a>
+          <button id="publish" type="button">Create PR</button>
+          <button id="terminate" class="danger" type="button">Terminate</button>
+        </div>
+      </header>
+      <div id="ws-error" class="ws-error hidden"></div>
+      <div id="chat" aria-live="polite">
+        <div id="chat-empty" class="chat-empty hidden">
+          <h2>What should Claude work on?</h2>
+          <p>Claude Code runs in the sandbox, in the repository checkout. Describe a task; follow-ups continue the same conversation. When you are happy, publish the changes as a pull request.</p>
+        </div>
+        <div id="entries"></div>
+        <div id="working" class="working-bar hidden">
+          <span class="spinner" aria-hidden="true"></span>
+          <span id="working-text">Claude is working…</span>
+          <span id="working-time" class="muted"></span>
+          <button id="stop" class="small" type="button">Stop</button>
+        </div>
+      </div>
+      <form id="composer" autocomplete="off">
+        <textarea id="prompt" rows="3" placeholder="Ask Claude to make a change…  (Enter to send, Shift+Enter for a new line)"></textarea>
+        <div class="composer-bar">
+          <span id="composer-hint" class="muted"></span>
+          <button id="send" class="primary" type="submit">Send</button>
+        </div>
+      </form>
+    </section>
+  </main>
+
+  <dialog id="create-dialog">
+    <form id="create-form" method="dialog">
+      <h2>New workspace</h2>
+      <label>Repository
+        <input id="create-repo" list="repo-options" placeholder="owner/repo" required spellcheck="false" autocapitalize="off">
+        <datalist id="repo-options"></datalist>
+      </label>
+      <label>Base branch
+        <input id="create-base" list="branch-options" placeholder="default branch" spellcheck="false" autocapitalize="off">
+        <datalist id="branch-options"></datalist>
+      </label>
+      <p class="muted small-text">Mosso provisions a sandbox (30 minutes), clones the base branch onto a new working branch and installs Claude Code. This takes about a minute.</p>
+      <p id="create-error" class="error-text hidden"></p>
+      <div class="dialog-actions">
+        <button id="create-cancel" type="button">Cancel</button>
+        <button id="create-submit" class="primary" type="submit">Create</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="publish-dialog">
+    <form id="publish-form" method="dialog">
+      <h2 id="publish-heading">Create pull request</h2>
+      <label><span id="publish-title-label">Title</span>
+        <input id="publish-title" maxlength="256" required>
+      </label>
+      <label id="publish-body-field">Description <span class="muted">(optional)</span>
+        <textarea id="publish-body" rows="4"></textarea>
+      </label>
+      <label id="publish-draft-field" class="inline"><input id="publish-draft" type="checkbox"> Open as a draft</label>
+      <p class="muted small-text">Mosso commits the sandbox's changes and pushes them to the working branch through the GitHub API.</p>
+      <p id="publish-error" class="error-text hidden"></p>
+      <div class="dialog-actions">
+        <button id="publish-cancel" type="button">Cancel</button>
+        <button id="publish-submit" class="primary" type="submit">Publish</button>
+      </div>
+    </form>
+  </dialog>
+</body>
+</html>

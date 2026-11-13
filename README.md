@@ -4,7 +4,9 @@ Mosso is an experimental, self-hosted coding-agent orchestration project.
 
 The initial Minimum Usable Product (MUP) will run Pi in a Vercel Sandbox, offer an interactive chat through a local Go server, and allow an agent to create GitHub pull requests.
 
-> Early development. The first end-to-end workflow (repository → Claude Code → pull request) works through the local API; there is no UI yet.
+> Early development. The first end-to-end workflow (repository → Claude Code → pull request) works in a local web UI and through the local API. Workspaces and conversations are kept in memory only.
+
+**Quick start:** configure Vercel, Claude Code and GitHub (see below), run `make run`, and open <http://127.0.0.1:8080>. Create a workspace from a GitHub repository, chat with Claude Code while its tool activity streams in, and publish the result as a pull request. See [docs/web-ui.md](docs/web-ui.md), including its limitations: workspace state and conversations are lost when Mosso stops or a sandbox is terminated or expires.
 
 Mosso can already provision a Vercel Sandbox, run a shell command in it, and destroy it; see [docs/vercel-sandbox.md](docs/vercel-sandbox.md) for setup.
 
