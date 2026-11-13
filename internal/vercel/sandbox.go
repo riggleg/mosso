@@ -1,8 +1,9 @@
 // Package vercel is a minimal client for the Vercel Sandbox REST API.
 //
 // It mirrors the endpoints used by the official @vercel/sandbox SDK and only
-// implements what Mosso needs today: create a sandbox, run a shell command,
-// read its output and exit status, and destroy the sandbox.
+// implements what Mosso needs today: create a sandbox, run a command (with
+// optional environment and working directory), read its output and exit
+// status, and destroy the sandbox.
 package vercel
 
 import (
@@ -217,14 +218,42 @@ type apiCommand struct {
 	ExitCode *int   `json:"exitCode"`
 }
 
+// Command is a process to start in a sandbox session.
+type Command struct {
+	// Name is the executable, e.g. "bash".
+	Name string
+	Args []string
+	// Env adds environment variables for this command only. Values are sent
+	// in the request body (never the URL) and are never logged; use it for
+	// secrets rather than embedding them in Args.
+	Env map[string]string
+	// Cwd is the working directory; empty uses the sandbox default.
+	Cwd string
+	// MaxOutputBytes caps stdout and stderr each; zero uses MaxOutputBytes.
+	MaxOutputBytes int
+}
+
 // Exec runs script with `bash -c` in the sandbox session, waits for it to
 // finish, and returns its exit code and output.
 func (c *Client) Exec(ctx context.Context, sessionID, script string) (*CommandResult, error) {
+	return c.Run(ctx, sessionID, Command{Name: "bash", Args: []string{"-c", script}})
+}
+
+// Run starts cmd in the sandbox session, waits for it to finish, and returns
+// its exit code and output. If ctx ends first, Run asks Vercel to terminate
+// the command so it does not keep running unobserved.
+func (c *Client) Run(ctx context.Context, sessionID string, cmd Command) (*CommandResult, error) {
 	sid := url.PathEscape(sessionID)
 	var started struct {
 		Command apiCommand `json:"command"`
 	}
-	body := map[string]any{"command": "bash", "args": []string{"-c", script}}
+	body := map[string]any{"command": cmd.Name, "args": cmd.Args}
+	if len(cmd.Env) > 0 {
+		body["env"] = cmd.Env
+	}
+	if cmd.Cwd != "" {
+		body["cwd"] = cmd.Cwd
+	}
 	if err := c.doJSON(ctx, http.MethodPost, "/v2/sandboxes/sessions/"+sid+"/cmd", nil, body, &started); err != nil {
 		return nil, fmt.Errorf("start command: %w", err)
 	}
@@ -233,33 +262,55 @@ func (c *Client) Exec(ctx context.Context, sessionID, script string) (*CommandRe
 	}
 	cmdPath := "/v2/sandboxes/sessions/" + sid + "/cmd/" + url.PathEscape(started.Command.ID)
 
-	cmd := started.Command
+	finished, err := c.wait(ctx, cmdPath, started.Command)
+	if err != nil {
+		if ctx.Err() != nil {
+			c.kill(cmdPath)
+		}
+		return nil, err
+	}
+
+	limit := cmd.MaxOutputBytes
+	if limit <= 0 {
+		limit = MaxOutputBytes
+	}
+	stdout, stderr, err := c.logs(ctx, cmdPath+"/logs", limit)
+	if err != nil {
+		return nil, fmt.Errorf("read command logs: %w", err)
+	}
+	return &CommandResult{CommandID: started.Command.ID, ExitCode: *finished.ExitCode, Stdout: stdout, Stderr: stderr}, nil
+}
+
+// wait polls until the command has an exit code.
+func (c *Client) wait(ctx context.Context, cmdPath string, cmd apiCommand) (apiCommand, error) {
 	for cmd.ExitCode == nil {
 		var finished struct {
 			Command apiCommand `json:"command"`
 		}
 		if err := c.doJSON(ctx, http.MethodGet, cmdPath, url.Values{"wait": {"true"}}, nil, &finished); err != nil {
-			return nil, fmt.Errorf("wait for command: %w", err)
+			return cmd, fmt.Errorf("wait for command: %w", err)
 		}
 		cmd = finished.Command
 		if cmd.ExitCode == nil {
 			select {
 			case <-ctx.Done():
-				return nil, ctx.Err()
+				return cmd, ctx.Err()
 			case <-time.After(500 * time.Millisecond):
 			}
 		}
 	}
+	return cmd, nil
+}
 
-	stdout, stderr, err := c.logs(ctx, cmdPath+"/logs")
-	if err != nil {
-		return nil, fmt.Errorf("read command logs: %w", err)
-	}
-	return &CommandResult{CommandID: started.Command.ID, ExitCode: *cmd.ExitCode, Stdout: stdout, Stderr: stderr}, nil
+// kill sends SIGTERM to a command whose caller has gone away. Best effort.
+func (c *Client) kill(cmdPath string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	_ = c.doJSON(ctx, http.MethodPost, cmdPath+"/kill", nil, map[string]int{"signal": 15}, nil)
 }
 
 // logs reads the newline-delimited JSON log stream of a finished command.
-func (c *Client) logs(ctx context.Context, path string) (string, string, error) {
+func (c *Client) logs(ctx context.Context, path string, limit int) (string, string, error) {
 	resp, err := c.do(ctx, http.MethodGet, path, nil, nil)
 	if err != nil {
 		return "", "", err
@@ -267,7 +318,7 @@ func (c *Client) logs(ctx context.Context, path string) (string, string, error) 
 	defer resp.Body.Close()
 
 	var stdout, stderr limitedBuffer
-	stdout.max, stderr.max = MaxOutputBytes, MaxOutputBytes
+	stdout.max, stderr.max = limit, limit
 	// A json.Decoder reads newline-delimited JSON with no per-line size limit,
 	// so one very large log chunk cannot fail the whole exec.
 	dec := json.NewDecoder(resp.Body)

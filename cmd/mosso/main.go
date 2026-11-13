@@ -11,11 +11,19 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/riggleg/mosso/internal/claude"
 	"github.com/riggleg/mosso/internal/server"
 	"github.com/riggleg/mosso/internal/vercel"
 )
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "auth" {
+		if err := runAuth(context.Background(), os.Args[2:]); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
+
 	defaultAddr := "127.0.0.1:8080"
 	if v := os.Getenv("MOSSO_LISTEN"); v != "" {
 		defaultAddr = v
@@ -32,6 +40,11 @@ func main() {
 	} else {
 		client = vercel.NewClient(cfg)
 		log.Print("Vercel Sandbox credentials loaded")
+	}
+	if _, source, err := claude.LoadToken(context.Background()); err != nil {
+		log.Printf("Claude Code messages disabled until a token is configured: %v", err)
+	} else {
+		log.Printf("Claude Code token found (%s)", source)
 	}
 	srv := server.New(client)
 	httpSrv := &http.Server{Addr: *addr, Handler: srv.Handler(), ReadHeaderTimeout: 10 * time.Second}

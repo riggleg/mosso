@@ -16,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/riggleg/mosso/internal/claude"
 	"github.com/riggleg/mosso/internal/vercel"
 )
 
@@ -31,16 +32,28 @@ const maxSandboxes = 5
 type Server struct {
 	vercel *vercel.Client // nil when credentials are not configured
 
+	// claudeToken loads the Claude Code token; replaced in tests.
+	claudeToken func(context.Context) (claude.Token, string, error)
+
 	mu        sync.Mutex
 	sandboxes map[string]vercel.Sandbox
 	creating  int  // creates in flight, counted against maxSandboxes
 	closed    bool // set by Shutdown; later creates are destroyed immediately
+	// Per-sandbox Claude Code state, keyed by sandbox name.
+	claudeInstalled map[string]bool
+	claudeBusy      map[string]bool // a turn is running; turns are serialized
 }
 
 // New returns a Server. client may be nil, in which case sandbox endpoints
 // respond with 503 Service Unavailable.
 func New(client *vercel.Client) *Server {
-	return &Server{vercel: client, sandboxes: map[string]vercel.Sandbox{}}
+	return &Server{
+		vercel:          client,
+		claudeToken:     claude.LoadToken,
+		sandboxes:       map[string]vercel.Sandbox{},
+		claudeInstalled: map[string]bool{},
+		claudeBusy:      map[string]bool{},
+	}
 }
 
 // NewHandler returns a handler without sandbox support.
@@ -57,6 +70,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /sandboxes", s.requireVercel(s.createSandbox))
 	mux.HandleFunc("POST /sandboxes/{name}/exec", s.requireVercel(s.execSandbox))
 	mux.HandleFunc("DELETE /sandboxes/{name}", s.requireVercel(s.destroySandbox))
+	mux.HandleFunc("GET /claude/auth", s.claudeAuthStatus)
+	mux.HandleFunc("POST /sandboxes/{name}/claude/messages", s.requireVercel(s.claudeMessage))
 	return localOnly(mux)
 }
 
@@ -250,6 +265,7 @@ func (s *Server) destroySandbox(w http.ResponseWriter, r *http.Request) {
 func (s *Server) forget(name string) {
 	s.mu.Lock()
 	delete(s.sandboxes, name)
+	delete(s.claudeInstalled, name)
 	s.mu.Unlock()
 }
 

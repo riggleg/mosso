@@ -47,5 +47,8 @@ endpoints (see [vercel-sandbox.md](vercel-sandbox.md)).
 `cmd/mosso-worker`: placeholder binary, **not yet connected to Pi**.
 `internal/server`: HTTP API and tests.
 `internal/vercel`: minimal Vercel Sandbox REST client (create, exec, destroy).
+`internal/claude`: runs Claude Code headlessly in a sandbox with a
+subscription token from the macOS Keychain, and resumes conversations by
+session ID (see [claude-code.md](claude-code.md)).
 
-No persistence, chat, PR creation, or secret injection into sandboxes exists yet.
+No persistence, streaming chat, repository cloning or PR creation exists yet.

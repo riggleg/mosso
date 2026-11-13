@@ -20,6 +20,10 @@ data in public issues. Contact the repository owner privately before disclosure.
 - Avoid logging environment variables, request bodies containing secrets, agent
   tool input/output containing secrets, or process command lines containing secrets.
 - Remove credentials and destroy the sandbox when the session ends.
+- The Claude Code subscription token is stored in the macOS Keychain and passed
+  to a sandbox only in the environment of the Claude Code process. Code running
+  in that sandbox can still read it, so only run Claude on trusted content; see
+  [docs/claude-code.md](docs/claude-code.md#security-model-and-limitations).
 - If a credential is exposed, **revoke or rotate it immediately**. Removing it
   from a subsequent commit does not make the exposure safe.
 
