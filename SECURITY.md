@@ -33,6 +33,9 @@ data in public issues. Contact the repository owner privately before disclosure.
   sandbox as bundles. It enters a sandbox only in the environment of the
   initial `git clone` of a private repository, before any agent or repository
   code runs there; see [docs/github.md](docs/github.md#security-model-and-limitations).
+  Before pushing, Mosso refuses commits that contain the GitHub or Claude token,
+  but it only matches the literal values: an encoded copy, or exfiltration over
+  the network from the sandbox, is not caught.
 - If a credential is exposed, **revoke or rotate it immediately**. Removing it
   from a subsequent commit does not make the exposure safe.
 

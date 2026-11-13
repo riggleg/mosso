@@ -412,6 +412,8 @@ func (m *Mirror) sendWith(ctx context.Context, heads Heads, incremental bool) er
 		Name: "bash",
 		Args: []string{"-c", applyScript, "apply", path, m.opts.Base, heads.Base, m.opts.Branch, branchSHA},
 		Cwd:  m.opts.Dir,
+		// send matches Git's English "prerequisite" message.
+		Env: map[string]string{"LC_ALL": "C"},
 	})
 	if err != nil {
 		return err
