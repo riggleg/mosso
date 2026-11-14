@@ -16,7 +16,7 @@ var web embed.FS
 // Claude's output is untrusted (it can echo prompt-injected text), so the UI
 // never renders it as HTML, and this policy blocks inline and third-party
 // scripts as a second line of defence.
-const contentSecurityPolicy = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; " +
+const contentSecurityPolicy = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; " +
 	"connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
 
 func webUI() http.Handler {

@@ -494,15 +494,17 @@ func (c *Client) doJSON(ctx context.Context, method, path string, q url.Values, 
 // has no overall deadline (the client's Timeout would cut off a long
 // command's log stream); ctx bounds it instead.
 func (c *Client) doStream(ctx context.Context, path string) (*http.Response, error) {
-	return c.send(ctx, c.stream, http.MethodGet, path, nil, nil)
+	return c.send(ctx, c.stream, http.MethodGet, path, nil, nil, nil)
 }
 
 // do sends an authenticated request and returns the response if it is 2xx.
 func (c *Client) do(ctx context.Context, method, path string, q url.Values, body io.Reader) (*http.Response, error) {
-	return c.send(ctx, c.http, method, path, q, body)
+	return c.send(ctx, c.http, method, path, q, body, nil)
 }
 
-func (c *Client) send(ctx context.Context, hc *http.Client, method, path string, q url.Values, body io.Reader) (*http.Response, error) {
+// send sends an authenticated request. A body is JSON unless hdr sets its
+// Content-Type.
+func (c *Client) send(ctx context.Context, hc *http.Client, method, path string, q url.Values, body io.Reader, hdr map[string]string) (*http.Response, error) {
 	if q == nil {
 		q = url.Values{}
 	}
@@ -515,6 +517,9 @@ func (c *Client) send(ctx context.Context, hc *http.Client, method, path string,
 	req.Header.Set("User-Agent", "mosso")
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
+	}
+	for k, v := range hdr {
+		req.Header.Set(k, v)
 	}
 	resp, err := hc.Do(req)
 	if err != nil {

@@ -15,6 +15,7 @@ const state = {
   entries: [], // the selected workspace's chat log
   tools: new Map(), // tool_use_id -> {details, state, body, children}
   drafts: new Map(), // workspace name -> unsent composer text
+  pending: new Map(), // workspace name -> attachments being composed
   sending: false,
   publishing: false,
   repos: null,
@@ -345,7 +346,9 @@ function renderWorking() {
   const prompt = $("prompt");
   const send = $("send");
   const hint = $("composer-hint");
-  const blocked = busy || state.sending || !ws;
+  const pending = (state.selected && state.pending.get(state.selected)) || [];
+  const uploading = pending.some((i) => i.status !== "done");
+  const blocked = busy || state.sending || !ws || uploading;
   send.disabled = blocked;
   if (ws && ws.status === "creating") {
     prompt.placeholder = "The workspace is being set up…";
@@ -355,7 +358,7 @@ function renderWorking() {
     hint.textContent = "Busy";
   } else {
     prompt.placeholder = "Ask Claude to make a change…  (Enter to send, Shift+Enter for a new line)";
-    hint.textContent = state.entries.some((e) => e.type === "user") ? "Follow-ups continue the same conversation." : "";
+    hint.textContent = uploading ? "Waiting for attachments…" : state.entries.some((e) => e.type === "user") ? "Follow-ups continue the same conversation." : "";
   }
 }
 
@@ -395,6 +398,7 @@ function select(name) {
   state.publishing = false;
   $("entries").replaceChildren();
   $("prompt").value = (name && state.drafts.get(name)) || "";
+  renderAttachments();
   history.replaceState(null, "", name ? "#" + encodeURIComponent(name) : location.pathname);
   hideBanner();
   if (name) {
@@ -449,7 +453,17 @@ function renderEntry(e) {
   const box = $("entries");
   switch (e.type) {
     case "user":
-      box.appendChild(h("div", { class: "entry user-msg" }, h("span", { class: "who", text: "You" }), e.text));
+      box.appendChild(
+        h(
+          "div",
+          { class: "entry user-msg" },
+          h("span", { class: "who", text: "You" }),
+          e.text,
+          e.attachments && e.attachments.length
+            ? h("ul", { class: "attachments" }, ...e.attachments.map((a) => attachmentChip(a, { url: attachmentURL(state.selected, a.id) })))
+            : null,
+        ),
+      );
       break;
     case "claude":
       renderEvent(e.event);
@@ -654,18 +668,195 @@ function toolInput(name, input, body) {
   }
 }
 
+// ---------- attachments ----------
+
+const attachmentURL = (ws, id) => wsPath(ws) + "/attachments/" + encodeURIComponent(id);
+let nextAttachmentKey = 0;
+
+const pendingFor = (name) => {
+  if (!state.pending.has(name)) state.pending.set(name, []);
+  return state.pending.get(name);
+};
+
+// attachmentChip renders an attachment, in the composer (opts.item) or in
+// the history (opts.url): a thumbnail for images, an icon for files.
+function attachmentChip(a, opts) {
+  const item = opts.item;
+  const li = h("li", { class: "attachment" + (item && item.status === "error" ? " failed" : "") });
+  const label = a.name + " (" + Attach.formatSize(a.size) + ")";
+  const preview = item ? item.preview : opts.url;
+  let visual;
+  if (a.image && preview) {
+    const img = h("img", { alt: a.name });
+    img.src = preview;
+    img.addEventListener("error", () => {
+      li.classList.add("gone");
+      visual.replaceChildren("—");
+      visual.disabled = true;
+      sub.textContent = "No longer available (the sandbox is gone)";
+    });
+    visual = h("button", { class: "thumb", type: "button", title: "Preview " + a.name, "aria-label": "Preview " + label, onclick: () => openPreview(preview, label) }, img);
+  } else {
+    visual = h("span", { class: "file-icon", "aria-hidden": "true", text: Attach.extension(a.name) });
+  }
+  const sub = h("span", { class: "sub", text: Attach.formatSize(a.size) });
+  const meta = h("span", { class: "meta" }, h("span", { class: "fname", text: a.name, title: a.name }), sub);
+  if (item && item.status === "uploading") {
+    const bar = h("progress", { max: 1, value: item.progress, "aria-label": "Uploading " + a.name });
+    meta.appendChild(bar);
+    sub.textContent = "Uploading… " + Math.round(item.progress * 100) + "%";
+  } else if (item && item.status === "error") {
+    sub.className = "sub err";
+    sub.textContent = item.error;
+  }
+  li.append(visual, meta);
+  if (item) {
+    if (item.status === "error" && item.file) li.appendChild(h("button", { class: "retry", type: "button", title: "Retry", "aria-label": "Retry " + a.name, text: "↻", onclick: () => startUpload(item) }));
+    li.appendChild(h("button", { class: "x", type: "button", title: "Remove", "aria-label": "Remove " + a.name, text: "✕", onclick: () => removeAttachment(item) }));
+  } else if (!a.image || !preview) {
+    li.appendChild(h("button", { class: "retry", type: "button", title: "Download", "aria-label": "Download " + label, text: "⤓", onclick: () => downloadAttachment(a, opts.url, sub, li) }));
+  }
+  return li;
+}
+
+function openPreview(src, label) {
+  $("preview-img").src = src;
+  $("preview-img").alt = label;
+  $("preview-name").textContent = label;
+  $("preview-dialog").showModal();
+}
+
+// downloadAttachment saves a file from the sandbox through a blob, so a
+// workspace that is gone is reported instead of saving an error page.
+async function downloadAttachment(a, url, sub, li) {
+  try {
+    const res = await fetch(url + "?download=1");
+    if (!res.ok) throw new Error(res.status === 410 ? "gone" : "failed");
+    const blobURL = URL.createObjectURL(await res.blob());
+    const link = h("a", { download: a.name, href: blobURL });
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(blobURL), 10000);
+  } catch (e) {
+    li.classList.add("gone");
+    sub.textContent = e.message === "gone" ? "No longer available (the sandbox is gone)" : "Download failed";
+  }
+}
+
+function renderAttachments() {
+  const list = $("attachments");
+  const items = (state.selected && state.pending.get(state.selected)) || [];
+  list.classList.toggle("hidden", items.length === 0);
+  list.replaceChildren(...items.map((item) => attachmentChip({ name: item.name, size: item.size, image: item.image }, { item })));
+  render();
+}
+
+// addFiles is where paste, drop and the file picker all end up.
+function addFiles(files) {
+  if (!state.ws || state.ws.status === "creating") {
+    showBanner("The workspace is still being set up; attach files in a moment.");
+    return;
+  }
+  const name = state.selected;
+  const items = pendingFor(name);
+  for (const file of files) {
+    const err = Attach.checkFile(file, items);
+    if (err) {
+      showBanner(err);
+      continue;
+    }
+    const item = {
+      key: ++nextAttachmentKey,
+      file,
+      workspace: name,
+      name: Attach.nameFor(file),
+      size: file.size,
+      image: Attach.isImage(file),
+      status: "uploading",
+      progress: 0,
+      preview: Attach.isImage(file) ? URL.createObjectURL(file) : null,
+    };
+    items.push(item);
+    startUpload(item);
+  }
+  renderAttachments();
+}
+
+function startUpload(item) {
+  item.status = "uploading";
+  item.progress = 0;
+  item.error = null;
+  const refresh = () => state.selected === item.workspace && renderAttachments();
+  item.upload = Attach.upload(item.workspace, item.file, item.name, (p) => {
+    // Redraw only when the percentage changes.
+    if (Math.round(p * 100) === Math.round(item.progress * 100)) return;
+    item.progress = p;
+    refresh();
+  });
+  item.upload.promise.then(
+    (att) => {
+      item.id = att.id;
+      item.status = "done";
+      item.file = null;
+      refresh();
+    },
+    (err) => {
+      if (err.aborted) return;
+      item.status = "error";
+      item.error = err.message;
+      refresh();
+    },
+  );
+  refresh();
+}
+
+function removeAttachment(item) {
+  if (item.upload && item.status === "uploading") item.upload.abort();
+  if (item.preview) URL.revokeObjectURL(item.preview);
+  const items = pendingFor(item.workspace);
+  items.splice(items.indexOf(item), 1);
+  renderAttachments();
+}
+
+// onPaste turns pasted images and files into attachments. Plain text is
+// left to the browser.
+function onPaste(e) {
+  const r = Attach.filesFromTransfer(e.clipboardData, "paste");
+  if (!r.handled) return;
+  e.preventDefault();
+  if (r.message) showBanner(r.message);
+  if (r.files.length) addFiles(r.files);
+}
+
+function onDrop(e) {
+  e.preventDefault();
+  $("composer").classList.remove("dragging");
+  $("drop-hint").classList.add("hidden");
+  const r = Attach.filesFromTransfer(e.dataTransfer, "drop");
+  if (r.message) showBanner(r.message);
+  if (r.files.length) addFiles(r.files);
+}
+
 // ---------- actions ----------
 
 async function sendPrompt() {
   const prompt = $("prompt");
   const text = prompt.value;
-  if (!text.trim() || !state.ws || isWorking() || state.sending) return;
   const name = state.selected;
+  const items = (name && state.pending.get(name)) || [];
+  if ((!text.trim() && items.length === 0) || !state.ws || isWorking() || state.sending) return;
+  if (items.some((i) => i.status !== "done")) {
+    showBanner("Wait for the attachments to finish uploading, or remove the ones that failed.");
+    return;
+  }
   state.sending = true;
   render();
   try {
-    await api("POST", wsPath(name) + "/chat", { prompt: text });
+    await api("POST", wsPath(name) + "/chat", { prompt: text, attachments: items.map((i) => i.id) });
     if (state.selected === name) prompt.value = "";
+    state.pending.delete(name);
+    if (state.selected === name) renderAttachments();
     state.drafts.delete(name);
     hideBanner();
   } catch (e) {
@@ -872,6 +1063,43 @@ function init() {
       sendPrompt();
     }
   });
+  // Paste, drop and the paperclip all feed addFiles.
+  document.addEventListener("paste", (e) => {
+    const t = e.target;
+    if (document.querySelector("dialog[open]") || !state.ws) return;
+    if (t !== document.body && t !== $("prompt") && !$("workspace").contains(t)) return;
+    onPaste(e);
+  });
+  $("attach").addEventListener("click", () => $("file-input").click());
+  $("file-input").addEventListener("change", (e) => {
+    addFiles(Array.from(e.target.files));
+    e.target.value = ""; // so choosing the same file again works
+  });
+  const hasFiles = (e) => Array.from((e.dataTransfer && e.dataTransfer.types) || []).some((t) => t === "Files" || t === "text/uri-list" || t === "text/html");
+  let dragDepth = 0;
+  // Always stop the browser from navigating to a file dropped anywhere.
+  window.addEventListener("dragover", (e) => hasFiles(e) && e.preventDefault());
+  window.addEventListener("drop", (e) => hasFiles(e) && e.preventDefault());
+  const zone = $("workspace");
+  zone.addEventListener("dragenter", (e) => {
+    if (!hasFiles(e)) return;
+    dragDepth++;
+    $("composer").classList.add("dragging");
+    $("drop-hint").classList.remove("hidden");
+  });
+  zone.addEventListener("dragleave", () => {
+    if (--dragDepth > 0) return;
+    dragDepth = 0;
+    $("composer").classList.remove("dragging");
+    $("drop-hint").classList.add("hidden");
+  });
+  zone.addEventListener("drop", (e) => {
+    dragDepth = 0;
+    if (hasFiles(e)) onDrop(e);
+  });
+  $("preview-close").addEventListener("click", () => $("preview-dialog").close());
+  $("preview-dialog").addEventListener("click", (e) => e.target === $("preview-dialog") && $("preview-dialog").close());
+  $("preview-dialog").addEventListener("close", () => $("preview-img").removeAttribute("src"));
   $("prompt").addEventListener("input", (e) => {
     const t = e.target;
     t.style.height = "auto";

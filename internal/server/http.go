@@ -122,6 +122,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /workspaces/{name}/pull-request", s.requireVercel(s.workspacePullRequest))
 	mux.HandleFunc("DELETE /workspaces/{name}", s.requireVercel(s.destroySandbox))
 	mux.HandleFunc("POST /workspaces/{name}/chat", s.requireVercel(s.workspaceChat))
+	mux.HandleFunc("POST /workspaces/{name}/attachments", s.requireVercel(s.uploadAttachments))
+	mux.HandleFunc("GET /workspaces/{name}/attachments/{id}", s.requireVercel(s.downloadAttachment))
 	mux.HandleFunc("POST /workspaces/{name}/chat/stop", s.requireVercel(s.workspaceStop))
 	mux.HandleFunc("GET /workspaces/{name}/events", s.requireVercel(s.workspaceEvents))
 	mux.HandleFunc("GET /github/repos", s.githubRepos)
@@ -176,7 +178,10 @@ func localOnly(next http.Handler) http.Handler {
 		}
 		if r.Method == http.MethodPost {
 			mt, _, _ := mime.ParseMediaType(r.Header.Get("Content-Type"))
-			if mt != "application/json" {
+			// Uploads are multipart; the Host and Origin checks above
+			// still apply to them.
+			upload := mt == "multipart/form-data" && strings.HasSuffix(r.URL.Path, "/attachments") && strings.HasPrefix(r.URL.Path, "/workspaces/")
+			if mt != "application/json" && !upload {
 				writeError(w, http.StatusUnsupportedMediaType, "Content-Type must be application/json")
 				return
 			}
