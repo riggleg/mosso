@@ -95,6 +95,8 @@ type chatEntry struct {
 	Event       *claude.Event     `json:"event,omitempty"`
 	Result      *turnResult       `json:"result,omitempty"`
 	PullRequest *github.Published `json:"pull_request,omitempty"`
+	// Attachments are the files sent with a "user" entry.
+	Attachments []attachment `json:"attachments,omitempty"`
 }
 
 // turnResult is how a Claude Code turn ended.
@@ -138,7 +140,7 @@ func (c *chat) stopLocked(run *turnRun) bool {
 // finishes, the user stops it, the workspace is destroyed or Mosso shuts
 // down. A nil sessionID continues the chat's conversation. It reports false
 // if something else is running in the workspace.
-func (s *Server) startTurn(ws workspace, token claude.Token, prompt string, sessionID *string) (*turnRun, bool) {
+func (s *Server) startTurn(ws workspace, token claude.Token, prompt string, atts []attachment, sessionID *string) (*turnRun, bool) {
 	if !s.acquire(ws.Name) {
 		return nil, false
 	}
@@ -151,7 +153,7 @@ func (s *Server) startTurn(ws workspace, token claude.Token, prompt string, sess
 		sid = *sessionID
 	}
 	c.running, c.err = run, ""
-	c.add(chatEntry{Type: "user", Text: prompt})
+	c.add(chatEntry{Type: "user", Text: prompt, Attachments: atts})
 	installed := s.claudeInstalled[ws.Name]
 	s.mu.Unlock()
 
@@ -165,7 +167,7 @@ func (s *Server) startTurn(ws workspace, token claude.Token, prompt string, sess
 		if run.err == nil {
 			s.syncBeforeTurn(ctx, ws)
 			run.turn, run.err = claude.Send(ctx, s.vercel, ws.Sandbox.SessionID, token, claude.Request{
-				Prompt:       prompt,
+				Prompt:       claudePrompt(prompt, atts),
 				SessionID:    sid,
 				Dir:          ws.Dir,
 				SystemPrompt: workspacePrompt(ws),
@@ -180,6 +182,35 @@ func (s *Server) startTurn(ws workspace, token claude.Token, prompt string, sess
 		s.finishTurn(ws, c, run)
 	}()
 	return run, true
+}
+
+// claudePrompt is what Claude receives: the user's text and, if there are
+// attachments, a note saying where they are.
+func claudePrompt(prompt string, atts []attachment) string {
+	if strings.TrimSpace(prompt) == "" {
+		prompt = "(The user sent no text, only attachments.)"
+	}
+	return prompt + attachmentNote(atts)
+}
+
+// startTurnWithAttachments resolves a message's attachments and starts its
+// turn, or writes an error.
+func (s *Server) startTurnWithAttachments(w http.ResponseWriter, ws workspace, token claude.Token, req messageRequest, sessionID *string) (*turnRun, bool) {
+	live, ok := s.workspaceByName(ws.Name)
+	if !ok {
+		writeError(w, http.StatusNotFound, "unknown workspace")
+		return nil, false
+	}
+	atts, err := s.takeAttachments(live, req.Attachments)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return nil, false
+	}
+	run, ok := s.startTurn(ws, token, req.Prompt, atts, sessionID)
+	if !ok {
+		writeBusy(w)
+	}
+	return run, ok
 }
 
 // syncTimeout bounds the fetch before a turn.
@@ -294,8 +325,7 @@ func (s *Server) workspaceChat(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if _, ok := s.startTurn(ws, token, req.Prompt, nil); !ok {
-		writeBusy(w)
+	if _, ok := s.startTurnWithAttachments(w, ws, token, req, nil); !ok {
 		return
 	}
 	writeJSON(w, http.StatusAccepted, map[string]string{"status": "working"})

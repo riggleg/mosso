@@ -21,6 +21,7 @@ type recordedRequest struct {
 	Path        string
 	Query       map[string][]string
 	ContentType string
+	Header      http.Header
 	RawBody     string
 	Body        map[string]any
 }
@@ -50,7 +51,7 @@ func (f *fakeAPI) serve(w http.ResponseWriter, r *http.Request) {
 	if got := r.URL.Query().Get("teamId"); got != "team_1" {
 		f.t.Errorf("%s %s: teamId = %q", r.Method, r.URL.Path, got)
 	}
-	rec := recordedRequest{Method: r.Method, Path: r.URL.Path, Query: r.URL.Query(), ContentType: r.Header.Get("Content-Type")}
+	rec := recordedRequest{Method: r.Method, Path: r.URL.Path, Query: r.URL.Query(), ContentType: r.Header.Get("Content-Type"), Header: r.Header}
 	b, _ := io.ReadAll(r.Body)
 	rec.RawBody = string(b)
 	if len(b) > 0 {
@@ -60,7 +61,7 @@ func (f *fakeAPI) serve(w http.ResponseWriter, r *http.Request) {
 	f.requests = append(f.requests, rec)
 	f.mu.Unlock()
 	// Like the real API, reject POSTs that are not a JSON body.
-	if r.Method == http.MethodPost && (rec.ContentType != "application/json" || !json.Valid(b)) {
+	if r.Method == http.MethodPost && rec.ContentType != "application/gzip" && (rec.ContentType != "application/json" || !json.Valid(b)) {
 		http.Error(w, `{"error":{"message":"Unsupported Media Type"}}`, http.StatusUnsupportedMediaType)
 		return
 	}

@@ -107,7 +107,8 @@ These come in addition to the endpoints in [github.md](github.md) and
 
 | Method & path                              | Description |
 | ------------------------------------------ | ----------- |
-| `POST /workspaces/{name}/chat`             | Body: `{"prompt": "..."}`. Starts a Claude Code turn that continues the workspace's conversation and returns `202 {"status":"working"}`. `409` if the workspace is busy, `503` if there is no Claude token. |
+| `POST /workspaces/{name}/chat`             | Body: `{"prompt": "...", "attachments": ["<id>"]}` (`attachments` optional; `prompt` may then be empty). Starts a Claude Code turn that continues the workspace's conversation and returns `202 {"status":"working"}`. `409` if the workspace is busy, `503` if there is no Claude token. |
+| `POST /workspaces/{name}/attachments`      | Multipart upload into the sandbox; see [attachments.md](attachments.md). `GET /workspaces/{name}/attachments/{id}` reads one back. |
 | `POST /workspaces/{name}/chat/stop`        | Stops the running turn (`202`); `409` if Claude is not running. |
 | `GET /workspaces/{name}/events`            | Server-sent events, see below. |
 | `GET /github/repos`                        | `{"repos": [{"full_name", "default_branch", "private"}]}`: up to 100 repositories the GitHub token can access, most recently pushed first. |

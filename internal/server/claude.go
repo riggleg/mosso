@@ -26,6 +26,8 @@ func (s *Server) claudeAuthStatus(w http.ResponseWriter, r *http.Request) {
 type messageRequest struct {
 	Prompt    string `json:"prompt"`
 	SessionID string `json:"session_id"`
+	// Attachments are IDs of files uploaded to the workspace.
+	Attachments []string `json:"attachments"`
 }
 
 // decodeMessage reads and validates a message request or writes an error.
@@ -36,10 +38,13 @@ func decodeMessage(w http.ResponseWriter, r *http.Request) (messageRequest, bool
 		return req, false
 	}
 	switch {
-	case strings.TrimSpace(req.Prompt) == "":
+	case strings.TrimSpace(req.Prompt) == "" && len(req.Attachments) == 0:
 		writeError(w, http.StatusBadRequest, "prompt is required")
 		return req, false
-	case len(req.Prompt) > claude.MaxPromptBytes:
+	case len(req.Attachments) > maxMessageFiles:
+		writeError(w, http.StatusBadRequest, "too many attachments")
+		return req, false
+	case len(req.Prompt) > claude.MaxPromptBytes-promptReserve:
 		writeError(w, http.StatusBadRequest, "prompt is too long")
 		return req, false
 	case req.SessionID != "" && !claude.ValidSessionID(req.SessionID):
@@ -102,6 +107,10 @@ func (s *Server) claudeMessage(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	if len(req.Attachments) > 0 {
+		writeError(w, http.StatusBadRequest, "attachments are only supported in workspaces")
+		return
+	}
 	// One turn at a time per sandbox: concurrent turns could resume the same
 	// session and interleave its transcript.
 	if !s.acquire(sb.Name) {
@@ -144,7 +153,7 @@ func (s *Server) workspaceClaudeMessage(w http.ResponseWriter, r *http.Request) 
 	if !ok {
 		return
 	}
-	run, ok := s.startTurn(ws, token, req.Prompt, &req.SessionID)
+	run, ok := s.startTurnWithAttachments(w, ws, token, req, &req.SessionID)
 	if !ok {
 		writeBusy(w)
 		return

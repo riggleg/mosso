@@ -49,6 +49,11 @@ type workspace struct {
 
 	creating bool
 	chat     *chat
+	// attachments are the files uploaded to the workspace's sandbox, by
+	// ID; attachBytes is their total size. Guarded by Server.mu.
+	attachments    map[string]attachment
+	attachBytes    int64
+	attachDirReady bool
 	// git fetches and pushes for the workspace; nil until it is cloned.
 	git *github.Mirror
 }
@@ -305,6 +310,8 @@ func (s *Server) createWorkspace(w http.ResponseWriter, r *http.Request) {
 		ExpiresAt: sb.CreatedAt.Add(timeout),
 		creating:  true,
 		chat:      newChat(),
+
+		attachments: map[string]attachment{},
 	}
 	if !github.ValidRepo(ws.Repo) {
 		ws.Repo = req.Repo

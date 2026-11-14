@@ -1,12 +1,15 @@
 package server
 
 import (
+	"archive/tar"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"path"
 	"strings"
 	"sync"
 	"testing"
@@ -27,6 +30,10 @@ type fakeVercel struct {
 	stdoutFor func(cmd map[string]any) string
 	// exitFor, if set, scripts a command's exit code.
 	exitFor func(cmd map[string]any) int
+	// files is what was written with fs/write, by sandbox session and
+	// absolute path; failWrite makes writes fail.
+	files     map[string]map[string][]byte
+	failWrite bool
 }
 
 func (f *fakeVercel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -42,6 +49,50 @@ func (f *fakeVercel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		f.created = append(f.created, body.Name)
 		_, _ = io.WriteString(w, `{"sandbox":{"name":"`+body.Name+`","currentSessionId":"sbx_`+body.Name+`"},"session":{"id":"sbx_`+body.Name+`","status":"running"},"routes":[]}`)
+	case r.Method == http.MethodPost && strings.HasSuffix(p, "/fs/write"):
+		if f.failWrite {
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = io.WriteString(w, `{"error":{"message":"disk full"}}`)
+			return
+		}
+		session := strings.Split(p, "/")[4]
+		gz, err := gzip.NewReader(r.Body)
+		if err != nil || r.Header.Get("Content-Type") != "application/gzip" {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		tr := tar.NewReader(gz)
+		for {
+			hdr, err := tr.Next()
+			if err != nil {
+				break
+			}
+			if hdr.Typeflag != tar.TypeReg {
+				continue
+			}
+			data, _ := io.ReadAll(tr)
+			if f.files == nil {
+				f.files = map[string]map[string][]byte{}
+			}
+			if f.files[session] == nil {
+				f.files[session] = map[string][]byte{}
+			}
+			f.files[session][path.Join(r.Header.Get("x-cwd"), hdr.Name)] = data
+		}
+		_, _ = io.WriteString(w, `{}`)
+	case r.Method == http.MethodPost && strings.HasSuffix(p, "/fs/read"):
+		var body struct {
+			Path string `json:"path"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		data, ok := f.files[strings.Split(p, "/")[4]][body.Path]
+		if !ok {
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = io.WriteString(w, `{"error":{"message":"no such file"}}`)
+			return
+		}
+		w.Header().Set("Content-Type", "application/octet-stream")
+		_, _ = w.Write(data)
 	case r.Method == http.MethodPost && strings.HasSuffix(p, "/cmd"):
 		if f.failCmd {
 			w.WriteHeader(http.StatusInternalServerError)
