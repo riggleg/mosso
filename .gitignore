@@ -20,8 +20,11 @@ data/
 .pi/
 
 # Development outputs
-bin/
-internal/worker/bin/mosso-worker
+/bin/
 dist/
 coverage.out
 .DS_Store
+
+# The sandbox worker binary that `make worker` embeds (internal/worker/bin
+# keeps a README so the embed compiles without it)
+internal/worker/bin/mosso-worker
