@@ -242,16 +242,16 @@ func TestClaudeFailureIsRecordedAsError(t *testing.T) {
 }
 
 // TestLargeStderrDoesNotBreakClaude: a verbose Claude Code (more stderr
-// than the worker keeps) must not get a broken pipe; the error keeps the
-// end of stderr.
+// than the worker keeps) must not get a broken pipe; the error reports the
+// exit code and the stderr the worker kept.
 func TestLargeStderrDoesNotBreakClaude(t *testing.T) {
 	_, ts, _, _ := newTestWorker(t)
 	post(t, ts.URL+"/messages", Message{Text: "noisy", Prompt: "be noisy", Dir: t.TempDir(), Token: testToken})
 	waitFor(t, func() bool { return getStatus(t, ts.URL).State == "idle" })
 	events := getEvents(t, ts.URL, 0)
 	last := events[len(events)-1]
-	if last.Type != EventError || !strings.Contains(last.Text, "code 4") || !strings.Contains(last.Text, "the end") {
-		t.Fatalf("last = %+v", last)
+	if last.Type != EventError || !strings.Contains(last.Text, "code 4") || !strings.Contains(last.Text, "eeee") || len(last.Text) > 4096 {
+		t.Fatalf("last = %.200s… (%d bytes)", last.Text, len(last.Text))
 	}
 	if strings.Contains(last.Text, "broken pipe") || strings.Contains(last.Text, "short write") {
 		t.Fatalf("stderr limit broke the process: %s", last.Text)
