@@ -2,7 +2,6 @@ package github
 
 import (
 	"bytes"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -151,15 +150,19 @@ func (f *localSandbox) commandsSince(n int) []string {
 // real bare repository, and serves that repository over smart HTTP with
 // basic auth, like github.com.
 type fakeGitHub struct {
-	t      *testing.T
-	bare   string
-	token  string
-	api    *httptest.Server
-	git    *httptest.Server
-	mu     sync.Mutex
-	pulls  []map[string]any
-	auths  []string // Authorization headers seen by the API
-	gitHit int      // authenticated Git HTTP requests
+	t     *testing.T
+	bare  string
+	token string
+	api   *httptest.Server
+	git   *httptest.Server
+	mu    sync.Mutex
+	pulls []map[string]any
+	auths []string // Authorization headers seen by the API
+	// gitHit counts authenticated Git HTTP requests.
+	gitHit int
+	// pushStatus, if set, is the HTTP status for every push request, to
+	// simulate a token without write access.
+	pushStatus int
 }
 
 func newFakeGitHub(t *testing.T, backend, token string, private bool) *fakeGitHub {
@@ -178,6 +181,7 @@ func newFakeGitHub(t *testing.T, backend, token string, private bool) *fakeGitHu
 	runGit(t, work, "", "add", "-A")
 	runGit(t, work, "", "commit", "--quiet", "-m", "initial")
 	runGit(t, work, "", "push", "--quiet", bare, "main")
+	runGit(t, bare, "", "config", "http.receivepack", "true")
 
 	f := &fakeGitHub{t: t, bare: bare, token: token}
 	gitHandler := &cgi.Handler{
@@ -185,7 +189,17 @@ func newFakeGitHub(t *testing.T, backend, token string, private bool) *fakeGitHu
 		Env:  []string{"GIT_PROJECT_ROOT=" + root, "GIT_HTTP_EXPORT_ALL=1", "GIT_CONFIG_NOSYSTEM=1", "HOME=" + isolatedHome},
 	}
 	f.git = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if private {
+		// Like GitHub, pushes always need the token.
+		push := strings.Contains(r.URL.Path, "git-receive-pack") || r.URL.Query().Get("service") == "git-receive-pack"
+		f.mu.Lock()
+		pushStatus := f.pushStatus
+		f.mu.Unlock()
+		if push && pushStatus != 0 {
+			w.WriteHeader(pushStatus)
+			_, _ = io.WriteString(w, "remote: Permission to octo/widgets.git denied to octo.\n")
+			return
+		}
+		if private || push {
 			if _, pass, ok := r.BasicAuth(); !ok || pass != token {
 				w.Header().Set("WWW-Authenticate", `Basic realm="GitHub"`)
 				w.WriteHeader(http.StatusUnauthorized)
@@ -205,65 +219,6 @@ func newFakeGitHub(t *testing.T, backend, token string, private bool) *fakeGitHu
 	})
 	mux.HandleFunc("GET /repos/octo/widgets", func(w http.ResponseWriter, r *http.Request) {
 		f.json(w, 200, map[string]any{"full_name": testRepo, "default_branch": "main", "private": private})
-	})
-	mux.HandleFunc("GET /repos/octo/widgets/git/ref/heads/{branch...}", func(w http.ResponseWriter, r *http.Request) {
-		sha, err := gitCmd(bare, "", nil, "rev-parse", "--verify", "--quiet", "refs/heads/"+r.PathValue("branch"))
-		if err != nil {
-			f.json(w, 404, map[string]any{"message": "Not Found"})
-			return
-		}
-		f.json(w, 200, map[string]any{"object": map[string]string{"sha": sha}})
-	})
-	mux.HandleFunc("GET /repos/octo/widgets/git/commits/{sha}", func(w http.ResponseWriter, r *http.Request) {
-		f.json(w, 200, map[string]any{"tree": map[string]string{"sha": f.must("rev-parse", r.PathValue("sha")+"^{tree}")}})
-	})
-	mux.HandleFunc("POST /repos/octo/widgets/git/blobs", func(w http.ResponseWriter, r *http.Request) {
-		var in struct{ Content, Encoding string }
-		_ = json.NewDecoder(r.Body).Decode(&in)
-		b, err := base64.StdEncoding.DecodeString(in.Content)
-		if err != nil || in.Encoding != "base64" {
-			f.json(w, 422, map[string]any{"message": "bad blob"})
-			return
-		}
-		f.json(w, 201, map[string]any{"sha": f.hashObject(b)})
-	})
-	mux.HandleFunc("POST /repos/octo/widgets/git/trees", f.createTree)
-	mux.HandleFunc("POST /repos/octo/widgets/git/commits", func(w http.ResponseWriter, r *http.Request) {
-		var in struct {
-			Message string
-			Tree    string
-			Parents []string
-		}
-		_ = json.NewDecoder(r.Body).Decode(&in)
-		args := []string{"commit-tree", in.Tree, "-m", in.Message}
-		for _, p := range in.Parents {
-			args = append(args, "-p", p)
-		}
-		f.json(w, 201, map[string]any{"sha": f.must(args...)})
-	})
-	mux.HandleFunc("POST /repos/octo/widgets/git/refs", func(w http.ResponseWriter, r *http.Request) {
-		var in struct{ Ref, SHA string }
-		_ = json.NewDecoder(r.Body).Decode(&in)
-		if _, err := gitCmd(bare, "", nil, "update-ref", in.Ref, in.SHA, strings.Repeat("0", 40)); err != nil {
-			f.json(w, 422, map[string]any{"message": "Reference already exists"})
-			return
-		}
-		f.json(w, 201, map[string]any{"ref": in.Ref})
-	})
-	mux.HandleFunc("PATCH /repos/octo/widgets/git/refs/heads/{branch...}", func(w http.ResponseWriter, r *http.Request) {
-		var in struct {
-			SHA   string
-			Force bool
-		}
-		_ = json.NewDecoder(r.Body).Decode(&in)
-		ref := "refs/heads/" + r.PathValue("branch")
-		old := f.must("rev-parse", ref)
-		if _, err := gitCmd(bare, "", nil, "merge-base", "--is-ancestor", old, in.SHA); err != nil || in.Force {
-			f.json(w, 422, map[string]any{"message": "Update is not a fast forward"})
-			return
-		}
-		f.must("update-ref", ref, in.SHA, old)
-		f.json(w, 200, map[string]any{"ref": ref})
 	})
 	mux.HandleFunc("GET /repos/octo/widgets/pulls", func(w http.ResponseWriter, r *http.Request) {
 		q := r.URL.Query()
@@ -324,67 +279,6 @@ func (f *fakeGitHub) must(args ...string) string {
 		f.t.Errorf("fake github: git %v: %v", args, err)
 	}
 	return out
-}
-
-func (f *fakeGitHub) hashObject(b []byte) string {
-	out, err := gitCmd(f.bare, string(b), nil, "hash-object", "-w", "--stdin")
-	if err != nil {
-		f.t.Errorf("fake github: hash-object: %v", err)
-	}
-	return out
-}
-
-// createTree applies the entries to base_tree in a temporary index, like
-// GitHub: an entry with content writes a blob, a null sha deletes the path.
-func (f *fakeGitHub) createTree(w http.ResponseWriter, r *http.Request) {
-	var in struct {
-		BaseTree string                       `json:"base_tree"`
-		Tree     []map[string]json.RawMessage `json:"tree"`
-	}
-	_ = json.NewDecoder(r.Body).Decode(&in)
-	index := []string{"GIT_INDEX_FILE=" + filepath.Join(f.t.TempDir(), "index")}
-	if _, err := gitCmd(f.bare, "", index, "read-tree", in.BaseTree); err != nil {
-		f.json(w, 422, map[string]any{"message": err.Error()})
-		return
-	}
-	var lines strings.Builder
-	for _, e := range in.Tree {
-		var path, mode string
-		var sha, content *string
-		_ = json.Unmarshal(e["path"], &path)
-		_ = json.Unmarshal(e["mode"], &mode)
-		if raw, ok := e["sha"]; ok {
-			_ = json.Unmarshal(raw, &sha)
-		}
-		if raw, ok := e["content"]; ok {
-			_ = json.Unmarshal(raw, &content)
-		}
-		_, hasSHA := e["sha"]
-		switch {
-		case content != nil && hasSHA:
-			f.json(w, 422, map[string]any{"message": "sha and content are mutually exclusive"})
-			return
-		case content != nil:
-			fmt.Fprintf(&lines, "%s %s\t%s\n", mode, f.hashObject([]byte(*content)), path)
-		case sha != nil:
-			fmt.Fprintf(&lines, "%s %s\t%s\n", mode, *sha, path)
-		case hasSHA:
-			fmt.Fprintf(&lines, "0 %s\t%s\n", strings.Repeat("0", 40), path)
-		default:
-			f.json(w, 422, map[string]any{"message": "entry needs sha or content"})
-			return
-		}
-	}
-	if _, err := gitCmd(f.bare, lines.String(), index, "update-index", "--index-info"); err != nil {
-		f.json(w, 422, map[string]any{"message": err.Error()})
-		return
-	}
-	tree, err := gitCmd(f.bare, "", index, "write-tree")
-	if err != nil {
-		f.json(w, 422, map[string]any{"message": err.Error()})
-		return
-	}
-	f.json(w, 201, map[string]any{"sha": tree})
 }
 
 func writeFile(t *testing.T, path, content string) {

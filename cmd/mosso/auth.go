@@ -68,11 +68,12 @@ func authGitHub(ctx context.Context) error {
 	if runtime.GOOS != "darwin" {
 		return fmt.Errorf("the macOS Keychain is not available on %s: export %s in the environment that starts Mosso", runtime.GOOS, github.EnvToken)
 	}
-	fmt.Println("Step 1/2: create a fine-grained personal access token at")
-	fmt.Println("  https://github.com/settings/personal-access-tokens/new")
-	fmt.Println("with access to only the repositories Mosso should work on, and these repository permissions:")
-	fmt.Println("  Contents: Read and write, Pull requests: Read and write (Metadata: Read is added automatically).")
-	fmt.Println("Pick a short expiration.")
+	fmt.Println("Step 1/2: create a fine-grained personal access token. This link opens GitHub's form with")
+	fmt.Println("Mosso's permissions preselected (Contents and Pull requests: Read and write; Metadata: Read)")
+	fmt.Println("and a 90-day expiration:")
+	fmt.Println("  " + github.NewTokenURL)
+	fmt.Println("Under Repository access, choose only the repositories Mosso should work on, then generate the token.")
+	fmt.Println("(You can also paste the token into Connect GitHub in the Mosso web UI instead.)")
 	fmt.Println()
 	fmt.Printf("Step 2/2: paste the token at both prompts below (input is hidden). It is saved in your login Keychain as service %q, account %q.\n",
 		keychain.Service, github.KeychainAccount)

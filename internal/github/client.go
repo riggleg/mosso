@@ -1,11 +1,12 @@
 // Package github connects Mosso workspaces to GitHub: it clones a repository
-// into a Vercel Sandbox and publishes the sandbox's changes as a pull request.
+// into a Vercel Sandbox, keeps the sandbox's remote-tracking branches up to
+// date, pushes the sandbox's commits and opens pull requests.
 //
 // Only the initial clone of a private repository sends the token into the
-// sandbox, before any agent or repository code has run there. Commits,
-// branches and pull requests are created by the Mosso server through the
-// GitHub REST API, so code running in the sandbox afterwards never sees the
-// GitHub token.
+// sandbox, before any agent or repository code has run there. Later fetches
+// and pushes run on the Mosso server (see Mirror), which exchanges commits
+// with the sandbox as Git bundles, and pull requests are created through the
+// GitHub REST API. Code running in the sandbox never sees the GitHub token.
 package github
 
 import (
@@ -19,7 +20,14 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
+)
+
+// Hints appended to GitHub errors so the user knows what to fix.
+const (
+	hintExpired     = "the GitHub token is invalid, expired or revoked: connect GitHub again in the Mosso web UI with a new token, or run `mosso auth github`"
+	hintPermissions = "the GitHub token lacks access: give it this repository under Repository access, with Contents and Pull requests set to Read and write"
 )
 
 // DefaultBaseURL is the GitHub REST API endpoint.
@@ -54,6 +62,28 @@ type Client struct {
 	// BaseURL defaults to DefaultBaseURL; tests point it at a fake.
 	BaseURL string
 	HTTP    *http.Client
+
+	mu         sync.Mutex
+	expiration time.Time // from the last response, if GitHub sent it
+}
+
+// TokenExpiration returns when the token expires, as reported by GitHub on
+// the last API response, or the zero time if unknown (or it never expires).
+func (c *Client) TokenExpiration() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.expiration
+}
+
+// parseExpiration reads GitHub's github-authentication-token-expiration
+// header, e.g. "2026-02-11 00:00:00 UTC".
+func parseExpiration(v string) time.Time {
+	for _, layout := range []string{"2006-01-02 15:04:05 MST", "2006-01-02 15:04:05 -0700"} {
+		if t, err := time.Parse(layout, v); err == nil {
+			return t.UTC()
+		}
+	}
+	return time.Time{}
 }
 
 // NewClient returns a client that authenticates with token.
@@ -202,107 +232,6 @@ func (c *Client) createPullRequest(ctx context.Context, repo string, pr NewPullR
 	return &PullRequest{Number: out.Number, URL: out.HTMLURL}, nil
 }
 
-// branchHead returns the commit a branch points to, or "" if it does not
-// exist.
-func (c *Client) branchHead(ctx context.Context, repo, branch string) (string, error) {
-	var ref struct {
-		Object struct {
-			SHA string `json:"sha"`
-		} `json:"object"`
-	}
-	if err := c.do(ctx, http.MethodGet, "/repos/"+repo+"/git/ref/heads/"+branch, nil, &ref); err != nil {
-		if IsNotFound(err) {
-			return "", nil
-		}
-		return "", fmt.Errorf("get branch %s: %w", branch, err)
-	}
-	return ref.Object.SHA, nil
-}
-
-func (c *Client) commitTree(ctx context.Context, repo, commit string) (string, error) {
-	var out struct {
-		Tree struct {
-			SHA string `json:"sha"`
-		} `json:"tree"`
-	}
-	if err := c.do(ctx, http.MethodGet, "/repos/"+repo+"/git/commits/"+commit, nil, &out); err != nil {
-		return "", fmt.Errorf("get commit %s: %w", commit, err)
-	}
-	return out.Tree.SHA, nil
-}
-
-func (c *Client) createBlob(ctx context.Context, repo string, base64Content string) (string, error) {
-	var out struct {
-		SHA string `json:"sha"`
-	}
-	in := map[string]string{"content": base64Content, "encoding": "base64"}
-	if err := c.do(ctx, http.MethodPost, "/repos/"+repo+"/git/blobs", in, &out); err != nil {
-		return "", fmt.Errorf("create blob: %w", err)
-	}
-	return out.SHA, nil
-}
-
-// treeEntry is one change in a create-tree request. A nil SHA with no
-// Content deletes the path.
-type treeEntry struct {
-	Path    string  `json:"path"`
-	Mode    string  `json:"mode"`
-	Type    string  `json:"type"`
-	SHA     *string `json:"sha"`
-	Content *string `json:"content,omitempty"`
-}
-
-// MarshalJSON omits "sha" when Content is set: GitHub rejects entries that
-// carry both, and reads an explicit null sha as a deletion.
-func (e treeEntry) MarshalJSON() ([]byte, error) {
-	m := map[string]any{"path": e.Path, "mode": e.Mode, "type": e.Type}
-	if e.Content != nil {
-		m["content"] = *e.Content
-	} else {
-		m["sha"] = e.SHA
-	}
-	return json.Marshal(m)
-}
-
-func (c *Client) createTree(ctx context.Context, repo, baseTree string, entries []treeEntry) (string, error) {
-	var out struct {
-		SHA string `json:"sha"`
-	}
-	in := map[string]any{"base_tree": baseTree, "tree": entries}
-	if err := c.do(ctx, http.MethodPost, "/repos/"+repo+"/git/trees", in, &out); err != nil {
-		return "", fmt.Errorf("create tree: %w", err)
-	}
-	return out.SHA, nil
-}
-
-func (c *Client) createCommit(ctx context.Context, repo, message, tree, parent string) (string, error) {
-	var out struct {
-		SHA string `json:"sha"`
-	}
-	in := map[string]any{"message": message, "tree": tree, "parents": []string{parent}}
-	if err := c.do(ctx, http.MethodPost, "/repos/"+repo+"/git/commits", in, &out); err != nil {
-		return "", fmt.Errorf("create commit: %w", err)
-	}
-	return out.SHA, nil
-}
-
-func (c *Client) createBranch(ctx context.Context, repo, branch, sha string) error {
-	in := map[string]string{"ref": "refs/heads/" + branch, "sha": sha}
-	if err := c.do(ctx, http.MethodPost, "/repos/"+repo+"/git/refs", in, nil); err != nil {
-		return fmt.Errorf("create branch %s: %w", branch, err)
-	}
-	return nil
-}
-
-// updateBranch fast-forwards a branch; GitHub rejects non-fast-forward moves.
-func (c *Client) updateBranch(ctx context.Context, repo, branch, sha string) error {
-	in := map[string]any{"sha": sha, "force": false}
-	if err := c.do(ctx, http.MethodPatch, "/repos/"+repo+"/git/refs/heads/"+branch, in, nil); err != nil {
-		return fmt.Errorf("update branch %s: %w", branch, err)
-	}
-	return nil
-}
-
 // do sends an authenticated JSON request and decodes a 2xx JSON response
 // into out (if non-nil).
 func (c *Client) do(ctx context.Context, method, path string, in, out any) error {
@@ -331,6 +260,13 @@ func (c *Client) do(ctx context.Context, method, path string, in, out any) error
 		return err
 	}
 	defer resp.Body.Close()
+	if v := resp.Header.Get("Github-Authentication-Token-Expiration"); v != "" {
+		if t := parseExpiration(v); !t.IsZero() {
+			c.mu.Lock()
+			c.expiration = t
+			c.mu.Unlock()
+		}
+	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		return c.apiError(resp)
 	}
@@ -365,8 +301,11 @@ func (c *Client) apiError(resp *http.Response) error {
 			msg += "; " + detail
 		}
 	}
-	if resp.StatusCode == http.StatusUnauthorized {
-		msg += " (the GitHub token is invalid or expired; run `mosso auth github`)"
+	switch {
+	case resp.StatusCode == http.StatusUnauthorized:
+		msg += " (" + hintExpired + ")"
+	case resp.StatusCode == http.StatusForbidden && strings.Contains(msg, "not accessible by"):
+		msg += " (" + hintPermissions + ")"
 	}
 	return &APIError{StatusCode: resp.StatusCode, Message: c.token.redact(msg)}
 }

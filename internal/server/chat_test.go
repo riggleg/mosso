@@ -131,8 +131,7 @@ func newChatServer(t *testing.T) (*Server, *fakeVercel, *httptest.Server, testWo
 	srv, fake := newTestServer(t)
 	withToken(srv, testClaudeToken, nil)
 	withGitHub(t, srv, &fakeGitHubAPI{})
-	noChanges := false
-	fake.stdoutFor = fakeRepoSandbox(&noChanges)
+	fake.stdoutFor = fakeRepoSandbox()
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(ts.Close)
 	t.Cleanup(srv.CloseStreams)
@@ -326,7 +325,7 @@ func TestWorkspaceEventsCloseWhenDestroyed(t *testing.T) {
 }
 
 func TestWorkspacePullRequestIsRecorded(t *testing.T) {
-	_, _, ts, ws := newChatServer(t)
+	srv, _, ts, ws := newChatServer(t)
 	events := openEvents(t, ts.URL, ws.Name, "")
 	if resp := postJSON(t, ts.URL+"/workspaces/"+ws.Name+"/pull-request", `{"title":"Improve README"}`); resp.StatusCode != http.StatusCreated {
 		t.Fatalf("status = %d", resp.StatusCode)
@@ -341,22 +340,16 @@ func TestWorkspacePullRequestIsRecorded(t *testing.T) {
 	if entries[len(entries)-1].PullRequest.Created {
 		t.Fatal("second publish should update the pull request")
 	}
-	for {
-		ev := events.next()
-		if ev.Event == "workspace" && strings.Contains(ev.Data, `"status":"ready"`) {
-			if !strings.Contains(ev.Data, `"pull_request":{"number":7`) {
-				t.Fatalf("workspace does not show the pull request: %s", ev.Data)
-			}
-			break
-		}
+	got := do(t, srv.Handler(), http.MethodGet, "/workspaces/"+ws.Name, "").Body.String()
+	if !strings.Contains(got, `"status":"ready"`) || !strings.Contains(got, `"pull_request":{"number":7`) {
+		t.Fatalf("workspace does not show the pull request: %s", got)
 	}
 }
 
 func TestWorkspaceShowsCreatingWhileCloning(t *testing.T) {
 	srv, fake := newTestServer(t)
 	withGitHub(t, srv, &fakeGitHubAPI{})
-	noChanges := false
-	inner := fakeRepoSandbox(&noChanges)
+	inner := fakeRepoSandbox()
 	cloning := make(chan struct{})
 	release := make(chan struct{})
 	fake.stdoutFor = func(cmd map[string]any) string {

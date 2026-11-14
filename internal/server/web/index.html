@@ -31,6 +31,7 @@
     <section id="empty" class="empty hidden">
       <h1>Welcome to Mosso</h1>
       <p>A workspace is a GitHub repository checked out on a new <code>mosso/*</code> branch in a Vercel Sandbox, with Claude Code ready to work on it.</p>
+      <button id="empty-connect" class="primary hidden" type="button">Connect GitHub</button>
       <button id="empty-new" class="primary" type="button">Create a workspace</button>
       <p id="empty-error" class="error-text hidden"></p>
     </section>
@@ -103,11 +104,32 @@
         <textarea id="publish-body" rows="4"></textarea>
       </label>
       <label id="publish-draft-field" class="inline"><input id="publish-draft" type="checkbox"> Open as a draft</label>
-      <p class="muted small-text">Mosso commits the sandbox's changes and pushes them to the working branch through the GitHub API.</p>
+      <p class="muted small-text">Mosso commits the sandbox's changes and pushes the branch to GitHub from this machine; the sandbox never gets your GitHub token. A rebased branch is pushed with --force-with-lease.</p>
       <p id="publish-error" class="error-text hidden"></p>
       <div class="dialog-actions">
         <button id="publish-cancel" type="button">Cancel</button>
         <button id="publish-submit" class="primary" type="submit">Publish</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="github-dialog">
+    <form id="github-form" autocomplete="off">
+      <h2 id="github-heading">Connect GitHub</h2>
+      <p id="github-current" class="small-text hidden"></p>
+      <ol class="steps small-text">
+        <li><a id="github-create" target="_blank" rel="noopener noreferrer">Open GitHub to create a token ↗</a>. Mosso's permissions are preselected: <em>Contents</em> and <em>Pull requests</em>: Read and write, with a 90-day expiration.</li>
+        <li>Under <em>Repository access</em>, choose the repositories Mosso may work on, then click <em>Generate token</em>.</li>
+        <li>Copy the token and paste it here.</li>
+      </ol>
+      <label>Token
+        <input id="github-token" type="password" autocomplete="off" spellcheck="false" autocapitalize="off" placeholder="github_pat_…" required>
+      </label>
+      <p id="github-storage" class="muted small-text"></p>
+      <p id="github-error" class="error-text hidden"></p>
+      <div class="dialog-actions">
+        <button id="github-cancel" type="button">Cancel</button>
+        <button id="github-submit" class="primary" type="submit">Connect</button>
       </div>
     </form>
   </dialog>

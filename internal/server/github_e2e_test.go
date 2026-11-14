@@ -124,6 +124,21 @@ func TestGitHubEndToEnd(t *testing.T) {
 	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), pub.URL) {
 		t.Fatalf("second publish: %d %s", rec.Code, rec.Body)
 	}
+
+	// A follow-up that rewrites the published commit (as a rebase does)
+	// updates the same pull request with --force-with-lease.
+	prompt, _ = json.Marshal(map[string]string{"prompt": "Append a second line, Updated by Mosso., to " + file +
+		", then run exactly: git add -A && git commit --amend --no-edit. Do not change anything else and do not push."})
+	if rec := do(t, h, http.MethodPost, "/workspaces/"+ws.Name+"/claude/messages", string(prompt)); rec.Code != http.StatusOK {
+		t.Fatalf("follow-up: %d %s", rec.Code, rec.Body)
+	}
+	rec = do(t, h, http.MethodPost, prPath, `{"title":"Amend"}`)
+	var again github.Published
+	_ = json.Unmarshal(rec.Body.Bytes(), &again)
+	t.Logf("update: %s", rec.Body)
+	if rec.Code != http.StatusOK || again.URL != pub.URL || again.Commit == pub.Commit || !again.Forced {
+		t.Fatalf("amended publish: %d %s, want the same pull request updated with a forced push", rec.Code, rec.Body)
+	}
 }
 
 // e2eGitHub sends one cleanup request to the GitHub API and reports a

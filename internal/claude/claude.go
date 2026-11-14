@@ -85,6 +85,9 @@ type Request struct {
 	// Code stores sessions per directory, so a conversation must keep the
 	// same one.
 	Dir string
+	// SystemPrompt, if set, is appended to Claude Code's system prompt for
+	// this turn, for example to explain the workspace's Git setup.
+	SystemPrompt string
 
 	// OnSession, if set, is called with the session ID as soon as Claude
 	// Code reports it, so an interrupted turn can still be resumed.
@@ -150,6 +153,9 @@ func Send(ctx context.Context, vc *vercel.Client, sandboxSession string, token T
 			return nil, errors.New("invalid session_id")
 		}
 		args = append(args, "--resume", req.SessionID)
+	}
+	if req.SystemPrompt != "" {
+		args = append(args, "--append-system-prompt", req.SystemPrompt)
 	}
 	// Output is parsed line by line as it streams out of the sandbox. The
 	// token cannot contain a newline, so redacting whole lines is enough.

@@ -62,8 +62,9 @@ endpoints (see [vercel-sandbox.md](vercel-sandbox.md)).
 subscription token from the macOS Keychain, and resumes conversations by
 session ID (see [claude-code.md](claude-code.md)).
 `internal/github`: clones a GitHub repository into a sandbox on a `mosso/*`
-branch and publishes the result as a pull request through the GitHub API
-(see [github.md](github.md)).
+branch, keeps the sandbox's `origin/*` current and pushes its commits from
+the Mosso server (Git bundles, `--force-with-lease`), and opens pull
+requests through the GitHub API (see [github.md](github.md)).
 `internal/keychain`: macOS Keychain storage shared by the Claude and GitHub
 tokens.
 

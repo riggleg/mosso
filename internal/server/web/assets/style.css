@@ -119,6 +119,11 @@ input:focus, textarea:focus { outline: 2px solid var(--accent-soft); border-colo
 #checks .check-ok { color: var(--ok); }
 #checks .check-bad { color: var(--danger); }
 #checks .check-detail { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#checks .check-action { margin-left: auto; flex: none; }
+#checks .check-detail.soon { color: var(--danger); }
+dialog ol.steps { margin: 0 0 14px; padding-left: 20px; }
+dialog ol.steps li { margin-bottom: 4px; }
+.empty button + button { margin-left: 8px; }
 .limitation { color: var(--muted); margin: 0; line-height: 1.4; }
 
 /* Main */

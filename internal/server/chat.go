@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"slices"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/riggleg/mosso/internal/claude"
@@ -162,10 +163,12 @@ func (s *Server) startTurn(ws workspace, token claude.Token, prompt string, sess
 		}
 		run.err = s.ensureClaude(ctx, ws.Name, ws.Sandbox.SessionID)
 		if run.err == nil {
+			s.syncBeforeTurn(ctx, ws)
 			run.turn, run.err = claude.Send(ctx, s.vercel, ws.Sandbox.SessionID, token, claude.Request{
-				Prompt:    prompt,
-				SessionID: sid,
-				Dir:       ws.Dir,
+				Prompt:       prompt,
+				SessionID:    sid,
+				Dir:          ws.Dir,
+				SystemPrompt: workspacePrompt(ws),
 				OnSession: func(id string) {
 					s.mu.Lock()
 					c.sessionID = id
@@ -177,6 +180,63 @@ func (s *Server) startTurn(ws workspace, token claude.Token, prompt string, sess
 		s.finishTurn(ws, c, run)
 	}()
 	return run, true
+}
+
+// syncTimeout bounds the fetch before a turn.
+const syncTimeout = 2 * time.Minute
+
+// syncBeforeTurn fetches the base and working branches from GitHub into the
+// sandbox's origin/* refs, so Claude can rebase or merge without
+// credentials. A failure is reported in the chat but does not stop the turn.
+func (s *Server) syncBeforeTurn(ctx context.Context, ws workspace) {
+	if ws.git == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, syncTimeout)
+	defer cancel()
+	gh, _, err := s.githubClient(ctx)
+	var synced github.Synced
+	if err == nil {
+		synced, err = s.gitSync(ws.git, ctx, gh.Token())
+	}
+	if err != nil {
+		if ctx.Err() == nil {
+			log.Printf("workspace %s: %v", ws.Name, err)
+			s.addEntry(ws.chat, chatEntry{Type: "notice", Text: "Could not fetch the latest changes from GitHub (" + err.Error() + "). Claude works with what the sandbox already has."})
+		}
+		return
+	}
+	var moved []string
+	if b, a := synced.Before.Base, synced.After.Base; b != a {
+		moved = append(moved, fmt.Sprintf("origin/%s moved %s → %s", ws.Base, short(b), short(a)))
+	}
+	if b, a := synced.Before.Branch, synced.After.Branch; b != a && a != "" {
+		moved = append(moved, fmt.Sprintf("origin/%s moved %s → %s", ws.Branch, short(b), short(a)))
+	}
+	if len(moved) > 0 {
+		s.addEntry(ws.chat, chatEntry{Type: "notice", Text: "Fetched from GitHub: " + strings.Join(moved, "; ") + "."})
+	}
+}
+
+func short(sha string) string {
+	if len(sha) > 7 {
+		return sha[:7]
+	}
+	if sha == "" {
+		return "(none)"
+	}
+	return sha
+}
+
+// workspacePrompt tells Claude how Git works in a workspace: no
+// credentials, Mosso fetches and pushes.
+func workspacePrompt(ws workspace) string {
+	return fmt.Sprintf(`You are working in a Mosso workspace: a checkout of the GitHub repository %[1]s in %[2]s, on the working branch %[3]s, whose pull request targets %[4]s.
+Git in this sandbox has no GitHub credentials, on purpose. Do not try to push, authenticate, or use the gh CLI, and do not ask for a token.
+- Before each of your turns, Mosso fetches from GitHub for you: origin/%[4]s is the latest base branch, and origin/%[3]s is the working branch as last published (once it has been). git fetch and git pull may fail here; use those refs instead, for example "git rebase origin/%[4]s".
+- Commit your work on the current branch. When the user publishes from Mosso, Mosso pushes the current HEAD to %[3]s and opens or updates the pull request. A rebased branch is pushed with --force-with-lease.
+- If a rebase or merge stops on conflicts, resolve them and finish it before ending your turn: Mosso will not publish while one is in progress.`,
+		ws.Repo, ws.Dir, ws.Branch, ws.Base)
 }
 
 // finishTurn records how a turn ended and frees the workspace, atomically,

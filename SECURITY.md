@@ -26,10 +26,16 @@ data in public issues. Contact the repository owner privately before disclosure.
   [docs/claude-code.md](docs/claude-code.md#security-model-and-limitations).
 - The GitHub token (a fine-grained personal access token limited to the target
   repositories, with Contents and Pull requests write access) is stored in the
-  macOS Keychain. It is used by the Mosso server for pushes and pull requests
-  through the GitHub API. It enters a sandbox only in the environment of the
+  macOS Keychain, or in memory or `MOSSO_GITHUB_TOKEN` without one. It can be
+  pasted into the local web UI (a password field, sent once over loopback and
+  never stored by the browser). The Mosso server uses it for the GitHub API
+  and for its own `git` fetches and pushes, which exchange commits with the
+  sandbox as bundles. It enters a sandbox only in the environment of the
   initial `git clone` of a private repository, before any agent or repository
   code runs there; see [docs/github.md](docs/github.md#security-model-and-limitations).
+  Before pushing, Mosso refuses commits that contain the GitHub or Claude token,
+  but it only matches the literal values: an encoded copy, or exfiltration over
+  the network from the sandbox, is not caught.
 - If a credential is exposed, **revoke or rotate it immediately**. Removing it
   from a subsequent commit does not make the exposure safe.
 
