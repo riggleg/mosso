@@ -159,9 +159,8 @@ func Send(ctx context.Context, vc *vercel.Client, sandboxSession string, token T
 	}
 	// Output is parsed line by line as it streams out of the sandbox. The
 	// token cannot contain a newline, so redacting whole lines is enough.
-	p := &parser{turn: Turn{Events: []Event{}}, onSession: req.OnSession, onEvent: req.OnEvent}
-	var line strings.Builder
-	skipping := false // inside a line longer than maxLineBytes
+	p := NewStreamParser(req.OnSession, req.OnEvent)
+	lines := NewLineSplitter(func(line string) { p.Line(token.redact(line)) })
 	res, err := vc.Run(ctx, sandboxSession, vercel.Command{
 		Name: "bash",
 		Args: args,
@@ -171,37 +170,59 @@ func Send(ctx context.Context, vc *vercel.Client, sandboxSession string, token T
 			"MOSSO_PROMPT":        req.Prompt,
 			"DISABLE_AUTOUPDATER": "1",
 		},
-		Stdout: func(chunk string) {
-			for chunk != "" {
-				part, rest, complete := strings.Cut(chunk, "\n")
-				chunk = rest
-				if !skipping && line.Len()+len(part) <= maxLineBytes {
-					line.WriteString(part)
-				} else {
-					skipping = true
-					line.Reset()
-				}
-				if complete {
-					if !skipping {
-						p.line(token.redact(line.String()))
-					}
-					line.Reset()
-					skipping = false
-				}
-			}
-		},
+		Stdout: lines.Write,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("run claude code: %w", err)
 	}
-	if !skipping {
-		p.line(token.redact(line.String()))
-	}
-	turn, err := p.finish()
+	lines.Flush()
+	turn, err := p.Finish()
 	if err != nil {
 		return nil, fmt.Errorf("run claude code: exit code %d: %w: %s", res.ExitCode, err, tail(token.redact(res.Stderr)))
 	}
 	return turn, nil
+}
+
+// LineSplitter turns a stream of chunks into complete lines. Lines longer
+// than maxLineBytes are dropped, so one huge line cannot exhaust memory.
+type LineSplitter struct {
+	fn       func(line string)
+	line     strings.Builder
+	skipping bool // inside a line longer than maxLineBytes
+}
+
+// NewLineSplitter returns a splitter that calls fn with each complete line,
+// without its newline.
+func NewLineSplitter(fn func(line string)) *LineSplitter { return &LineSplitter{fn: fn} }
+
+// Write feeds the next chunk of the stream.
+func (s *LineSplitter) Write(chunk string) {
+	for chunk != "" {
+		part, rest, complete := strings.Cut(chunk, "\n")
+		chunk = rest
+		if !s.skipping && s.line.Len()+len(part) <= maxLineBytes {
+			s.line.WriteString(part)
+		} else {
+			s.skipping = true
+			s.line.Reset()
+		}
+		if complete {
+			if !s.skipping {
+				s.fn(s.line.String())
+			}
+			s.line.Reset()
+			s.skipping = false
+		}
+	}
+}
+
+// Flush delivers an unterminated last line, if any.
+func (s *LineSplitter) Flush() {
+	if !s.skipping && s.line.Len() > 0 {
+		s.fn(s.line.String())
+	}
+	s.line.Reset()
+	s.skipping = false
 }
 
 // streamMessage is the subset of a stream-json line Mosso reads.
@@ -237,15 +258,17 @@ type contentBlock struct {
 // into a Turn. Lines that are not JSON, and message types Mosso does not use,
 // are skipped. It fails if the stream has no final result message.
 func ParseStream(out string) (*Turn, error) {
-	p := &parser{turn: Turn{Events: []Event{}}}
+	p := NewStreamParser(nil, nil)
 	for _, line := range strings.Split(out, "\n") {
-		p.line(line)
+		p.Line(line)
 	}
-	return p.finish()
+	return p.Finish()
 }
 
-// parser builds a Turn from stream-json output one line at a time.
-type parser struct {
+// StreamParser builds a Turn from stream-json output one line at a time.
+// It is what Send uses, exported so the sandbox worker can parse the same
+// output from a local Claude Code process.
+type StreamParser struct {
 	turn      Turn
 	sawResult bool
 	bytes     int // stream-json bytes whose events are in turn.Events
@@ -253,7 +276,14 @@ type parser struct {
 	onEvent   func(Event)
 }
 
-func (p *parser) line(line string) {
+// NewStreamParser returns a parser. onSession, if set, is called once with
+// the session ID as soon as it is known; onEvent, if set, with each event.
+func NewStreamParser(onSession func(string), onEvent func(Event)) *StreamParser {
+	return &StreamParser{turn: Turn{Events: []Event{}}, onSession: onSession, onEvent: onEvent}
+}
+
+// Line parses one line of output. Lines that are not JSON are skipped.
+func (p *StreamParser) Line(line string) {
 	line = strings.TrimSpace(line)
 	if !strings.HasPrefix(line, "{") {
 		return
@@ -297,7 +327,8 @@ func (p *parser) line(line string) {
 	}
 }
 
-func (p *parser) finish() (*Turn, error) {
+// Finish returns the Turn. It fails if no final result message was seen.
+func (p *StreamParser) Finish() (*Turn, error) {
 	if !p.sawResult {
 		return nil, errors.New("claude code produced no result")
 	}

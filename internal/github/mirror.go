@@ -73,6 +73,9 @@ type MirrorOptions struct {
 	BaseSHA string // commit the checkout was cloned at
 	Branch  string // working branch, mosso/*
 	Dir     string // checkout in the sandbox
+	// Pushed is the working branch head Mosso last pushed, when a saved
+	// workspace is restored; empty for a new one.
+	Pushed string
 }
 
 // Heads are the base and working branch heads on GitHub. Branch is "" while
@@ -95,16 +98,27 @@ func NewMirror(vc *vercel.Client, sandboxSession string, opts MirrorOptions) (*M
 		return nil, errors.New("mirror: invalid base commit")
 	case !strings.HasPrefix(opts.Dir, "/"):
 		return nil, errors.New("mirror: dir must be absolute")
+	case opts.Pushed != "" && !shaPattern.MatchString(opts.Pushed):
+		return nil, errors.New("mirror: invalid pushed commit")
 	}
 	return &Mirror{
 		vc: vc, session: sandboxSession, opts: opts,
-		known: map[string]bool{opts.BaseSHA: true},
-		seen:  Heads{Base: opts.BaseSHA},
+		known:  map[string]bool{opts.BaseSHA: true},
+		seen:   Heads{Base: opts.BaseSHA},
+		pushed: opts.Pushed,
 	}, nil
 }
 
 // Options returns the workspace the Mirror was created for.
 func (m *Mirror) Options() MirrorOptions { return m.opts }
+
+// SetSandboxSession points the Mirror at a new session of the same sandbox,
+// after the sandbox was resumed. The checkout is the same filesystem.
+func (m *Mirror) SetSandboxSession(id string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.session = id
+}
 
 // Close removes the server-side repository. Later calls fail.
 func (m *Mirror) Close() error {

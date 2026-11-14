@@ -18,9 +18,11 @@ import (
 	"github.com/riggleg/mosso/internal/vercel"
 )
 
-// defaultWorkspaceTimeout is the sandbox lifetime for a workspace when the
-// request does not set one: long enough for a coding task and a pull request.
-const defaultWorkspaceTimeout = 30 * time.Minute
+// defaultWorkspaceTimeout is the sandbox session length for a workspace
+// when the request does not set one. Sessions are the unit Vercel bills
+// and limits (45 minutes on Hobby); the workspace itself persists across
+// sessions, so the longest allowed session is the most convenient.
+const defaultWorkspaceTimeout = vercel.MaxTimeout
 
 // setupTimeout bounds provisioning, cloning and installing Claude Code.
 const setupTimeout = 10 * time.Minute
@@ -29,7 +31,7 @@ const setupTimeout = 10 * time.Minute
 const publishTimeout = 5 * time.Minute
 
 // workspace is a GitHub repository checked out on a working branch in a
-// sandbox. Its name is the sandbox's name.
+// persistent sandbox. Its name is the sandbox's name.
 type workspace struct {
 	Name    string         `json:"name"`
 	Repo    string         `json:"repo"`
@@ -38,17 +40,25 @@ type workspace struct {
 	Branch  string         `json:"branch"`
 	Dir     string         `json:"dir"`
 	Sandbox vercel.Sandbox `json:"sandbox"`
-	// ExpiresAt is roughly when Vercel stops the sandbox.
-	ExpiresAt   time.Time           `json:"expires_at"`
+	// SandboxState is "running", "stopped" (resumes on the next message)
+	// or "gone" (deleted or expired); computed by snapshotLocked.
+	SandboxState string `json:"sandbox_state"`
+	// ExpiresAt is when Vercel stops the current sandbox session; unset
+	// while the sandbox is stopped.
+	ExpiresAt   time.Time           `json:"expires_at,omitzero"`
+	CreatedAt   time.Time           `json:"created_at"`
 	PullRequest *github.PullRequest `json:"pull_request,omitempty"`
-	// Status is "creating", "ready", "working" (Claude or a publish is
-	// running) or "error" (the last turn or publish failed, or the sandbox
-	// expired); Error says why. Both are computed by snapshotLocked.
+	// Status is "creating", "connecting" (checking the sandbox after a
+	// restart), "ready", "working" (Claude or a publish is running),
+	// "stopped" (the sandbox session ended; the next message resumes it)
+	// or "error" (the last turn or publish failed, or the sandbox is
+	// gone); Error says why. Both are computed by snapshotLocked.
 	Status string `json:"status"`
 	Error  string `json:"error,omitempty"`
 
-	creating bool
-	chat     *chat
+	creating   bool
+	connecting bool
+	chat       *chat
 	// attachments are the files uploaded to the workspace's sandbox, by
 	// ID; attachBytes is their total size. Guarded by Server.mu.
 	attachments    map[string]attachment
@@ -56,18 +66,41 @@ type workspace struct {
 	attachDirReady bool
 	// git fetches and pushes for the workspace; nil until it is cloned.
 	git *github.Mirror
+	// pushed is the working branch head Mosso last pushed.
+	pushed string
+
+	// Sandbox worker state, guarded by Server.mu. lastSeq is the last
+	// worker event applied to the chat; taskRunning says a Claude task is
+	// in flight (busy because of Claude, not a publish); sandboxState is
+	// one of the sandbox* constants; follower cancels the goroutine that
+	// follows the worker's events; interruptedTask is a task Mosso already
+	// reported as interrupted.
+	lastSeq         int64
+	taskRunning     bool
+	sandboxState    string
+	follower        context.CancelFunc
+	interruptedTask string
 }
 
 // snapshotLocked returns a copy of ws with its current status.
 func (s *Server) snapshotLocked(ws *workspace) workspace {
 	c := *ws
+	c.SandboxState = ws.sandboxState
+	expired := !ws.ExpiresAt.IsZero() && time.Now().After(ws.ExpiresAt)
 	switch {
 	case ws.creating:
 		c.Status = "creating"
+	case ws.connecting:
+		c.Status = "connecting"
+	case ws.sandboxState == sandboxGone:
+		c.Status, c.Error = "error", goneMessage
 	case s.busy[ws.Name]:
 		c.Status = "working"
-	case time.Now().After(ws.ExpiresAt):
-		c.Status, c.Error = "error", "The sandbox has expired. Terminate this workspace and create a new one."
+	case ws.sandboxState == sandboxStopped || expired:
+		c.Status = "stopped"
+		if expired {
+			c.ExpiresAt = time.Time{}
+		}
 	case ws.chat.err != "":
 		c.Status, c.Error = "error", ws.chat.err
 	default:
@@ -210,7 +243,7 @@ func (s *Server) listWorkspaces(w http.ResponseWriter, _ *http.Request) {
 		list = append(list, s.snapshotLocked(ws))
 	}
 	s.mu.Unlock()
-	sort.Slice(list, func(i, j int) bool { return list[i].Sandbox.CreatedAt.Before(list[j].Sandbox.CreatedAt) })
+	sort.Slice(list, func(i, j int) bool { return list[i].CreatedAt.Before(list[j].CreatedAt) })
 	writeJSON(w, http.StatusOK, map[string]any{"workspaces": list})
 }
 
@@ -234,9 +267,10 @@ func (s *Server) getWorkspace(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// createWorkspace provisions a sandbox, clones the repository's base branch
-// into it and checks out a new working branch. The sandbox is destroyed if
-// any step fails.
+// createWorkspace provisions a persistent sandbox, clones the repository's
+// base branch into it, checks out a new working branch, installs Claude
+// Code and starts the Mosso worker. The sandbox is destroyed if any step
+// fails.
 func (s *Server) createWorkspace(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Repo           string `json:"repo"`
@@ -295,27 +329,35 @@ func (s *Server) createWorkspace(w http.ResponseWriter, r *http.Request) {
 	// reloads), so the workspace still appears; Shutdown cancels it.
 	ctx, cancel := context.WithTimeout(s.ctx, setupTimeout)
 	defer cancel()
-	sb, status, err := s.provision(ctx, timeout)
+	// Persistent: the sandbox snapshots itself when a session stops and
+	// resumes later; one kept snapshot keeps storage flat.
+	sb, status, err := s.provision(ctx, vercel.CreateOptions{Timeout: timeout, Persistent: true, KeepLastSnapshots: 1})
 	if err != nil {
 		writeError(w, status, err.Error())
 		return
 	}
 	ws := &workspace{
-		Name:      sb.Name,
-		Repo:      repo.FullName,
-		Base:      base,
-		Branch:    github.NewBranchName(),
-		Dir:       path.Join(claude.WorkDir, req.Repo[strings.IndexByte(req.Repo, '/')+1:]),
-		Sandbox:   *sb,
-		ExpiresAt: sb.CreatedAt.Add(timeout),
-		creating:  true,
-		chat:      newChat(),
+		Name:         sb.Name,
+		Repo:         repo.FullName,
+		Base:         base,
+		Branch:       github.NewBranchName(),
+		Dir:          path.Join(claude.WorkDir, req.Repo[strings.IndexByte(req.Repo, '/')+1:]),
+		Sandbox:      *sb,
+		ExpiresAt:    sb.ExpiresAt(),
+		CreatedAt:    time.Now().UTC(),
+		creating:     true,
+		chat:         newChat(),
+		sandboxState: sandboxRunning,
 
 		attachments: map[string]attachment{},
+	}
+	if ws.ExpiresAt.IsZero() {
+		ws.ExpiresAt = sb.CreatedAt.Add(timeout)
 	}
 	if !github.ValidRepo(ws.Repo) {
 		ws.Repo = req.Repo
 	}
+	ws.chat.persist = s.persister(ws.Name)
 	// List the workspace as "creating" and hold it while cloning so nothing
 	// else runs in it. Destroy it if it does not come up.
 	s.mu.Lock()
@@ -378,9 +420,12 @@ func (s *Server) createWorkspace(w http.ResponseWriter, r *http.Request) {
 			s.addEntry(ws.chat, chatEntry{Type: "notice", Text: "Could not fetch from GitHub on the Mosso server: " + err.Error() + " Mosso tries again before each message and when publishing."})
 		}
 	}()
-	// Install Claude Code now so the first message is quick. If this
-	// fails, the first message tries again.
+	// Install Claude Code and start the worker now so the first message is
+	// quick. If either fails, the first message tries again.
 	_ = s.ensureClaude(ctx, sb.Name, sb.SessionID)
+	if _, err := s.ensureWorker(ctx, sb.Name, sb.SessionID); err != nil {
+		log.Printf("workspace %s: %v", sb.Name, err)
+	}
 	<-primed
 
 	s.mu.Lock()
@@ -392,6 +437,7 @@ func (s *Server) createWorkspace(w http.ResponseWriter, r *http.Request) {
 		ws.creating = false
 		delete(s.busy, sb.Name)
 		ws.chat.notify()
+		s.persistLocked(ws)
 		snapshot = s.snapshotLocked(ws)
 		ready = true
 	}
@@ -401,15 +447,25 @@ func (s *Server) createWorkspace(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "the sandbox was destroyed while the workspace was being set up")
 		return
 	}
+	// Follow the worker's events from now on.
+	go func() {
+		ctx, cancel := context.WithTimeout(s.ctx, resumeTimeout)
+		defer cancel()
+		if err := s.connect(ctx, ws); err != nil && ctx.Err() == nil {
+			log.Printf("workspace %s: %v", ws.Name, err)
+		}
+	}()
 	writeJSON(w, http.StatusCreated, snapshot)
 }
 
 // workspacePullRequest commits the workspace's changes, pushes them to its
 // working branch on GitHub and opens a pull request into the base branch.
-// Calling it again pushes new work to the same pull request.
+// Calling it again pushes new work to the same pull request. A stopped
+// sandbox is resumed first.
 func (s *Server) workspacePullRequest(w http.ResponseWriter, r *http.Request) {
-	ws, ok := s.lookupWorkspace(w, r)
+	ws, ok := s.workspaceByName(r.PathValue("name"))
 	if !ok {
+		writeError(w, http.StatusNotFound, "unknown workspace")
 		return
 	}
 	var req struct {
@@ -432,8 +488,15 @@ func (s *Server) workspacePullRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if ws.git == nil {
+	s.mu.Lock()
+	git, gone := ws.git, ws.sandboxState == sandboxGone
+	s.mu.Unlock()
+	if git == nil {
 		writeError(w, http.StatusConflict, "the workspace is still being set up")
+		return
+	}
+	if gone {
+		writeError(w, http.StatusGone, goneMessage)
 		return
 	}
 	gh, ok := s.gitHub(w, r)
@@ -457,7 +520,19 @@ func (s *Server) workspacePullRequest(w http.ResponseWriter, r *http.Request) {
 	// pull request are not left half-updated; Shutdown cancels it.
 	ctx, cancel := context.WithTimeout(s.ctx, publishTimeout)
 	defer cancel()
-	pub, err := s.gitPublish(ws.git, ctx, gh, github.PublishOptions{
+	fail := func(err error) {
+		log.Printf("workspace %s: publish: %v", ws.Name, err)
+		s.mu.Lock()
+		ws.chat.err = "Publishing failed: " + err.Error()
+		ws.chat.add(chatEntry{Type: "error", Text: ws.chat.err})
+		s.mu.Unlock()
+		writeError(w, http.StatusBadGateway, err.Error())
+	}
+	if err := s.connect(ctx, ws); err != nil {
+		fail(err)
+		return
+	}
+	pub, err := s.gitPublish(git, ctx, gh, github.PublishOptions{
 		Title: req.Title, Body: req.Body, Draft: req.Draft, Secrets: secrets,
 	})
 	if errors.Is(err, github.ErrNoChanges) {
@@ -466,20 +541,15 @@ func (s *Server) workspacePullRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
-		log.Printf("workspace %s: publish: %v", ws.Name, err)
-		s.mu.Lock()
-		ws.chat.err = "Publishing failed: " + err.Error()
-		ws.chat.add(chatEntry{Type: "error", Text: ws.chat.err})
-		s.mu.Unlock()
-		writeError(w, http.StatusBadGateway, err.Error())
+		fail(err)
 		return
 	}
 	s.mu.Lock()
-	if cur, ok := s.workspaces[ws.Name]; ok {
-		cur.PullRequest = &pub.PullRequest
-	}
+	ws.PullRequest = &pub.PullRequest
+	ws.pushed = pub.Commit
 	ws.chat.err = ""
 	ws.chat.add(chatEntry{Type: "pull_request", PullRequest: pub})
+	s.persistLocked(ws)
 	s.mu.Unlock()
 	log.Printf("workspace %s: pushed %s to %s (forced=%t), pull request %s (created=%t)", ws.Name, pub.Commit, ws.Branch, pub.Forced, pub.URL, pub.Created)
 	status := http.StatusOK

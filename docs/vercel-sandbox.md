@@ -76,16 +76,25 @@ Sandboxes are billed while running, so Mosso layers several safeguards:
   default) after which Vercel stops it, even if Mosso crashes.
   Mosso caps the timeout at 45 minutes, the Vercel Hobby plan maximum, so it
   works on every plan; Pro/Enterprise allow longer, but Mosso does not request it.
-- **Limit**: at most 5 sandboxes exist at once; further `POST /sandboxes`
-  requests get `429` until one is destroyed.
-- **Non-persistent**: sandboxes are created with `persistent: false`, so no
-  snapshots are kept after they stop.
+- **Limit**: at most 5 sandboxes run at once (stopped workspaces do not
+  count); further create requests get `429` until one is destroyed or
+  stops.
+- **Non-persistent** plain sandboxes: `POST /sandboxes` creates them with
+  `persistent: false`, so no snapshots are kept after they stop. Workspaces
+  (`POST /workspaces`) are **persistent** on purpose: their filesystem is
+  snapshotted when a session stops and resumed later; see
+  [worker.md](worker.md). One snapshot per workspace is kept.
 - **Create failures**: Mosso picks the sandbox name before calling Vercel. If the
   create request fails or returns an unusable response, Mosso deletes that name.
-- **Shutdown**: on `Ctrl-C`/`SIGTERM`, Mosso destroys every sandbox it created
-  and has not yet destroyed. A failed destroy is kept in the list so you can
-  retry `DELETE`, and is reported in the shutdown log.
+- **Shutdown**: on `Ctrl-C`/`SIGTERM`, Mosso destroys every plain sandbox it
+  created and has not yet destroyed. A failed destroy is kept in the list so
+  you can retry `DELETE`, and is reported in the shutdown log. Workspace
+  sandboxes are **not** destroyed on shutdown: Claude may still be working
+  in them, and they stop by themselves at the session timeout. They are
+  saved in Mosso's data directory and reconnected to on the next start;
+  only `DELETE /workspaces/{name}` (Terminate) deletes them, together with
+  their snapshots.
 
-Mosso keeps its sandbox list in memory only. If the process is killed with
+Plain sandboxes are tracked in memory only. If the process is killed with
 `SIGKILL`, check the Vercel dashboard (or wait for the timeout) for any
-`mosso-*` sandboxes.
+`mosso-*` sandboxes that are not workspaces.

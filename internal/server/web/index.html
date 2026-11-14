@@ -19,7 +19,7 @@
     <nav id="workspace-list" aria-label="Workspaces"></nav>
     <footer id="sidebar-footer">
       <ul id="checks" aria-label="Configuration"></ul>
-      <p class="limitation">Workspaces and chats are kept in memory only. They are lost when Mosso stops or a sandbox is terminated or expires; branches and pull requests stay on GitHub.</p>
+      <p class="limitation">Workspaces and chats are saved on this machine and in each persistent sandbox. Claude keeps working in the sandbox when Mosso stops; Mosso catches up when it starts again. Sandbox sessions last up to 45 minutes and resume on your next message. Terminate deletes a workspace for good; branches and pull requests stay on GitHub.</p>
     </footer>
   </aside>
 
@@ -47,6 +47,7 @@
         <div class="ws-meta">
           <span id="ws-expiry" class="muted"></span>
           <a id="ws-pr" class="pr-link hidden" target="_blank" rel="noopener noreferrer"></a>
+          <button id="resume" class="hidden" type="button" title="Start a new sandbox session from the saved snapshot and fetch what Claude did meanwhile">Resume sandbox</button>
           <button id="publish" type="button">Create PR</button>
           <button id="terminate" class="danger" type="button">Terminate</button>
         </div>
@@ -100,7 +101,7 @@
         <input id="create-base" list="branch-options" placeholder="default branch" spellcheck="false" autocapitalize="off">
         <datalist id="branch-options"></datalist>
       </label>
-      <p class="muted small-text">Mosso provisions a sandbox (30 minutes), clones the base branch onto a new working branch and installs Claude Code. This takes about a minute.</p>
+      <p class="muted small-text">Mosso provisions a persistent sandbox (sessions of up to 45 minutes, resumed as needed), clones the base branch onto a new working branch and installs Claude Code and the Mosso worker. This takes about a minute.</p>
       <p id="create-error" class="error-text hidden"></p>
       <div class="dialog-actions">
         <button id="create-cancel" type="button">Cancel</button>

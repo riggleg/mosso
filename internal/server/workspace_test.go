@@ -183,14 +183,20 @@ func TestWorkspaceToPullRequest(t *testing.T) {
 	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "you said improve the readme") {
 		t.Fatalf("message status = %d: %s", rec.Code, rec.Body)
 	}
-	run := fake.cmds[len(fake.cmds)-1]
-	if run["cwd"] != ws.Dir {
-		t.Fatalf("claude ran in %v, want %s", run["cwd"], ws.Dir)
+	task := fake.claude.last()
+	if task.Dir != ws.Dir {
+		t.Fatalf("claude ran in %q, want %s", task.Dir, ws.Dir)
 	}
 	// Claude is told how Git works here, and origin/* was refreshed first.
-	if args, _ := json.Marshal(run["args"]); !strings.Contains(string(args), "--append-system-prompt") ||
-		!strings.Contains(string(args), "origin/main") || !strings.Contains(string(args), ws.Branch) {
-		t.Fatalf("claude args lack the workspace prompt: %s", args)
+	if !strings.Contains(task.SystemPrompt, "origin/main") || !strings.Contains(task.SystemPrompt, ws.Branch) {
+		t.Fatalf("claude task lacks the workspace prompt: %+v", task)
+	}
+	// The Claude token reaches the worker through the command environment,
+	// never through command arguments.
+	for _, c := range fake.cmds {
+		if args, _ := json.Marshal(c["args"]); strings.Contains(string(args), testClaudeToken) {
+			t.Fatalf("Claude token in command arguments: %s", args)
+		}
 	}
 	if api.syncs != 2 { // once while creating, once before the turn
 		t.Fatalf("syncs = %d, want 2", api.syncs)

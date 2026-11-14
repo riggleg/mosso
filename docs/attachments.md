@@ -17,9 +17,9 @@ All three end in the same code. Each file uploads as soon as it is added, with
 a progress bar; you can remove it, or retry it if it failed. Send is disabled
 until every upload has finished. A message may be attachments only. Click a
 thumbnail to see it larger. In the history, images show as thumbnails and
-other files download from the workspace's sandbox. A refresh keeps them, as
-long as the sandbox lives; afterwards a thumbnail turns into a notice that the
-attachment is no longer available.
+other files download from the workspace's sandbox. A refresh, and a Mosso
+restart, keep them; while the sandbox is stopped a thumbnail turns into a
+notice that it is not available until the sandbox resumes.
 
 Limits (checked in the browser for quick feedback, and again on the server):
 25 MiB per file, 10 files and 40 MiB per message, 256 MiB per workspace. Names
@@ -51,11 +51,13 @@ A pasted image is named `Pasted image <date>.png`.
    Vercel's documented write-files API (gzipped tar plus the `x-cwd` header),
    and returns `{"attachments":[{id,name,size,type,image}]}`. Nothing is
    written on the Mosso machine and nothing about the file goes to the log.
-2. Files live at `/tmp/mosso-attachments/<id>/<name>` in the workspace's
-   sandbox: outside the repository, mode 0644 (never executable), and a random
-   `<id>` per file so equal names never collide. Mosso never runs, commits or
-   adds them to Git. They are deleted with the sandbox when the workspace is
-   terminated or expires, and with it Mosso's in-memory records.
+2. Files live at `/vercel/sandbox/.mosso/attachments/<id>/<name>` in the
+   workspace's sandbox: outside the repository, inside the persisted
+   filesystem (so they survive a session stop and resume), mode 0644 (never
+   executable), and a random `<id>` per file so equal names never collide.
+   Mosso never runs, commits or adds them to Git. Their descriptions are
+   saved with the workspace; the files are deleted with the sandbox when the
+   workspace is terminated.
 3. `POST /workspaces/{name}/chat` accepts `"attachments": ["<id>", …]` next to
    `prompt` (which may then be empty). The ids must belong to that workspace.
    The user's entry in the chat log carries the attachments, so every browser
@@ -69,7 +71,8 @@ A pasted image is named `Pasted image <date>.png`.
    sandbox with the read-file API: images inline, with `?download=1` or for any
    other type as `application/octet-stream` attachments, all with `nosniff`
    and `Content-Security-Policy: default-src 'none'; sandbox`. `410` means the
-   sandbox is gone.
+   sandbox is stopped (resume it and reload; Mosso does not boot a sandbox
+   to serve a thumbnail) or gone. Uploading resumes a stopped sandbox.
 
 The upload endpoint accepts `multipart/form-data` only on that route; the
 loopback `Host` and `Origin` checks apply to it like to every endpoint.

@@ -21,6 +21,7 @@ data/
 
 # Development outputs
 bin/
+internal/worker/bin/mosso-worker
 dist/
 coverage.out
 .DS_Store

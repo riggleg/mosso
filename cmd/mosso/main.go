@@ -58,6 +58,16 @@ func main() {
 		log.Print("git is not installed on this machine: workspaces cannot fetch from or push to GitHub until it is (on macOS: xcode-select --install)")
 	}
 	srv := server.New(client)
+	// Workspaces are saved on disk and reconnected to after a restart.
+	if dataDir, err := server.DataDir(); err != nil {
+		log.Printf("workspaces are not saved between runs: %v", err)
+	} else if client == nil {
+		log.Printf("workspaces in %s are not restored: Vercel is not configured", dataDir)
+	} else if err := srv.Restore(context.Background(), dataDir); err != nil {
+		log.Printf("restore workspaces from %s: %v", dataDir, err)
+	} else {
+		log.Printf("workspaces saved in %s", dataDir)
+	}
 	httpSrv := &http.Server{Addr: *addr, Handler: srv.Handler(), ReadHeaderTimeout: 10 * time.Second}
 	// Browsers keep event streams open; end them so shutdown need not wait.
 	httpSrv.RegisterOnShutdown(srv.CloseStreams)
@@ -90,8 +100,11 @@ func main() {
 	}
 	cancelDrain()
 
-	// Destroy any sandboxes still running so they do not keep accruing charges.
-	// This uses its own deadline so a slow drain cannot leave it pre-expired.
+	// Workspace sandboxes keep running (Claude finishes its task in the
+	// sandbox and Mosso catches up on the next start; Vercel stops the
+	// session at its timeout). Plain sandboxes are destroyed so they do not
+	// keep accruing charges. This uses its own deadline so a slow drain
+	// cannot leave it pre-expired.
 	destroyCtx, cancelDestroy := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancelDestroy()
 	if err := srv.Shutdown(destroyCtx); err != nil {
