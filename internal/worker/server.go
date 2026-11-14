@@ -190,7 +190,9 @@ func (s *Server) message(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusAccepted, Accepted{TaskID: t.id, Seq: user.Seq})
 }
 
-// work runs the task and records how it ended.
+// work runs the task and records how it ended. The terminal event is
+// recorded before the worker accepts another message, so the log never
+// interleaves two tasks and the status never says idle with a task open.
 func (s *Server) work(ctx context.Context, t *task) {
 	defer close(t.done)
 	defer t.cancel()
@@ -201,9 +203,13 @@ func (s *Server) work(ctx context.Context, t *task) {
 	turn, err := s.run(ctx, t.msg, emit)
 	s.mu.Lock()
 	stopped := t.stopped
-	s.cur = nil
 	s.mu.Unlock()
-	t.msg.Token = "" // drop the token as soon as the task is over
+	defer func() {
+		s.mu.Lock()
+		s.cur = nil
+		s.mu.Unlock()
+	}()
+	t.msg.Token = "" // this copy; the runner's command environment is gone with the process
 	switch {
 	case err != nil && (stopped || errors.Is(err, context.Canceled)):
 		emit(Event{Type: EventStopped, Text: "Stopped. Send a message to continue the conversation."})

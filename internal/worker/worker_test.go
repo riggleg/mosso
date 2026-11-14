@@ -41,6 +41,7 @@ echo "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"tool_use\",\
 echo "{\"type\":\"user\",\"message\":{\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"toolu_1\",\"content\":\"README.md\"}]}}"
 case "$prompt" in *slow*) sleep 30;; esac
 case "$prompt" in *crash*) echo "boom" >&2; exit 3;; esac
+case "$prompt" in *noisy*) head -c 300000 /dev/zero | tr '\0' 'e' >&2; echo >&2; echo " the end" >&2; exit 4;; esac
 printf '{"type":"result","subtype":"success","is_error":false,"num_turns":2,"result":"you said %s","session_id":"%s"}\n' "$prompt" "$sid"
 `
 
@@ -237,6 +238,55 @@ func TestClaudeFailureIsRecordedAsError(t *testing.T) {
 	last := events[len(events)-1]
 	if last.Type != EventError || !strings.Contains(last.Text, "code 3") || !strings.Contains(last.Text, "boom") {
 		t.Fatalf("last = %+v", last)
+	}
+}
+
+// TestLargeStderrDoesNotBreakClaude: a verbose Claude Code (more stderr
+// than the worker keeps) must not get a broken pipe; the error keeps the
+// end of stderr.
+func TestLargeStderrDoesNotBreakClaude(t *testing.T) {
+	_, ts, _, _ := newTestWorker(t)
+	post(t, ts.URL+"/messages", Message{Text: "noisy", Prompt: "be noisy", Dir: t.TempDir(), Token: testToken})
+	waitFor(t, func() bool { return getStatus(t, ts.URL).State == "idle" })
+	events := getEvents(t, ts.URL, 0)
+	last := events[len(events)-1]
+	if last.Type != EventError || !strings.Contains(last.Text, "code 4") || !strings.Contains(last.Text, "the end") {
+		t.Fatalf("last = %+v", last)
+	}
+	if strings.Contains(last.Text, "broken pipe") || strings.Contains(last.Text, "short write") {
+		t.Fatalf("stderr limit broke the process: %s", last.Text)
+	}
+}
+
+// TestStatusIsIdleOnlyAfterTheTerminalEvent: once /status says idle, the
+// log already holds the task's terminal event, so a next message cannot
+// interleave with it.
+func TestStatusIsIdleOnlyAfterTheTerminalEvent(t *testing.T) {
+	w, ts, _, _ := newTestWorker(t)
+	for i := 0; i < 5; i++ {
+		post(t, ts.URL+"/messages", Message{Text: "hi", Prompt: "hi", Dir: t.TempDir(), Token: testToken})
+		for {
+			st := getStatus(t, ts.URL)
+			if st.State == "idle" {
+				if w.log.OpenTask() != "" {
+					t.Fatal("idle with an open task")
+				}
+				break
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+	events := getEvents(t, ts.URL, 0)
+	open := ""
+	for _, e := range events {
+		switch {
+		case e.Type == EventUser && open != "":
+			t.Fatalf("task %s started before %s ended", e.TaskID, open)
+		case e.Type == EventUser:
+			open = e.TaskID
+		case e.Terminal():
+			open = ""
+		}
 	}
 }
 

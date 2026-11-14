@@ -90,19 +90,21 @@ func (s *Server) runClaude(ctx context.Context, msg Message, emit func(Event)) (
 	return turn, nil
 }
 
-// limitedBuffer keeps the first maxStderrBytes written to it.
+// limitedBuffer keeps the first maxStderrBytes written to it and accepts
+// (and discards) the rest, so the writer never sees a short write.
 type limitedBuffer struct {
 	b strings.Builder
 }
 
 func (l *limitedBuffer) Write(p []byte) (int, error) {
+	n := len(p)
 	if room := maxStderrBytes - l.b.Len(); room > 0 {
 		if len(p) > room {
 			p = p[:room]
 		}
 		l.b.Write(p)
 	}
-	return len(p), nil
+	return n, nil
 }
 
 func (l *limitedBuffer) String() string { return l.b.String() }
