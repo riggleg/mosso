@@ -151,8 +151,87 @@ func TestCreateFailureCleansUp(t *testing.T) {
 	if got := f.calls(); len(got) != 2 || got[1] != "DELETE /v2/sandboxes/mosso-abc" {
 		t.Fatalf("calls = %v, want create then delete", got)
 	}
-	if f.requests[1].Query["projectId"][0] != "prj_1" {
-		t.Fatalf("delete missing projectId: %v", f.requests[1].Query)
+	if f.requests[1].Query["projectId"][0] != "prj_1" || f.requests[1].Query["deleteOrphanSnapshots"][0] != "true" {
+		t.Fatalf("delete missing projectId or deleteOrphanSnapshots: %v", f.requests[1].Query)
+	}
+}
+
+func TestCreatePersistent(t *testing.T) {
+	f, c := newFakeAPI(t)
+	f.handle("POST /v2/sandboxes", reply(200, `{
+		"sandbox": {"name": "mosso-abc", "persistent": true, "currentSessionId": "sbx_1", "status": "running", "timeout": 2700000, "createdAt": 1700000000000},
+		"session": {"id": "sbx_1", "status": "running", "timeout": 2700000, "startedAt": 1700000001000},
+		"routes": []
+	}`))
+	sb, err := c.Create(context.Background(), "mosso-abc", CreateOptions{Timeout: 45 * time.Minute, Persistent: true, SnapshotExpiration: 7 * 24 * time.Hour, KeepLastSnapshots: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !sb.Persistent || sb.Timeout != 45*time.Minute || sb.StartedAt.UnixMilli() != 1700000001000 ||
+		sb.ExpiresAt() != sb.StartedAt.Add(45*time.Minute) || !sb.Running() || sb.CreatedAt.UnixMilli() != 1700000000000 {
+		t.Fatalf("unexpected sandbox: %+v", sb)
+	}
+	body := f.requests[0].Body
+	keep, _ := body["keepLastSnapshots"].(map[string]any)
+	if body["persistent"] != true || body["snapshotExpiration"] != float64(7*24*3600*1000) || keep["count"] != float64(1) || keep["deleteEvicted"] != true {
+		t.Fatalf("unexpected create body: %v", body)
+	}
+}
+
+func TestGetResumesAndReportsErrors(t *testing.T) {
+	f, c := newFakeAPI(t)
+	f.handle("GET /v2/sandboxes/mosso-abc", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("resume") != "true" || r.URL.Query().Get("projectId") != "prj_1" {
+			t.Errorf("query = %v", r.URL.Query())
+		}
+		reply(200, `{"sandbox":{"name":"mosso-abc","persistent":true,"currentSessionId":"sbx_2","status":"running","timeout":60000},
+			"session":{"id":"sbx_2","status":"running","timeout":60000,"startedAt":1700000005000},"routes":[],"resumed":true}`)(w, r)
+	})
+	sb, err := c.Get(context.Background(), "mosso-abc", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sb.SessionID != "sbx_2" || sb.Timeout != time.Minute || sb.StartedAt.UnixMilli() != 1700000005000 || !sb.Running() {
+		t.Fatalf("unexpected sandbox: %+v", sb)
+	}
+
+	f.handle("GET /v2/sandboxes/stopped", reply(200, `{"sandbox":{"name":"stopped","persistent":true,"currentSessionId":"sbx_9","status":"stopped"},
+		"session":{"id":"sbx_9","status":"stopped","timeout":60000,"startedAt":1,"stoppedAt":2},"routes":[]}`))
+	sb, err = c.Get(context.Background(), "stopped", false)
+	if err != nil || sb.Running() || sb.Status != "stopped" {
+		t.Fatalf("stopped sandbox = %+v, %v", sb, err)
+	}
+
+	f.handle("GET /v2/sandboxes/gone", reply(410, `{"error":{"code":"snapshot_not_found","message":"The snapshot has expired"}}`))
+	_, err = c.Get(context.Background(), "gone", true)
+	if !SnapshotGone(err) || !SessionStopped(err) || IsNotFound(err) {
+		t.Fatalf("err = %v, want SnapshotGone", err)
+	}
+	f.handle("GET /v2/sandboxes/busy", reply(422, `{"error":{"code":"sandbox_stopping","message":"stopping"}}`))
+	if _, err = c.Get(context.Background(), "busy", true); !InTransition(err) {
+		t.Fatalf("err = %v, want InTransition", err)
+	}
+	if _, err = c.Get(context.Background(), "missing", true); !IsNotFound(err) || !SessionOver(err) {
+		t.Fatalf("err = %v, want not found", err)
+	}
+}
+
+func TestStopIgnoresEndedSessions(t *testing.T) {
+	f, c := newFakeAPI(t)
+	f.handle("POST /v2/sandboxes/sessions/sbx_1/stop", reply(200, `{"session":{"id":"sbx_1","status":"stopping"},"snapshot":{"id":"snap_1"}}`))
+	if err := c.Stop(context.Background(), "sbx_1"); err != nil {
+		t.Fatal(err)
+	}
+	f.handle("POST /v2/sandboxes/sessions/sbx_2/stop", reply(410, `{"error":{"code":"sandbox_stopped","message":"gone"}}`))
+	if err := c.Stop(context.Background(), "sbx_2"); err != nil {
+		t.Fatalf("stopping an ended session = %v, want nil", err)
+	}
+	if err := c.Stop(context.Background(), "sbx_404"); err != nil {
+		t.Fatalf("stopping an unknown session = %v, want nil", err)
+	}
+	f.handle("POST /v2/sandboxes/sessions/sbx_3/stop", reply(500, `{"error":{"message":"boom"}}`))
+	if err := c.Stop(context.Background(), "sbx_3"); err == nil {
+		t.Fatal("expected an error")
 	}
 }
 

@@ -139,7 +139,7 @@ func (s *Server) claudeMessage(w http.ResponseWriter, r *http.Request) {
 // workspaceClaudeMessage runs a Claude Code turn in the workspace checkout
 // and waits for it, like claudeMessage. The turn is recorded in the
 // workspace's chat, so the web UI shows it too. The GitHub token is not
-// available to Claude.
+// available to Claude. If the client disconnects, the turn is stopped.
 func (s *Server) workspaceClaudeMessage(w http.ResponseWriter, r *http.Request) {
 	ws, ok := s.lookupWorkspace(w, r)
 	if !ok {
@@ -153,23 +153,35 @@ func (s *Server) workspaceClaudeMessage(w http.ResponseWriter, r *http.Request) 
 	if !ok {
 		return
 	}
-	run, ok := s.startTurnWithAttachments(w, ws, token, req, &req.SessionID)
+	run, ok := s.startTurnWithAttachments(w, ws.Name, token, req, &req.SessionID)
 	if !ok {
-		writeBusy(w)
 		return
 	}
 	select {
 	case <-run.done:
 	case <-r.Context().Done():
 		s.mu.Lock()
-		ws.chat.stopLocked(run)
+		run.stopped = true
+		taskID, session := run.taskID, ws.Sandbox.SessionID
+		if live, ok := s.workspaces[ws.Name]; ok {
+			session = live.Sandbox.SessionID
+		}
 		s.mu.Unlock()
+		if taskID != "" {
+			s.stopTask(session)
+		}
 		<-run.done
 		return
 	}
-	if run.err != nil {
-		writeError(w, http.StatusBadGateway, run.err.Error())
+	s.mu.Lock()
+	turn, err := run.turn, run.err
+	s.mu.Unlock()
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, run.turn)
+	if turn == nil {
+		turn = &claude.Turn{Events: []claude.Event{}}
+	}
+	writeJSON(w, http.StatusOK, turn)
 }

@@ -13,7 +13,7 @@ import (
 func TestWriteFilesSendsAGzippedTarToTheDirectory(t *testing.T) {
 	f, c := newFakeAPI(t)
 	f.handle("POST /v2/sandboxes/sessions/sess/fs/write", func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, "{}") })
-	err := c.WriteFiles(context.Background(), "sess", "/tmp/mosso-attachments", []File{{Name: "abc/shot.png", Data: []byte("PNGDATA")}})
+	err := c.WriteFiles(context.Background(), "sess", "/tmp/mosso-attachments", []File{{Name: "abc/shot.png", Data: []byte("PNGDATA")}, {Name: "bin/tool", Data: []byte("#!/bin/sh"), Mode: 0o755}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -36,7 +36,7 @@ func TestWriteFilesSendsAGzippedTarToTheDirectory(t *testing.T) {
 		b, _ := io.ReadAll(tr)
 		got[hdr.Name], modes[hdr.Name] = string(b), hdr.Mode
 	}
-	if got["abc/shot.png"] != "PNGDATA" || modes["abc/shot.png"] != 0o644 {
+	if got["abc/shot.png"] != "PNGDATA" || modes["abc/shot.png"] != 0o644 || modes["bin/tool"] != 0o755 {
 		t.Fatalf("tar contents = %v modes %v", got, modes)
 	}
 }

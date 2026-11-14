@@ -41,6 +41,9 @@ func (Token) MarshalText() ([]byte, error) { return []byte("[REDACTED]"), nil }
 func (t Token) Reveal() string             { return string(t) }
 func (t Token) redact(s string) string     { return redact(s, string(t)) }
 
+// Redact replaces every occurrence of the token in s with "[REDACTED]".
+func (t Token) Redact(s string) string { return t.redact(s) }
+
 func redact(s, secret string) string {
 	if secret == "" {
 		return s

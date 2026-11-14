@@ -18,6 +18,7 @@ const state = {
   pending: new Map(), // workspace name -> attachments being composed
   sending: false,
   publishing: false,
+  resuming: false,
   repos: null,
   github: null, // GET /github/auth: whether GitHub is connected (never the token)
 };
@@ -240,13 +241,22 @@ function statusLabel(ws) {
   switch (ws.status) {
     case "creating":
       return "Setting up";
+    case "connecting":
+      return "Connecting";
     case "working":
       return "Working";
+    case "stopped":
+      return "Stopped";
     case "error":
-      return "Error";
+      return ws.sandbox_state === "gone" ? "Gone" : "Error";
     default:
       return "Ready";
   }
+}
+
+// sandboxGone reports whether the workspace's sandbox no longer exists.
+function sandboxGone(ws) {
+  return !!ws && ws.sandbox_state === "gone";
 }
 
 function renderHeader() {
@@ -269,11 +279,15 @@ function renderHeader() {
   } else {
     pr.classList.add("hidden");
   }
-  const busy = ws.status === "working" || ws.status === "creating";
+  const busy = ws.status === "working" || ws.status === "creating" || ws.status === "connecting";
   const publish = $("publish");
   publish.textContent = state.publishing ? "Publishing…" : ws.pull_request ? "Update PR" : "Create PR";
-  publish.disabled = busy || state.publishing;
-  publish.title = busy ? "Wait for the current task to finish" : "Commit and push the sandbox's changes as a pull request";
+  publish.disabled = busy || state.publishing || sandboxGone(ws);
+  publish.title = busy ? "Wait for the current task to finish" : "Commit and push the sandbox's changes as a pull request (a stopped sandbox is resumed first)";
+  const resume = $("resume");
+  resume.classList.toggle("hidden", ws.status !== "stopped");
+  resume.disabled = state.resuming;
+  resume.textContent = state.resuming ? "Resuming…" : "Resume sandbox";
 
   const err = $("ws-error");
   if (ws.error && ws.status === "error") {
@@ -288,20 +302,38 @@ function renderHeader() {
 function renderExpiry() {
   const ws = state.ws;
   const el = $("ws-expiry");
-  if (!ws || !ws.expires_at) return;
+  if (!ws) return;
+  if (sandboxGone(ws)) {
+    el.textContent = "Sandbox gone";
+    el.className = "soon";
+    el.title = "The sandbox was deleted or its snapshot expired. The conversation is kept; terminate the workspace to remove it.";
+    return;
+  }
+  if (ws.status === "connecting") {
+    el.textContent = "Checking the sandbox…";
+    el.className = "muted";
+    el.title = "Mosso restarted and is reconnecting to the sandbox.";
+    return;
+  }
+  if (!ws.expires_at || ws.status === "stopped") {
+    el.textContent = "Sandbox stopped";
+    el.className = "muted";
+    el.title = "The sandbox session ended (sessions last up to 45 minutes). Its files and the conversation are saved; sending a message or clicking Resume starts a new session.";
+    return;
+  }
   const left = new Date(ws.expires_at).getTime() - Date.now();
   if (left <= 0) {
-    el.textContent = "Sandbox expired";
-    el.className = "soon";
+    el.textContent = "Session ended";
+    el.className = "muted";
   } else {
-    el.textContent = "Sandbox expires in " + (left < 60000 ? "under a minute" : Math.floor(left / 60000) + " min");
+    el.textContent = "Session ends in " + (left < 60000 ? "under a minute" : Math.floor(left / 60000) + " min");
     el.className = left < 5 * 60000 ? "soon" : "muted";
   }
-  el.title = "Vercel stops the sandbox at " + new Date(ws.expires_at).toLocaleTimeString() + ". Publish before then.";
+  el.title = "Vercel stops the sandbox session at " + new Date(ws.expires_at).toLocaleTimeString() + ". Claude's work is saved in the sandbox and resumes with your next message.";
 }
 
 function isWorking() {
-  return state.ws && (state.ws.status === "working" || state.ws.status === "creating");
+  return state.ws && (state.ws.status === "working" || state.ws.status === "creating" || state.ws.status === "connecting");
 }
 
 function lastEntryOf(types) {
@@ -316,7 +348,7 @@ function claudeRunning() {
     const e = state.entries[i];
     if (e.type === "user") return true;
     if (["result", "error", "pull_request"].includes(e.type)) return false;
-    if (e.type === "notice" && /^(Stopped|Publishing|Nothing to publish)/.test(e.text)) return false;
+    if (e.type === "notice" && /^(Stopped|Interrupted|Publishing|Nothing to publish)/.test(e.text)) return false;
   }
   return false;
 }
@@ -331,6 +363,7 @@ function renderWorking() {
     let text = "Working…";
     let since = null;
     if (ws.status === "creating") text = "Setting up the workspace: provisioning the sandbox, cloning and installing Claude Code…";
+    else if (ws.status === "connecting") text = "Reconnecting to the sandbox after a restart…";
     else if (running) {
       text = "Claude is working…";
       since = lastEntryOf(["user"]);
@@ -348,11 +381,19 @@ function renderWorking() {
   const hint = $("composer-hint");
   const pending = (state.selected && state.pending.get(state.selected)) || [];
   const uploading = pending.some((i) => i.status !== "done");
-  const blocked = busy || state.sending || !ws || uploading;
+  const gone = sandboxGone(ws);
+  const blocked = busy || state.sending || !ws || uploading || gone;
   send.disabled = blocked;
-  if (ws && ws.status === "creating") {
+  prompt.disabled = gone;
+  if (gone) {
+    prompt.placeholder = "The sandbox is gone. The conversation is kept; terminate the workspace to remove it.";
+    hint.textContent = "";
+  } else if (ws && ws.status === "creating") {
     prompt.placeholder = "The workspace is being set up…";
     hint.textContent = "";
+  } else if (ws && ws.status === "stopped") {
+    prompt.placeholder = "Ask Claude to make a change…  (the stopped sandbox resumes first, which takes a few seconds)";
+    hint.textContent = "Sandbox stopped; sending resumes it.";
   } else if (busy) {
     prompt.placeholder = "Claude is busy. You can type your next message; send it when the current task finishes.";
     hint.textContent = "Busy";
@@ -693,7 +734,7 @@ function attachmentChip(a, opts) {
       li.classList.add("gone");
       visual.replaceChildren("—");
       visual.disabled = true;
-      sub.textContent = "No longer available (the sandbox is gone)";
+      sub.textContent = "Not available while the sandbox is stopped or gone; resume it and reload";
     });
     visual = h("button", { class: "thumb", type: "button", title: "Preview " + a.name, "aria-label": "Preview " + label, onclick: () => openPreview(preview, label) }, img);
   } else {
@@ -740,7 +781,7 @@ async function downloadAttachment(a, url, sub, li) {
     setTimeout(() => URL.revokeObjectURL(blobURL), 10000);
   } catch (e) {
     li.classList.add("gone");
-    sub.textContent = e.message === "gone" ? "No longer available (the sandbox is gone)" : "Download failed";
+    sub.textContent = e.message === "gone" ? "Not available while the sandbox is stopped or gone; resume it and try again" : "Download failed";
   }
 }
 
@@ -867,6 +908,24 @@ async function sendPrompt() {
   }
 }
 
+// resumeSandbox resumes a stopped sandbox without sending a message, so
+// attachments can be opened and Claude's last state is fetched.
+async function resumeSandbox() {
+  const ws = state.ws;
+  if (!ws || state.resuming) return;
+  state.resuming = true;
+  render();
+  try {
+    await api("POST", wsPath(ws.name) + "/connect", {});
+    hideBanner();
+  } catch (e) {
+    showBanner("Could not resume the sandbox: " + e.message);
+  } finally {
+    state.resuming = false;
+    refreshList();
+  }
+}
+
 async function stopTurn() {
   if (!state.selected) return;
   $("stop").disabled = true;
@@ -884,7 +943,7 @@ async function terminate() {
   if (!ws) return;
   const msg =
     `Terminate the workspace for ${ws.repo}?\n\n` +
-    "This destroys the Vercel Sandbox with its files and the Claude conversation. Unpublished changes are lost. " +
+    "This permanently deletes the Vercel Sandbox with its files and snapshots, the Claude conversation and the history Mosso saved on this machine. Unpublished changes are lost. " +
     (ws.pull_request ? `The branch and PR #${ws.pull_request.number} stay on GitHub.` : "Nothing has been published yet.");
   if (!confirm(msg)) return;
   const btn = $("terminate");
@@ -1047,6 +1106,7 @@ function init() {
   $("publish-form").addEventListener("submit", submitPublish);
   $("publish-cancel").addEventListener("click", () => $("publish-dialog").close());
   $("terminate").addEventListener("click", terminate);
+  $("resume").addEventListener("click", resumeSandbox);
   $("empty-connect").addEventListener("click", openGitHub);
   $("github-form").addEventListener("submit", submitGitHub);
   $("github-cancel").addEventListener("click", closeGitHub);

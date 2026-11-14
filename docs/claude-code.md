@@ -46,7 +46,17 @@ pull request, use a workspace; see [github.md](github.md).
    [web-ui.md](web-ui.md).
 6. **Follow-ups** pass the previous `session_id`; Mosso runs
    `claude -p --resume <session_id>`. Claude Code keeps the transcript on the
-   sandbox's disk, so **a conversation only lives as long as its sandbox**.
+   sandbox's disk. For a plain sandbox that is as long as the sandbox runs;
+   a workspace's sandbox is persistent, so its transcripts survive session
+   stops and the conversation can be resumed later.
+
+In **workspaces**, steps 4 and 5 happen inside the sandbox: the Mosso worker
+(see [worker.md](worker.md)) starts the same `claude -p` command as its
+child, with the prompt on stdin and the token in the process environment,
+parses the output line by line, redacts the token and records the events to
+a log in the sandbox, from which Mosso reads them. Claude therefore keeps
+running when Mosso is not. The `POST /sandboxes/{name}/claude/messages`
+endpoint still runs Claude as a Vercel command directly.
 
 ## Setup
 
@@ -147,11 +157,14 @@ MOSSO_E2E=1 go test ./internal/server -run TestClaudeEndToEnd -v -timeout 20m
 **The sandbox can use your subscription.** Claude Code needs the token in
 its process environment. Claude Code removes `CLAUDE_CODE_OAUTH_TOKEN` from
 the environment of the Bash commands it runs, but those commands run as the same
-user and can still read it from `/proc/<pid>/environ`. A prompt injection (for
-example, from a repository you ask Claude to work on) could therefore read the
-token and send it out over the network. Mosso redacts the exact token from
-API responses, but it cannot stop exfiltration from inside the sandbox.
-Treat the sandbox as holding your Claude login while it runs:
+user and can still read it from `/proc/<pid>/environ`. In a workspace the
+Mosso worker also holds the token in memory while a task runs (it receives
+it with each message and drops it when the task ends; it never writes it to
+disk). A prompt injection (for example, from a repository you ask Claude to
+work on) could therefore read the token and send it out over the network.
+Mosso redacts the exact token from API responses and from the worker's
+event log, but it cannot stop exfiltration from inside the sandbox. Treat
+the sandbox as holding your Claude login while a task runs:
 
 - Only point Claude at code and content you trust.
 - If you suspect exposure, revoke the token and generate a new one.
@@ -193,5 +206,6 @@ page):
   token and switch to API billing; Mosso never sets one.
 - Claude Code installs from `claude.ai` on every new sandbox. A failed
   download returns `502`; retry, or check the sandbox's network access.
-- The transcript is lost when the sandbox stops. Restarting a conversation in
-  a new sandbox is out of scope for this milestone.
+- A plain sandbox's transcript is lost when the sandbox stops. A workspace's
+  transcript persists with its sandbox (see [worker.md](worker.md));
+  moving a conversation to a new sandbox is out of scope.

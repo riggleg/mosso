@@ -109,7 +109,8 @@ input:focus, textarea:focus { outline: 2px solid var(--accent-soft); border-colo
 .list-empty { color: var(--muted); padding: 10px; font-size: 13px; }
 .dot { width: 8px; height: 8px; border-radius: 50%; flex: none; background: var(--muted); }
 .dot.ready { background: var(--ok); }
-.dot.working, .dot.creating { background: var(--accent); animation: pulse 1.2s ease-in-out infinite; }
+.dot.working, .dot.creating, .dot.connecting { background: var(--accent); animation: pulse 1.2s ease-in-out infinite; }
+.dot.stopped { background: var(--muted); }
 .dot.error { background: var(--danger); }
 @keyframes pulse { 50% { opacity: 0.35; } }
 
@@ -149,7 +150,8 @@ dialog ol.steps li { margin-bottom: 4px; }
 .branch { font-family: var(--mono); font-size: 12px; color: var(--muted); background: var(--bg-soft); border: 1px solid var(--border); border-radius: 5px; padding: 1px 6px; }
 .status { font-size: 12px; border-radius: 10px; padding: 1px 8px; background: var(--bg-soft); color: var(--muted); }
 .status.ready { color: var(--ok); }
-.status.working, .status.creating { color: var(--accent); background: var(--accent-soft); }
+.status.working, .status.creating, .status.connecting { color: var(--accent); background: var(--accent-soft); }
+.status.stopped { color: var(--muted); background: var(--bg-soft); }
 .status.error { color: var(--danger); background: var(--danger-soft); }
 .ws-meta { display: flex; align-items: center; gap: 10px; }
 #ws-expiry.soon { color: var(--warn); font-weight: 600; }

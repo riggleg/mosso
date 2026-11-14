@@ -184,9 +184,12 @@ or a log. Bundles move through the Vercel Sandbox command API: into the
 sandbox as base64 command arguments, out of it as command output.
 
 The mirror is a temporary directory (`$TMPDIR/mosso-git-*`) per workspace,
-removed when the workspace is terminated or Mosso shuts down. It needs
-`git` on the machine running Mosso (on macOS: `xcode-select --install`); the
-first fetch downloads the base branch's history once.
+removed when the workspace is terminated or Mosso shuts down, and recreated
+on demand after a restart (the first fetch downloads the base branch's
+history again). Mosso saves the commit it last pushed with the workspace,
+so a rebased branch can still be published with `--force-with-lease` after a
+restart. It needs `git` on the machine running Mosso (on macOS:
+`xcode-select --install`).
 
 ## API
 
@@ -199,7 +202,7 @@ first fetch downloads the base branch's history once.
 | `POST /workspaces/{name}/claude/messages`    | Same body and response as `POST /sandboxes/{name}/claude/messages`, run in the checkout after syncing `origin/*`. The turn is also recorded in the workspace's chat. |
 | `POST /workspaces/{name}/chat`, `GET /workspaces/{name}/events` | Asynchronous chat with streamed progress, used by the web UI; see [web-ui.md](web-ui.md#api-used-by-the-ui). |
 | `POST /workspaces/{name}/pull-request`       | Body (all optional): `{"title": "...", "body": "...", "draft": false}`. `201` when it opened the pull request, `200` when it already existed. |
-| `DELETE /workspaces/{name}`                  | Destroy the sandbox and the server-side mirror. The branch and pull request stay on GitHub. |
+| `DELETE /workspaces/{name}`                  | Terminate: delete the sandbox with its snapshots, the server-side mirror and the saved history. The branch and pull request stay on GitHub. |
 
 Workspace:
 
@@ -379,8 +382,8 @@ MOSSO_E2E=1 MOSSO_E2E_GITHUB_REPO=you/mosso-playground \
   `.gitignore`. Review the pull request before merging, as for any
   contributor.
 - Commits are authored with your GitHub account's name and noreply address.
-- Workspaces and mirrors are in memory and in temporary directories only;
-  restarting Mosso destroys their sandboxes and mirrors, but branches and
-  pull requests remain on GitHub. If Mosso is killed without shutting down,
-  `$TMPDIR/mosso-git-*` directories may be left behind; they are safe to
-  delete.
+- Workspaces are saved in Mosso's data directory and their sandboxes
+  persist across restarts (see [worker.md](worker.md)); mirrors are
+  temporary directories recreated as needed. If Mosso is killed without
+  shutting down, `$TMPDIR/mosso-git-*` directories may be left behind; they
+  are safe to delete. Publishing resumes a stopped sandbox first.

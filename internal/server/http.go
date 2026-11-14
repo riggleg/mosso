@@ -19,13 +19,15 @@ import (
 	"github.com/riggleg/mosso/internal/claude"
 	"github.com/riggleg/mosso/internal/github"
 	"github.com/riggleg/mosso/internal/vercel"
+	"github.com/riggleg/mosso/internal/worker"
 )
 
 // maxCommandBytes bounds the size of a command submitted to /exec.
 const maxCommandBytes = 64 * 1024
 
-// maxSandboxes caps how many sandboxes may exist (or be in creation) at once,
-// bounding the cost of a runaway or buggy local client.
+// maxSandboxes caps how many sandboxes may run (or be in creation) at once,
+// bounding the cost of a runaway or buggy local client. Stopped workspaces
+// do not count: they cost nothing until resumed.
 const maxSandboxes = 5
 
 // Server serves Mosso's HTTP API and tracks the sandboxes it has created so
@@ -48,6 +50,11 @@ type Server struct {
 	// operations on this server; replaced in tests.
 	gitSync    func(*github.Mirror, context.Context, github.Token) (github.Synced, error)
 	gitPublish func(*github.Mirror, context.Context, *github.Client, github.PublishOptions) (*github.Published, error)
+	// workerBinary returns the mosso-worker binary to upload into a
+	// sandbox; replaced in tests.
+	workerBinary func(context.Context) ([]byte, error)
+	// store saves workspaces on disk; nil keeps them in memory only.
+	store *store
 
 	// ctx is cancelled by Shutdown; background work (Claude turns,
 	// workspace setup) derives from it instead of from a request.
@@ -88,6 +95,7 @@ func New(client *vercel.Client) *Server {
 		saveGitHubToken: github.SaveToken,
 		gitSync:         (*github.Mirror).Sync,
 		gitPublish:      (*github.Mirror).Publish,
+		workerBinary:    worker.Binary,
 		sandboxes:       map[string]vercel.Sandbox{},
 		claudeInstalled: map[string]bool{},
 		busy:            map[string]bool{},
@@ -125,6 +133,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /workspaces/{name}/attachments", s.requireVercel(s.uploadAttachments))
 	mux.HandleFunc("GET /workspaces/{name}/attachments/{id}", s.requireVercel(s.downloadAttachment))
 	mux.HandleFunc("POST /workspaces/{name}/chat/stop", s.requireVercel(s.workspaceStop))
+	mux.HandleFunc("POST /workspaces/{name}/connect", s.requireVercel(s.workspaceConnect))
 	mux.HandleFunc("GET /workspaces/{name}/events", s.requireVercel(s.workspaceEvents))
 	mux.HandleFunc("GET /github/repos", s.githubRepos)
 	mux.HandleFunc("GET /github/repos/{owner}/{repo}/branches", s.githubBranches)
@@ -226,7 +235,7 @@ func (s *Server) createSandbox(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, fmt.Sprintf("timeout_seconds must be between 0 and %d", maxSeconds))
 		return
 	}
-	sb, status, err := s.provision(r.Context(), time.Duration(req.TimeoutSeconds)*time.Second)
+	sb, status, err := s.provision(r.Context(), vercel.CreateOptions{Timeout: time.Duration(req.TimeoutSeconds) * time.Second})
 	if err != nil {
 		writeError(w, status, err.Error())
 		return
@@ -236,20 +245,20 @@ func (s *Server) createSandbox(w http.ResponseWriter, r *http.Request) {
 
 // provision creates a sandbox and tracks it so it is destroyed on shutdown.
 // On error it returns the HTTP status to report.
-func (s *Server) provision(ctx context.Context, timeout time.Duration) (*vercel.Sandbox, int, error) {
+func (s *Server) provision(ctx context.Context, opts vercel.CreateOptions) (*vercel.Sandbox, int, error) {
 	// Reserve a slot before calling Vercel so concurrent requests cannot
 	// exceed the limit.
 	s.mu.Lock()
-	if len(s.sandboxes)+s.creating >= maxSandboxes {
+	if s.activeSandboxesLocked()+s.creating >= maxSandboxes {
 		s.mu.Unlock()
 		return nil, http.StatusTooManyRequests,
-			fmt.Errorf("sandbox limit reached (%d); destroy one before creating another", maxSandboxes)
+			fmt.Errorf("sandbox limit reached (%d running); terminate or wait for one to stop before creating another", maxSandboxes)
 	}
 	s.creating++
 	s.mu.Unlock()
 
 	name := vercel.NewSandboxName()
-	sb, err := s.vercel.Create(ctx, name, vercel.CreateOptions{Timeout: timeout})
+	sb, err := s.vercel.Create(ctx, name, opts)
 	s.mu.Lock()
 	s.creating--
 	if err != nil {
@@ -273,6 +282,19 @@ func (s *Server) provision(ctx context.Context, timeout time.Duration) (*vercel.
 	}
 	log.Printf("created sandbox %s (session %s)", sb.Name, sb.SessionID)
 	return sb, 0, nil
+}
+
+// activeSandboxesLocked counts the sandboxes that are running, or whose
+// state is unknown.
+func (s *Server) activeSandboxesLocked() int {
+	n := 0
+	for name := range s.sandboxes {
+		if ws, ok := s.workspaces[name]; ok && (ws.sandboxState == sandboxStopped || ws.sandboxState == sandboxGone) {
+			continue
+		}
+		n++
+	}
+	return n
 }
 
 func (s *Server) lookup(w http.ResponseWriter, r *http.Request) (vercel.Sandbox, bool) {
@@ -312,11 +334,21 @@ func (s *Server) execSandbox(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, res)
 }
 
+// destroySandbox terminates a sandbox or workspace: the session is stopped,
+// the sandbox and its snapshots are deleted, and everything Mosso saved
+// about the workspace is removed. The branch and pull request stay on
+// GitHub.
 func (s *Server) destroySandbox(w http.ResponseWriter, r *http.Request) {
 	sb, ok := s.lookup(w, r)
 	if !ok {
 		return
 	}
+	s.mu.Lock()
+	if ws, ok := s.workspaces[sb.Name]; ok && ws.follower != nil {
+		ws.follower() // stop following before the session goes away
+		ws.follower = nil
+	}
+	s.mu.Unlock()
 	// Finish cleanup even if the client disconnects.
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), time.Minute)
 	defer cancel()
@@ -369,18 +401,34 @@ func (s *Server) forget(name string) {
 	s.mu.Unlock()
 }
 
-// dropWorkspaceLocked removes a workspace and its chat, stops its running
-// turn and ends its event streams.
+// dropWorkspaceLocked removes a workspace, its chat and its saved state,
+// stops following its worker and ends its event streams.
 func (s *Server) dropWorkspaceLocked(name string) {
 	ws, ok := s.workspaces[name]
 	if !ok {
 		return
 	}
 	delete(s.workspaces, name)
+	if ws.follower != nil {
+		ws.follower()
+		ws.follower = nil
+	}
 	if ws.chat.running != nil {
-		ws.chat.running.cancel()
+		run := ws.chat.running
+		run.err = errors.New("the workspace was terminated")
+		ws.chat.running = nil
+		select {
+		case <-run.done:
+		default:
+			close(run.done)
+		}
 	}
 	ws.chat.notify()
+	if s.store != nil {
+		if err := s.store.remove(name); err != nil {
+			log.Printf("workspace %s: remove saved state: %v", name, err)
+		}
+	}
 	if ws.git != nil {
 		// Close waits for a fetch or push in progress, so not under mu.
 		s.cleanups.Add(1)
@@ -393,10 +441,13 @@ func (s *Server) dropWorkspaceLocked(name string) {
 	}
 }
 
-// Shutdown destroys every sandbox this server created and has not yet
-// destroyed. Call it before the process exits.
+// Shutdown prepares for the process to exit. Workspaces are left alone:
+// their sandboxes keep running (so Claude can finish what it is doing) and
+// Mosso reconnects to them on the next start; their saved state is already
+// on disk. Plain sandboxes made with POST /sandboxes are destroyed, as they
+// are tracked in memory only.
 func (s *Server) Shutdown(ctx context.Context) error {
-	s.cancel() // stop Claude turns and workspace setup
+	s.cancel() // stop following workers; cancel workspace setup and publishes
 	defer s.cleanups.Wait()
 	if s.vercel == nil {
 		return nil
@@ -404,8 +455,21 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	s.mu.Lock()
 	s.closed = true
 	pending := make([]vercel.Sandbox, 0, len(s.sandboxes))
-	for _, sb := range s.sandboxes {
-		pending = append(pending, sb)
+	for name, sb := range s.sandboxes {
+		ws, ok := s.workspaces[name]
+		if !ok {
+			pending = append(pending, sb)
+			continue
+		}
+		s.persistLocked(ws)
+		if ws.git != nil {
+			git := ws.git
+			s.cleanups.Add(1)
+			go func() {
+				defer s.cleanups.Done()
+				_ = git.Close() // the server-side Git repository is recreated on demand
+			}()
+		}
 	}
 	s.mu.Unlock()
 

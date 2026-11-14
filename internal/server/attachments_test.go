@@ -121,9 +121,9 @@ func TestUploadStoresFilesInTheSandboxOutsideTheRepo(t *testing.T) {
 	}
 	fake.mu.Lock()
 	defer fake.mu.Unlock()
-	files := fake.files["sbx_"+ws.Name]
+	files := attachmentFiles(fake.files["sbx_"+ws.Name])
 	for _, a := range atts {
-		p := "/tmp/mosso-attachments/" + a.ID + "/" + a.Name
+		p := attachmentsDir + "/" + a.ID + "/" + a.Name
 		if _, ok := files[p]; !ok {
 			t.Errorf("%s not written; have %v", p, files)
 		}
@@ -162,10 +162,25 @@ func TestUploadNamesAreSafeAndNeverCollide(t *testing.T) {
 	fake.mu.Lock()
 	defer fake.mu.Unlock()
 	for p := range fake.files["sbx_"+ws.Name] {
-		if !strings.HasPrefix(p, "/tmp/mosso-attachments/") || strings.Contains(p, "..") || strings.Count(p, "/") != 4 {
+		if strings.HasPrefix(p, workerDir+"/bin/") {
+			continue // the worker binary
+		}
+		if rel, ok := strings.CutPrefix(p, attachmentsDir+"/"); !ok || strings.Contains(p, "..") || strings.Count(rel, "/") != 1 {
 			t.Errorf("unsafe path %q", p)
 		}
 	}
+}
+
+// attachmentFiles returns the sandbox files that are attachments (not the
+// worker binary).
+func attachmentFiles(files map[string][]byte) map[string][]byte {
+	out := map[string][]byte{}
+	for p, data := range files {
+		if strings.HasPrefix(p, attachmentsDir+"/") {
+			out[p] = data
+		}
+	}
+	return out
 }
 
 func TestUploadLimits(t *testing.T) {
@@ -181,7 +196,10 @@ func TestUploadLimits(t *testing.T) {
 		upFile{"b.bin", bytes.Repeat([]byte{1}, maxMessageBytes-maxAttachmentBytes+1)}), http.StatusRequestEntityTooLarge)
 	errorOf(t, postUpload(t, ts.URL, ws.Name, upFile{"empty.txt", nil}), http.StatusBadRequest)
 	errorOf(t, postUpload(t, ts.URL, ws.Name), http.StatusBadRequest)
-	if n := len(fake.files["sbx_"+ws.Name]); n != 0 {
+	fake.mu.Lock()
+	n := len(attachmentFiles(fake.files["sbx_"+ws.Name]))
+	fake.mu.Unlock()
+	if n != 0 {
 		t.Fatalf("rejected uploads wrote %d files", n)
 	}
 	// Exactly at the limits is fine.
@@ -258,11 +276,9 @@ func TestMessageWithAttachmentsReachesClaude(t *testing.T) {
 	if user.Type != "user" || user.Text != "" || len(user.Attachments) != 2 || user.Attachments[0].Name != "shot.png" || user.Attachments[1].Type != "application/pdf" {
 		t.Fatalf("user entry = %+v", user)
 	}
-	fake.mu.Lock()
-	cmd := fake.cmds[len(fake.cmds)-1]
-	fake.mu.Unlock()
-	prompt, _ := cmd["env"].(map[string]any)["MOSSO_PROMPT"].(string)
-	for _, want := range []string{"/tmp/mosso-attachments/" + atts[0].ID + "/shot.png", "image/png, image", "/tmp/mosso-attachments/" + atts[1].ID + "/spec.pdf", "Read tool"} {
+	task := fake.claude.last()
+	prompt := task.Prompt
+	for _, want := range []string{attachmentsDir + "/" + atts[0].ID + "/shot.png", "image/png, image", attachmentsDir + "/" + atts[1].ID + "/spec.pdf", "Read tool"} {
 		if !strings.Contains(prompt, want) {
 			t.Errorf("prompt lacks %q:\n%s", want, prompt)
 		}
@@ -270,9 +286,16 @@ func TestMessageWithAttachmentsReachesClaude(t *testing.T) {
 	if strings.Contains(prompt, base64.StdEncoding.EncodeToString(onePixelPNG)) || strings.Contains(prompt, "PNG") {
 		t.Error("file contents must not be in the prompt")
 	}
-	if args, _ := json.Marshal(cmd["args"]); strings.Contains(string(args), atts[0].ID) {
-		t.Error("attachments belong in the prompt, not in the arguments")
+	if task.Text != "" || !strings.Contains(string(task.Attachments), atts[0].ID) {
+		t.Errorf("the worker records the user's text and attachments, got %q %s", task.Text, task.Attachments)
 	}
+	fake.mu.Lock()
+	for _, c := range fake.cmds {
+		if args, _ := json.Marshal(c["args"]); strings.Contains(string(args), atts[0].ID) {
+			t.Error("attachments belong in the prompt, not in command arguments")
+		}
+	}
+	fake.mu.Unlock()
 
 	// A follow-up can attach the same file again, and a plain one resumes
 	// the session.
@@ -323,7 +346,10 @@ func TestAttachmentsAreIsolatedBetweenWorkspaces(t *testing.T) {
 	if resp, body := get(t, ts.URL+"/workspaces/"+a.Name+"/attachments/"+att.ID); resp.StatusCode != http.StatusOK || string(body) != "a's secret" {
 		t.Fatalf("A cannot read its own: %d %s", resp.StatusCode, body)
 	}
-	if len(fake.files["sbx_"+b.Name]) != 0 {
+	fake.mu.Lock()
+	leaked := len(attachmentFiles(fake.files["sbx_"+b.Name]))
+	fake.mu.Unlock()
+	if leaked != 0 {
 		t.Fatal("B's sandbox received A's file")
 	}
 }

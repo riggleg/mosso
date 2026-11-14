@@ -12,17 +12,20 @@ import (
 	"net/http"
 	"path"
 	"strings"
+	"time"
 	"unicode"
 	"unicode/utf8"
 
 	"github.com/riggleg/mosso/internal/vercel"
+	"github.com/riggleg/mosso/internal/worker"
 )
 
 const (
 	// attachmentsDir holds attachments in the sandbox, outside the Git
-	// repository. Each attachment gets its own directory named by its random
-	// ID, so names never collide.
-	attachmentsDir = "/tmp/mosso-attachments"
+	// repository but inside the persisted filesystem, so they survive a
+	// session stop and resume. Each attachment gets its own directory
+	// named by its random ID, so names never collide.
+	attachmentsDir = worker.DefaultStateDir + "/attachments"
 
 	maxAttachmentBytes = 25 << 20  // per file
 	maxMessageBytes    = 40 << 20  // per message, and per upload request
@@ -37,7 +40,8 @@ const (
 )
 
 // attachment is a file the user uploaded to a workspace. It lives in the
-// workspace's sandbox, so it is gone when the sandbox is.
+// workspace's sandbox, so it is gone when the sandbox is; its description
+// is saved with the workspace.
 type attachment struct {
 	ID   string `json:"id"`
 	Name string `json:"name"` // sanitized
@@ -145,10 +149,14 @@ func (s *Server) uploadAttachments(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.mu.Lock()
-	ready := !ws.creating
+	ready, gone := !ws.creating, ws.sandboxState == sandboxGone
 	s.mu.Unlock()
 	if !ready {
 		writeError(w, http.StatusConflict, "the workspace is still being set up")
+		return
+	}
+	if gone {
+		writeError(w, http.StatusGone, goneMessage)
 		return
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, maxMessageBytes+uploadOverhead)
@@ -233,11 +241,17 @@ func (s *Server) uploadAttachments(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) storeAttachments(ctx context.Context, ws *workspace, files []upload) ([]attachment, error) {
+	// A stopped sandbox is resumed first.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), resumeTimeout)
+	defer cancel()
+	if err := s.connect(ctx, ws); err != nil {
+		return nil, err
+	}
 	s.mu.Lock()
-	dirReady := ws.attachDirReady
+	dirReady, session := ws.attachDirReady, ws.Sandbox.SessionID
 	s.mu.Unlock()
 	if !dirReady {
-		res, err := s.vercel.Exec(ctx, ws.Sandbox.SessionID, "mkdir -p "+attachmentsDir)
+		res, err := s.vercel.Exec(ctx, session, "mkdir -p "+attachmentsDir)
 		if err != nil {
 			return nil, err
 		}
@@ -255,13 +269,14 @@ func (s *Server) storeAttachments(ctx context.Context, ws *workspace, files []up
 		atts[i] = attachment{ID: newAttachmentID(), Name: f.name, Size: int64(len(f.data)), Type: typ, Image: imageTypes[typ]}
 		tarFiles[i] = vercel.File{Name: atts[i].ID + "/" + f.name, Data: f.data}
 	}
-	if err := s.vercel.WriteFiles(ctx, ws.Sandbox.SessionID, attachmentsDir, tarFiles); err != nil {
+	if err := s.vercel.WriteFiles(ctx, session, attachmentsDir, tarFiles); err != nil {
 		return nil, err
 	}
 	s.mu.Lock()
 	for _, a := range atts {
 		ws.attachments[a.ID] = a
 	}
+	s.persistLocked(ws)
 	s.mu.Unlock()
 	return atts, nil
 }
@@ -324,15 +339,27 @@ func (s *Server) downloadAttachment(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mu.Lock()
 	a, ok := ws.attachments[r.PathValue("id")]
+	session, state := ws.Sandbox.SessionID, ws.sandboxState
+	expired := !ws.ExpiresAt.IsZero() && time.Now().After(ws.ExpiresAt)
 	s.mu.Unlock()
 	if !ok {
 		writeError(w, http.StatusNotFound, "unknown attachment")
 		return
 	}
-	body, err := s.vercel.ReadFile(r.Context(), ws.Sandbox.SessionID, a.sandboxPath())
+	// Reading a file does not resume a stopped sandbox: thumbnails load
+	// with the page, and booting a sandbox for them would be a surprise.
+	switch {
+	case state == sandboxGone:
+		writeError(w, http.StatusGone, "this attachment is no longer available: the sandbox is gone")
+		return
+	case state != sandboxRunning || expired:
+		writeError(w, http.StatusGone, "the sandbox is stopped; resume it to open attachments")
+		return
+	}
+	body, err := s.vercel.ReadFile(r.Context(), session, a.sandboxPath())
 	if err != nil {
 		if vercelGone(err) {
-			writeError(w, http.StatusGone, "this attachment is no longer available: the sandbox is gone")
+			writeError(w, http.StatusGone, "this attachment is not available while the sandbox is stopped")
 		} else {
 			writeError(w, http.StatusBadGateway, err.Error())
 		}

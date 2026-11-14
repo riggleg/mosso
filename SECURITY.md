@@ -21,9 +21,18 @@ data in public issues. Contact the repository owner privately before disclosure.
   tool input/output containing secrets, or process command lines containing secrets.
 - Remove credentials and destroy the sandbox when the session ends.
 - The Claude Code subscription token is stored in the macOS Keychain and passed
-  to a sandbox only in the environment of the Claude Code process. Code running
-  in that sandbox can still read it, so only run Claude on trusted content; see
-  [docs/claude-code.md](docs/claude-code.md#security-model-and-limitations).
+  to a sandbox only with each message, in the environment of the command that
+  hands it to the Mosso worker, which keeps it in memory for that task and
+  puts it in the Claude Code process environment. It is never written to the
+  sandbox's disk or Mosso's data directory. Code running in that sandbox can
+  still read it while a task runs, so only run Claude on trusted content; see
+  [docs/claude-code.md](docs/claude-code.md#security-model-and-limitations)
+  and [docs/worker.md](docs/worker.md#security).
+- The worker's API in the sandbox listens on loopback only and is reached
+  through Vercel's authenticated command API; no port is published.
+- Mosso's data directory (`MOSSO_DATA_DIR`, by default
+  `~/Library/Application Support/mosso`) holds workspace records and chat
+  history (prompts and Claude's output), never credentials.
 - The GitHub token (a fine-grained personal access token limited to the target
   repositories, with Contents and Pull requests write access) is stored in the
   macOS Keychain, or in memory or `MOSSO_GITHUB_TOKEN` without one. It can be

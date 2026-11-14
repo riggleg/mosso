@@ -9,7 +9,6 @@ import (
 	"net/http/httptest"
 	"strconv"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -181,11 +180,11 @@ func TestWorkspaceChatStreamsAndContinues(t *testing.T) {
 	if second[0].ID != first[len(first)-1].ID+1 {
 		t.Fatalf("entry IDs are not consecutive: %d after %d", second[0].ID, first[len(first)-1].ID)
 	}
-	fake.mu.Lock()
-	last, _ := json.Marshal(fake.cmds[len(fake.cmds)-1])
-	fake.mu.Unlock()
-	if !strings.Contains(string(last), `"--resume","`+testSessionID+`"`) {
-		t.Fatalf("follow-up did not resume the session: %s", last)
+	if last := fake.claude.last(); last.SessionID != testSessionID || last.Text != "and the tests" {
+		t.Fatalf("follow-up did not resume the session: %+v", last)
+	}
+	if first := fake.claude.tasks[0]; first.SessionID != "" || first.Dir != ws.Dir || first.Token != testClaudeToken {
+		t.Fatalf("first task = %+v", first)
 	}
 
 	// Reconnecting with Last-Event-ID replays only what was missed; a new
@@ -202,17 +201,7 @@ func TestWorkspaceChatStreamsAndContinues(t *testing.T) {
 
 func TestWorkspaceChatRejectsConcurrentAndStops(t *testing.T) {
 	srv, fake, ts, ws := newChatServer(t)
-	release := make(chan struct{})
-	started := make(chan struct{})
-	var once sync.Once
-	fake.mu.Lock()
-	inner := fake.stdoutFor
-	fake.stdoutFor = func(cmd map[string]any) string {
-		once.Do(func() { close(started) })
-		<-release
-		return inner(cmd)
-	}
-	fake.mu.Unlock()
+	started, release := fake.claude.blockRuns()
 	events := openEvents(t, ts.URL, ws.Name, "")
 
 	if resp := postJSON(t, ts.URL+"/workspaces/"+ws.Name+"/chat", `{"prompt":"long task"}`); resp.StatusCode != http.StatusAccepted {
@@ -233,8 +222,9 @@ func TestWorkspaceChatRejectsConcurrentAndStops(t *testing.T) {
 	if resp := postJSON(t, ts.URL+"/workspaces/"+ws.Name+"/chat/stop", `{}`); resp.StatusCode != http.StatusAccepted {
 		t.Fatalf("stop status = %d", resp.StatusCode)
 	}
-	close(release) // let the fake answer the stopped request and the kill
+	// The stop reaches the worker, which interrupts Claude.
 	entries := events.until("notice")
+	close(release)
 	if last := entries[len(entries)-1]; !strings.HasPrefix(last.Text, "Stopped") {
 		t.Fatalf("entries = %+v, want a Stopped notice", entries)
 	}
@@ -269,11 +259,9 @@ func TestWorkspaceChatErrorsAreRecorded(t *testing.T) {
 	events := openEvents(t, ts.URL, ws.Name, "")
 
 	// Claude Code runs but reports an error, e.g. an expired token.
-	fake.mu.Lock()
-	fake.stdoutFor = func(map[string]any) string {
-		return `{"type":"result","subtype":"success","is_error":true,"result":"Invalid API key · Please run /login","session_id":"` + testSessionID + `"}` + "\n"
-	}
-	fake.mu.Unlock()
+	fake.claude.mu.Lock()
+	fake.claude.fail = true
+	fake.claude.mu.Unlock()
 	postJSON(t, ts.URL+"/workspaces/"+ws.Name+"/chat", `{"prompt":"hi"}`)
 	if r := events.until("result"); !r[len(r)-1].Result.IsError {
 		t.Fatalf("result = %+v, want is_error", r[len(r)-1].Result)
@@ -381,10 +369,13 @@ func TestWorkspaceExpiredStatus(t *testing.T) {
 	srv.mu.Lock()
 	srv.workspaces[ws.Name].ExpiresAt = time.Now().Add(-time.Second)
 	srv.mu.Unlock()
+	// A session past its timeout is a stopped sandbox: no error, and the
+	// next message resumes it.
 	var snap testWorkspaceStatus
-	_ = json.Unmarshal(do(t, srv.Handler(), http.MethodGet, "/workspaces/"+ws.Name, "").Body.Bytes(), &snap)
-	if snap.Status != "error" || !strings.Contains(snap.Error, "expired") {
-		t.Fatalf("workspace = %+v, want expired", snap)
+	body := do(t, srv.Handler(), http.MethodGet, "/workspaces/"+ws.Name, "").Body.String()
+	_ = json.Unmarshal([]byte(body), &snap)
+	if snap.Status != "stopped" || snap.Error != "" || strings.Contains(body, `"expires_at"`) {
+		t.Fatalf("workspace = %s, want stopped", body)
 	}
 }
 
@@ -428,17 +419,7 @@ func TestGitHubRepoAndBranchLists(t *testing.T) {
 
 func TestWorkspaceMessageStopsWhenClientDisconnects(t *testing.T) {
 	srv, fake, ts, ws := newChatServer(t)
-	release := make(chan struct{})
-	started := make(chan struct{})
-	var once sync.Once
-	fake.mu.Lock()
-	inner := fake.stdoutFor
-	fake.stdoutFor = func(cmd map[string]any) string {
-		once.Do(func() { close(started) })
-		<-release
-		return inner(cmd)
-	}
-	fake.mu.Unlock()
+	started, release := fake.claude.blockRuns()
 	events := openEvents(t, ts.URL, ws.Name, "")
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -451,9 +432,10 @@ func TestWorkspaceMessageStopsWhenClientDisconnects(t *testing.T) {
 	}()
 	<-started
 	cancel()
-	close(release)
 	<-done
-	if e := events.until("notice"); !strings.HasPrefix(e[len(e)-1].Text, "Stopped") {
+	e := events.until("notice")
+	close(release)
+	if !strings.HasPrefix(e[len(e)-1].Text, "Stopped") {
 		t.Fatalf("entries = %s, want the turn stopped", entryTypes(e))
 	}
 }

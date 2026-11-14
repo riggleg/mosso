@@ -20,13 +20,15 @@ import (
 type File struct {
 	Name string
 	Data []byte
+	// Mode is the file's permissions; zero means 0644 (not executable).
+	Mode int64
 }
 
 // WriteFiles extracts files under dir (which must already exist) in the
 // sandbox session, using Vercel's documented write-files endpoint: a gzipped
 // tarball with the target directory in the x-cwd header. Files are created
-// with mode 0644, so nothing is executable. Names must be relative and
-// contain no "." or ".." elements.
+// with mode 0644 unless File.Mode says otherwise. Names must be relative
+// and contain no "." or ".." elements.
 func (c *Client) WriteFiles(ctx context.Context, sessionID, dir string, files []File) error {
 	if !strings.HasPrefix(dir, "/") {
 		return errors.New("dir must be an absolute path")
@@ -45,7 +47,11 @@ func (c *Client) WriteFiles(ctx context.Context, sessionID, dir string, files []
 				return err
 			}
 		}
-		if err := tw.WriteHeader(&tar.Header{Typeflag: tar.TypeReg, Name: f.Name, Mode: 0o644, Size: int64(len(f.Data))}); err != nil {
+		mode := f.Mode
+		if mode == 0 {
+			mode = 0o644
+		}
+		if err := tw.WriteHeader(&tar.Header{Typeflag: tar.TypeReg, Name: f.Name, Mode: mode, Size: int64(len(f.Data))}); err != nil {
 			return err
 		}
 		if _, err := tw.Write(f.Data); err != nil {

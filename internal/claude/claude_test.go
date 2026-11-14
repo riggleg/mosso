@@ -322,11 +322,11 @@ func TestParseStreamBoundsKeptEvents(t *testing.T) {
 	n := maxEventBytes/len(line) + 3
 	out := strings.Repeat(line+"\n", n) + `{"type":"result","result":"done","session_id":"` + testSession + `"}`
 	var streamed int
-	p := &parser{turn: Turn{Events: []Event{}}, onEvent: func(Event) { streamed++ }}
+	p := NewStreamParser(nil, func(Event) { streamed++ })
 	for _, l := range strings.Split(out, "\n") {
-		p.line(l)
+		p.Line(l)
 	}
-	turn, err := p.finish()
+	turn, err := p.Finish()
 	if err != nil {
 		t.Fatal(err)
 	}

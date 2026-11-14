@@ -104,18 +104,80 @@ func NewClient(cfg Config) *Client {
 	return &Client{cfg: cfg, http: hc, stream: &stream}
 }
 
-// Sandbox identifies a provisioned sandbox. Commands run in its session.
+// Sandbox identifies a provisioned sandbox. Commands run in its current
+// session; a persistent sandbox gets a new session each time it resumes.
 type Sandbox struct {
-	Name      string    `json:"name"`
-	SessionID string    `json:"session_id"`
+	Name      string `json:"name"`
+	SessionID string `json:"session_id"`
+	// Status is the current session's status: pending, running, stopping,
+	// stopped, snapshotting, failed or aborted.
 	Status    string    `json:"status"`
 	CreatedAt time.Time `json:"created_at"`
+	// Persistent sandboxes snapshot their filesystem when a session stops
+	// and resume from it.
+	Persistent bool `json:"persistent,omitempty"`
+	// StartedAt and Timeout describe the current session: Vercel stops it
+	// at StartedAt+Timeout. StartedAt is zero when the session has not
+	// started yet.
+	StartedAt time.Time     `json:"started_at,omitzero"`
+	Timeout   time.Duration `json:"-"`
+}
+
+// Running reports whether the sandbox has a session that is starting or
+// running.
+func (sb Sandbox) Running() bool { return sb.Status == "pending" || sb.Status == "running" }
+
+// ExpiresAt is when Vercel stops the current session, or the zero time
+// when unknown.
+func (sb Sandbox) ExpiresAt() time.Time {
+	if sb.StartedAt.IsZero() || sb.Timeout <= 0 {
+		return time.Time{}
+	}
+	return sb.StartedAt.Add(sb.Timeout)
 }
 
 // CreateOptions configures a new sandbox. Zero values use defaults.
 type CreateOptions struct {
 	Runtime string
 	Timeout time.Duration
+	// Persistent keeps the filesystem across sessions: Vercel snapshots it
+	// when a session stops (also at the timeout) and resumes from the
+	// snapshot. Snapshots cost storage, so non-persistent is the default.
+	Persistent bool
+	// SnapshotExpiration is how long a persistent sandbox's snapshots are
+	// kept after their last use (Vercel's default is 30 days; at least one
+	// day). KeepLastSnapshots keeps only the most recent N snapshots (1 to
+	// 10) and deletes the rest at once, keeping storage flat.
+	SnapshotExpiration time.Duration
+	KeepLastSnapshots  int
+}
+
+// SessionStopped reports whether err is Vercel saying the session is no
+// longer running (410 Gone), for example because it timed out. A persistent
+// sandbox can then be resumed with Get.
+func SessionStopped(err error) bool {
+	var apiErr *APIError
+	return errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusGone
+}
+
+// SessionOver reports whether err means commands can no longer run in the
+// session: it stopped (410) or is unknown (404).
+func SessionOver(err error) bool { return SessionStopped(err) || IsNotFound(err) }
+
+// SnapshotGone reports whether err is Vercel refusing to resume a sandbox
+// because its snapshot expired or failed. The sandbox cannot be used again.
+func SnapshotGone(err error) bool {
+	var apiErr *APIError
+	return errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusGone && apiErr.Code == "snapshot_not_found"
+}
+
+// InTransition reports whether err is Vercel saying the sandbox is
+// stopping or snapshotting right now (422); the request can be retried in
+// a few seconds.
+func InTransition(err error) bool {
+	var apiErr *APIError
+	return errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusUnprocessableEntity &&
+		(apiErr.Code == "sandbox_stopping" || apiErr.Code == "sandbox_snapshotting")
 }
 
 // CommandResult is the outcome of a finished command.
@@ -126,10 +188,11 @@ type CommandResult struct {
 	Stderr    string `json:"stderr"`
 }
 
-// APIError is a non-2xx response from Vercel. It carries only the status code
-// and Vercel's error message, never request headers.
+// APIError is a non-2xx response from Vercel. It carries only the status
+// code and Vercel's error code and message, never request headers.
 type APIError struct {
 	StatusCode int
+	Code       string
 	Message    string
 }
 
@@ -155,9 +218,62 @@ func NewSandboxName() string {
 	return "mosso-" + hex.EncodeToString(b[:])
 }
 
-// Create provisions a non-persistent sandbox called name. If the request fails
-// after it may have reached Vercel, Create attempts to delete the sandbox so it
-// does not linger and accrue charges.
+// sandboxResponse is the shape of Vercel's sandbox-and-session responses.
+type sandboxResponse struct {
+	Sandbox struct {
+		Name             string `json:"name"`
+		CurrentSessionID string `json:"currentSessionId"`
+		Status           string `json:"status"`
+		Persistent       bool   `json:"persistent"`
+		Timeout          int64  `json:"timeout"`
+		CreatedAt        int64  `json:"createdAt"`
+	} `json:"sandbox"`
+	Session struct {
+		ID        string `json:"id"`
+		Status    string `json:"status"`
+		Timeout   int64  `json:"timeout"`
+		StartedAt int64  `json:"startedAt"`
+		CreatedAt int64  `json:"createdAt"`
+	} `json:"session"`
+	Resumed bool `json:"resumed"`
+}
+
+// sandbox turns a response into a Sandbox, or fails if it has no session.
+func (r sandboxResponse) sandbox(name string, created time.Time) (*Sandbox, error) {
+	sessionID := r.Session.ID
+	if sessionID == "" {
+		sessionID = r.Sandbox.CurrentSessionID
+	}
+	if sessionID == "" {
+		return nil, errors.New("response did not include a session id")
+	}
+	if r.Sandbox.Name != "" {
+		name = r.Sandbox.Name
+	}
+	status := r.Session.Status
+	if status == "" {
+		status = r.Sandbox.Status
+	}
+	sb := &Sandbox{Name: name, SessionID: sessionID, Status: status, CreatedAt: created, Persistent: r.Sandbox.Persistent}
+	if r.Sandbox.CreatedAt > 0 {
+		sb.CreatedAt = time.UnixMilli(r.Sandbox.CreatedAt).UTC()
+	}
+	if ms := r.Session.Timeout; ms > 0 {
+		sb.Timeout = time.Duration(ms) * time.Millisecond
+	} else if r.Sandbox.Timeout > 0 {
+		sb.Timeout = time.Duration(r.Sandbox.Timeout) * time.Millisecond
+	}
+	if start := r.Session.StartedAt; start > 0 {
+		sb.StartedAt = time.UnixMilli(start).UTC()
+	} else if r.Session.CreatedAt > 0 && (status == "pending" || status == "running") {
+		sb.StartedAt = time.UnixMilli(r.Session.CreatedAt).UTC()
+	}
+	return sb, nil
+}
+
+// Create provisions a sandbox called name. If the request fails after it
+// may have reached Vercel, Create attempts to delete the sandbox so it does
+// not linger and accrue charges.
 func (c *Client) Create(ctx context.Context, name string, opts CreateOptions) (sb *Sandbox, err error) {
 	if opts.Runtime == "" {
 		opts.Runtime = DefaultRuntime
@@ -173,26 +289,24 @@ func (c *Client) Create(ctx context.Context, name string, opts CreateOptions) (s
 		"name":       name,
 		"runtime":    opts.Runtime,
 		"timeout":    opts.Timeout.Milliseconds(),
-		"persistent": false,
+		"persistent": opts.Persistent,
 		"ports":      []int{},
 	}
-	var resp struct {
-		Sandbox struct {
-			Name             string `json:"name"`
-			CurrentSessionID string `json:"currentSessionId"`
-			Status           string `json:"status"`
-		} `json:"sandbox"`
-		Session struct {
-			ID     string `json:"id"`
-			Status string `json:"status"`
-		} `json:"session"`
+	if opts.Persistent {
+		if opts.SnapshotExpiration > 0 {
+			body["snapshotExpiration"] = opts.SnapshotExpiration.Milliseconds()
+		}
+		if opts.KeepLastSnapshots > 0 {
+			body["keepLastSnapshots"] = map[string]any{"count": opts.KeepLastSnapshots, "deleteEvicted": true}
+		}
 	}
+	var resp sandboxResponse
 	defer func() {
 		if err != nil {
 			// Best effort, independent of the caller's (possibly cancelled) context.
 			cctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
-			if derr := c.deleteSandbox(cctx, name); derr != nil && !IsNotFound(derr) {
+			if derr := c.deleteSandbox(cctx, name, true); derr != nil && !IsNotFound(derr) {
 				err = fmt.Errorf("%w (cleanup of sandbox %s also failed: %v)", err, name, derr)
 			}
 		}
@@ -200,21 +314,50 @@ func (c *Client) Create(ctx context.Context, name string, opts CreateOptions) (s
 	if err := c.doJSON(ctx, http.MethodPost, "/v2/sandboxes", nil, body, &resp); err != nil {
 		return nil, fmt.Errorf("create sandbox: %w", err)
 	}
-	sessionID := resp.Session.ID
-	if sessionID == "" {
-		sessionID = resp.Sandbox.CurrentSessionID
+	sb, err = resp.sandbox(name, time.Now().UTC())
+	if err != nil {
+		return nil, fmt.Errorf("create sandbox: %w", err)
 	}
-	if sessionID == "" {
-		return nil, errors.New("create sandbox: response did not include a session id")
+	if sb.StartedAt.IsZero() {
+		sb.StartedAt = time.Now().UTC()
 	}
-	if resp.Sandbox.Name != "" && resp.Sandbox.Name != name {
-		name = resp.Sandbox.Name
+	if sb.Timeout == 0 {
+		sb.Timeout = opts.Timeout
 	}
-	status := resp.Session.Status
-	if status == "" {
-		status = resp.Sandbox.Status
+	return sb, nil
+}
+
+// Get looks up a sandbox by name. With resume, a stopped persistent sandbox
+// is resumed first: Vercel boots a new session from the last snapshot, and
+// the returned Sandbox has the new session ID and expiry. Errors:
+// IsNotFound when the sandbox does not exist, SnapshotGone when it cannot
+// resume any more, InTransition when it is stopping or snapshotting (retry
+// shortly).
+func (c *Client) Get(ctx context.Context, name string, resume bool) (*Sandbox, error) {
+	q := url.Values{"projectId": {c.cfg.ProjectID}}
+	if resume {
+		q.Set("resume", "true")
 	}
-	return &Sandbox{Name: name, SessionID: sessionID, Status: status, CreatedAt: time.Now().UTC()}, nil
+	var resp sandboxResponse
+	if err := c.doJSON(ctx, http.MethodGet, "/v2/sandboxes/"+url.PathEscape(name), q, nil, &resp); err != nil {
+		return nil, fmt.Errorf("get sandbox: %w", err)
+	}
+	sb, err := resp.sandbox(name, time.Time{})
+	if err != nil {
+		return nil, fmt.Errorf("get sandbox: %w", err)
+	}
+	return sb, nil
+}
+
+// Stop stops the sandbox's current session. A persistent sandbox is
+// snapshotted and can be resumed with Get; a non-persistent one loses its
+// filesystem. An already stopped or unknown session is not an error.
+func (c *Client) Stop(ctx context.Context, sessionID string) error {
+	path := "/v2/sandboxes/sessions/" + url.PathEscape(sessionID) + "/stop"
+	if err := c.doJSON(ctx, http.MethodPost, path, nil, nil, nil); err != nil && !SessionOver(err) {
+		return fmt.Errorf("stop session: %w", err)
+	}
+	return nil
 }
 
 type apiCommand struct {
@@ -439,24 +582,29 @@ func (c *Client) follow(ctx context.Context, cmdPath string, cmd apiCommand, onS
 	}
 }
 
-// Destroy stops the sandbox's running session and deletes the sandbox. It is
-// idempotent: resources that are already gone are not treated as errors.
+// Destroy stops the sandbox's running session and deletes the sandbox,
+// along with the snapshots no other sandbox uses, so nothing of it is kept
+// or billed. It is idempotent: resources that are already gone are not
+// treated as errors.
 func (c *Client) Destroy(ctx context.Context, sb Sandbox) error {
 	var errs []error
 	if sb.SessionID != "" {
 		path := "/v2/sandboxes/sessions/" + url.PathEscape(sb.SessionID) + "/stop"
-		if err := c.doJSON(ctx, http.MethodPost, path, nil, nil, nil); err != nil && !IsNotFound(err) {
+		if err := c.doJSON(ctx, http.MethodPost, path, nil, nil, nil); err != nil && !SessionOver(err) {
 			errs = append(errs, fmt.Errorf("stop session: %w", err))
 		}
 	}
-	if err := c.deleteSandbox(ctx, sb.Name); err != nil && !IsNotFound(err) {
+	if err := c.deleteSandbox(ctx, sb.Name, true); err != nil && !IsNotFound(err) {
 		errs = append(errs, fmt.Errorf("delete sandbox: %w", err))
 	}
 	return errors.Join(errs...)
 }
 
-func (c *Client) deleteSandbox(ctx context.Context, name string) error {
+func (c *Client) deleteSandbox(ctx context.Context, name string, orphanSnapshots bool) error {
 	q := url.Values{"projectId": {c.cfg.ProjectID}}
+	if orphanSnapshots {
+		q.Set("deleteOrphanSnapshots", "true")
+	}
 	return c.doJSON(ctx, http.MethodDelete, "/v2/sandboxes/"+url.PathEscape(name), q, nil, nil)
 }
 
@@ -536,11 +684,12 @@ func apiError(resp *http.Response) error {
 	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
 	var parsed struct {
 		Error struct {
+			Code    string `json:"code"`
 			Message string `json:"message"`
 		} `json:"error"`
 	}
 	_ = json.Unmarshal(raw, &parsed)
-	return &APIError{StatusCode: resp.StatusCode, Message: parsed.Error.Message}
+	return &APIError{StatusCode: resp.StatusCode, Code: parsed.Error.Code, Message: parsed.Error.Message}
 }
 
 // limitedBuffer keeps at most max bytes and notes truncation.

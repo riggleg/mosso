@@ -33,15 +33,17 @@ implementations are acceptable for this first version.
       Code: follow-ups continue the conversation and a running turn can be
       stopped; steering a turn while it runs is not supported.
 - [x] Commit, push and open a PR; show the PR URL (with Claude Code for now).
-- [ ] Persist session metadata and chat events across UI reloads. Partly
-      done: the server keeps them in memory, so they survive reloads and
-      reconnects but not a Mosso restart or the end of the sandbox.
+- [x] Persist session metadata and chat events across UI reloads. Done
+      with Claude Code: workspaces and chats are saved on disk and in each
+      persistent sandbox's worker log, so they survive reloads, Mosso
+      restarts and sandbox session stops (see [worker.md](worker.md)).
 - [x] Show sessions and offer a terminate action (web UI).
 - [ ] Run Go CI and PR secret scanning.
 
 ## P1 / defer
 
-- Worker offline event replay and server reconnection.
+- Worker offline event replay and server reconnection: done for Claude Code
+  (see [worker.md](worker.md)); Pi is not integrated yet.
 - Restarting stopped environments with Pi conversation history.
 - Cost dashboards and additional VM providers or agent harnesses.
 - Multi-user auth, native desktop client, distributed architecture.
@@ -55,7 +57,9 @@ web interface once the end-to-end path works.
 
 `cmd/mosso`: localhost-only HTTP server with `GET /healthz` and Vercel Sandbox
 endpoints (see [vercel-sandbox.md](vercel-sandbox.md)).
-`cmd/mosso-worker`: placeholder binary, **not yet connected to Pi**.
+`cmd/mosso-worker`: the worker that runs inside each workspace's sandbox,
+runs Claude Code and records its events durably (`internal/worker`; see
+[worker.md](worker.md)). **Not yet connected to Pi**.
 `internal/server`: HTTP API and tests.
 `internal/vercel`: minimal Vercel Sandbox REST client (create, exec, destroy).
 `internal/claude`: runs Claude Code headlessly in a sandbox with a
@@ -72,4 +76,5 @@ tokens.
 binary), with streaming chat over server-sent events
 (see [web-ui.md](web-ui.md)).
 
-There is no persistence yet: workspaces and chats live in memory.
+Workspaces and chats are saved in Mosso's data directory and in the
+sandbox worker's event log; sandboxes are persistent and resume on demand.
