@@ -140,7 +140,21 @@ func newChatServer(t *testing.T) (*Server, *fakeVercel, *httptest.Server, testWo
 	}
 	var ws testWorkspace
 	_ = json.Unmarshal(rec.Body.Bytes(), &ws)
+	waitFollowing(t, srv, ws.Name)
 	return srv, fake, ts, ws
+}
+
+// waitFollowing waits for the background connect that createWorkspace
+// starts to attach its follower, so tests that change the workspace's
+// state do not race with it.
+func waitFollowing(t *testing.T, srv *Server, name string) {
+	t.Helper()
+	waitFor(t, func() bool {
+		srv.mu.Lock()
+		defer srv.mu.Unlock()
+		ws, ok := srv.workspaces[name]
+		return ok && ws.follower != nil
+	})
 }
 
 func postJSON(t *testing.T, url, body string) *http.Response {
