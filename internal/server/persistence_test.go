@@ -39,6 +39,7 @@ func newPersistentHarness(t *testing.T) *persistentHarness {
 		t.Fatalf("create status = %d: %s", rec.Code, rec.Body)
 	}
 	_ = json.Unmarshal(rec.Body.Bytes(), &h.ws)
+	waitFollowing(t, h.srv, h.ws.Name)
 	return h
 }
 
