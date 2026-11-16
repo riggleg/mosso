@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"time"
 
 	_ "modernc.org/sqlite" // the SQLite driver, in pure Go (no cgo)
@@ -80,6 +81,11 @@ type workspaceRecord struct {
 	// clone; empty for none. Both are kept for reference and never change.
 	Image       string `json:"image,omitempty"`
 	SetupScript string `json:"setup_script,omitempty"`
+	// Instructions are the agent instructions every turn's system prompt
+	// carries; fixed at creation. SectionID is the section the workspace
+	// is listed under, 0 for none; moving the workspace changes it.
+	Instructions string `json:"instructions,omitempty"`
+	SectionID    int64  `json:"section_id,omitempty"`
 	// SandboxState is "running", "stopped", "gone" or "terminated", as
 	// last known: the workspace's saved status.
 	SandboxState string    `json:"sandbox_state"`
@@ -205,22 +211,33 @@ func saveRecord(tx *sql.Tx, rec workspaceRecord) error {
 	if sandboxID == "" {
 		sandboxID = rec.Name
 	}
+	// The model, image, setup script and instructions are written once:
+	// they are what the workspace was created with. The section changes
+	// when the workspace is moved.
 	_, err = tx.Exec(`
-		INSERT INTO workspaces (id, repo, base, branch, model, image, setup_script, sandbox_id, status, state, created_at, updated_at, archived_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO workspaces (id, repo, base, branch, model, image, setup_script, instructions, section_id, sandbox_id, status, state, created_at, updated_at, archived_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT (id) DO UPDATE SET
-			repo = excluded.repo, base = excluded.base, branch = excluded.branch,
+			repo = excluded.repo, base = excluded.base, branch = excluded.branch, section_id = excluded.section_id,
 			sandbox_id = excluded.sandbox_id, status = excluded.status, state = excluded.state,
 			updated_at = excluded.updated_at, archived_at = excluded.archived_at`,
-		rec.Name, rec.Repo, rec.Base, rec.Branch, rec.Model, rec.Image, rec.SetupScript, sandboxID, rec.SandboxState, string(state),
-		formatTime(rec.CreatedAt), formatTime(time.Now()), archived)
+		rec.Name, rec.Repo, rec.Base, rec.Branch, rec.Model, rec.Image, rec.SetupScript, rec.Instructions, nullID(rec.SectionID),
+		sandboxID, rec.SandboxState, string(state), formatTime(rec.CreatedAt), formatTime(time.Now()), archived)
 	return err
+}
+
+// nullID stores a section ID of 0 (none) as NULL.
+func nullID(id int64) any {
+	if id == 0 {
+		return nil
+	}
+	return id
 }
 
 // load returns every saved workspace, oldest first.
 func (st *store) load() ([]workspaceRecord, error) {
 	rows, err := st.db.Query(`
-		SELECT id, repo, base, branch, model, image, setup_script, sandbox_id, status, state, created_at, updated_at, archived_at
+		SELECT id, repo, base, branch, model, image, setup_script, instructions, section_id, sandbox_id, status, state, created_at, updated_at, archived_at
 		FROM workspaces ORDER BY created_at, id`)
 	if err != nil {
 		return nil, err
@@ -231,9 +248,12 @@ func (st *store) load() ([]workspaceRecord, error) {
 		var rec workspaceRecord
 		var sandboxID, state, created, updated string
 		var archived sql.NullString
-		if err := rows.Scan(&rec.Name, &rec.Repo, &rec.Base, &rec.Branch, &rec.Model, &rec.Image, &rec.SetupScript, &sandboxID, &rec.SandboxState, &state, &created, &updated, &archived); err != nil {
+		var section sql.NullInt64
+		if err := rows.Scan(&rec.Name, &rec.Repo, &rec.Base, &rec.Branch, &rec.Model, &rec.Image, &rec.SetupScript, &rec.Instructions, &section,
+			&sandboxID, &rec.SandboxState, &state, &created, &updated, &archived); err != nil {
 			return nil, err
 		}
+		rec.SectionID = section.Int64
 		if err := json.Unmarshal([]byte(state), &rec.workspaceState); err != nil {
 			return nil, fmt.Errorf("read workspace %s: %w", rec.Name, err)
 		}
@@ -252,6 +272,9 @@ const (
 	settingDefaultModel       = "default_model"
 	settingDefaultImage       = "default_image"
 	settingDefaultSetupScript = "default_setup_script"
+	// settingDefaultSection is the ID of the section the New workspace
+	// dialog preselects, in decimal; unset or "" for none.
+	settingDefaultSection = "default_section"
 )
 
 // setting returns a saved setting, or "" if it is not set.
@@ -335,4 +358,100 @@ func (st *store) loadEntries(name string) ([]chatEntry, error) {
 		out = append(out, e)
 	}
 	return out, rows.Err()
+}
+
+// sectionColumns are the columns scanSection reads, in its order.
+const sectionColumns = `id, name, repo, base, model, image, setup_script, instructions, created_at, updated_at`
+
+func scanSection(row interface{ Scan(...any) error }) (section, error) {
+	var sec section
+	var created, updated string
+	err := row.Scan(&sec.ID, &sec.Name, &sec.Repo, &sec.Base, &sec.Model, &sec.Image, &sec.SetupScript, &sec.Instructions, &created, &updated)
+	sec.CreatedAt, sec.UpdatedAt = parseTime(created), parseTime(updated)
+	return sec, err
+}
+
+// sections returns every section, by name.
+func (st *store) sections() ([]section, error) {
+	rows, err := st.db.Query(`SELECT ` + sectionColumns + ` FROM sections ORDER BY name, id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []section{}
+	for rows.Next() {
+		sec, err := scanSection(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, sec)
+	}
+	return out, rows.Err()
+}
+
+// section returns the section with the ID, or errNoSection.
+func (st *store) section(id int64) (section, error) {
+	sec, err := scanSection(st.db.QueryRow(`SELECT `+sectionColumns+` FROM sections WHERE id = ?`, id))
+	if errors.Is(err, sql.ErrNoRows) {
+		return section{}, errNoSection
+	}
+	return sec, err
+}
+
+// sectionNameTaken reports whether another section than id has the name,
+// ignoring case.
+func (st *store) sectionNameTaken(name string, id int64) (bool, error) {
+	var n int
+	err := st.db.QueryRow(`SELECT COUNT(*) FROM sections WHERE name = ? AND id != ?`, name, id).Scan(&n)
+	return n > 0, err
+}
+
+// saveSection inserts a section (ID 0) or updates one, and returns it as
+// saved, with its ID and timestamps.
+func (st *store) saveSection(sec section) (section, error) {
+	now := time.Now().UTC().Truncate(time.Microsecond) // as stored
+	sec.UpdatedAt = now
+	if sec.ID == 0 {
+		sec.CreatedAt = now
+		res, err := st.db.Exec(`INSERT INTO sections (name, repo, base, model, image, setup_script, instructions, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			sec.Name, sec.Repo, sec.Base, sec.Model, sec.Image, sec.SetupScript, sec.Instructions, formatTime(now), formatTime(now))
+		if err != nil {
+			return section{}, err
+		}
+		sec.ID, err = res.LastInsertId()
+		return sec, err
+	}
+	res, err := st.db.Exec(`UPDATE sections SET name = ?, repo = ?, base = ?, model = ?, image = ?, setup_script = ?, instructions = ?, updated_at = ?
+		WHERE id = ?`,
+		sec.Name, sec.Repo, sec.Base, sec.Model, sec.Image, sec.SetupScript, sec.Instructions, formatTime(now), sec.ID)
+	if err != nil {
+		return section{}, err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return section{}, errNoSection
+	}
+	return sec, nil
+}
+
+// deleteSection deletes a section, all or nothing. Its workspaces become
+// unsectioned, keeping everything else, and it stops being the default
+// section if it was.
+func (st *store) deleteSection(id int64) error {
+	return st.tx(func(tx *sql.Tx) error {
+		if _, err := tx.Exec(`UPDATE workspaces SET section_id = NULL WHERE section_id = ?`, id); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`DELETE FROM settings WHERE key = ? AND value = ?`, settingDefaultSection, strconv.FormatInt(id, 10)); err != nil {
+			return err
+		}
+		res, err := tx.Exec(`DELETE FROM sections WHERE id = ?`, id)
+		if err != nil {
+			return err
+		}
+		if n, _ := res.RowsAffected(); n == 0 {
+			return errNoSection
+		}
+		return nil
+	})
 }

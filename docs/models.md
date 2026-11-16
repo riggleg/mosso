@@ -2,7 +2,8 @@
 
 Each workspace runs Claude Code with one Claude model, chosen when the
 workspace is created and kept for its whole life. A default model, set in
-the web UI and saved in Mosso's database, is preselected for new workspaces.
+the web UI and saved in Mosso's database, is preselected for new workspaces
+(a [section](sections.md) can name its own).
 
 ## Use it
 

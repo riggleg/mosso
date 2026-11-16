@@ -52,6 +52,15 @@ type workspace struct {
 	// reference.
 	Image       string `json:"image,omitempty"`
 	SetupScript string `json:"setup_script,omitempty"`
+	// Instructions are the agent instructions added to every turn's
+	// system prompt (see workspacePrompt): the section's, or what the
+	// workspace was created with. Fixed at creation; empty for none.
+	Instructions string `json:"instructions,omitempty"`
+	// SectionID is the section the workspace is listed under, 0 for none
+	// ("Unsectioned"). Moving the workspace changes only this; editing or
+	// deleting the section never changes the workspace's configuration.
+	// Guarded by Server.mu.
+	SectionID int64 `json:"section_id,omitempty"`
 	// Step says what the setup is doing while Status is "creating":
 	// "cloning", "setup" (the setup script runs) or "installing" (Claude
 	// Code and the worker).
@@ -313,36 +322,93 @@ func (s *Server) getWorkspace(w http.ResponseWriter, r *http.Request) {
 // or the default model. The sandbox is destroyed if any step fails,
 // including the setup script.
 //
+// With a section_id, the section's configuration replaces the defaults:
+// its repository, base branch, model, image, setup script and agent
+// instructions apply unless the request gives its own, and the workspace
+// is listed under the section. The workspace keeps the configuration it
+// was created with; later changes to the section do not affect it.
+//
 // With a prompt, the chat shows it at once and Claude starts on it as soon
 // as the workspace is ready, whether or not the client is still connected.
 func (s *Server) createWorkspace(w http.ResponseWriter, r *http.Request) {
 	var req struct {
+		// Repo is required, unless the section has one.
 		Repo           string `json:"repo"`
-		Base           string `json:"base"`
-		Model          string `json:"model"`
 		TimeoutSeconds int    `json:"timeout_seconds"`
 		// Prompt is the first message for Claude; optional.
 		Prompt string `json:"prompt"`
-		// Image and SetupScript override the defaults when present; ""
-		// asks for the built-in runtime or no setup script.
-		Image       *string `json:"image"`
-		SetupScript *string `json:"setup_script"`
+		// SectionID is the section to start from and list the workspace
+		// under; 0 for none.
+		SectionID int64 `json:"section_id"`
+		// Base, Model, Image, SetupScript and Instructions override the
+		// section's (or, without one, the defaults) when present. ""
+		// asks for the repository's default branch, the default model,
+		// the built-in runtime, no setup script or no instructions.
+		Base         *string `json:"base"`
+		Model        *string `json:"model"`
+		Image        *string `json:"image"`
+		SetupScript  *string `json:"setup_script"`
+		Instructions *string `json:"instructions"`
 	}
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 2*(claude.MaxPromptBytes+maxSetupScriptBytes))).Decode(&req); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 2*(claude.MaxPromptBytes+maxSetupScriptBytes+maxInstructionsBytes))).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
+	if req.SectionID < 0 {
+		writeError(w, http.StatusBadRequest, "section_id: no such section")
+		return
+	}
+	// The starting point: the section, or the defaults without one.
+	s.mu.Lock()
+	cfg := section{Model: s.defaultModel, Image: s.defaultImage, SetupScript: s.defaultSetupScript}
+	var sectionErr error
+	if req.SectionID != 0 {
+		sectionErr = errNoSection
+		if s.store != nil {
+			cfg, sectionErr = s.store.section(req.SectionID)
+		}
+		if sectionErr == nil && cfg.Model == "" {
+			cfg.Model = s.defaultModel
+		}
+	}
+	defaultModel := s.defaultModel
+	s.mu.Unlock()
+	switch {
+	case errors.Is(sectionErr, errNoSection):
+		writeError(w, http.StatusBadRequest, "section_id: no such section")
+		return
+	case sectionErr != nil:
+		writeSectionError(w, "read the section", sectionErr)
+		return
+	}
+	// Then what the request overrides.
+	repoName, base, model := strings.TrimSpace(req.Repo), cfg.Base, cfg.Model
+	if repoName == "" {
+		repoName = cfg.Repo
+	}
+	if req.Base != nil {
+		base = *req.Base
+	}
+	if req.Model != nil {
+		if model = *req.Model; model == "" {
+			model = defaultModel
+		}
+	}
+	image, script, instructions := cfg.Image, cfg.SetupScript, cfg.Instructions
 	switch maxSeconds := int(vercel.MaxTimeout.Seconds()); {
-	case !github.ValidRepo(req.Repo):
+	case !github.ValidRepo(repoName):
 		writeError(w, http.StatusBadRequest, `repo must be a GitHub repository as "owner/repo"`)
 		return
-	case req.Base != "" && !github.ValidBranch(req.Base):
+	case base != "" && !github.ValidBranch(base):
 		writeError(w, http.StatusBadRequest, "base is not a valid branch name")
 		return
 	case req.TimeoutSeconds < 0 || req.TimeoutSeconds > maxSeconds:
 		writeError(w, http.StatusBadRequest, fmt.Sprintf("timeout_seconds must be between 0 and %d", maxSeconds))
 		return
-	case req.Model != "" && !claude.KnownModel(req.Model):
+	case !claude.KnownModel(model) && req.Model == nil && req.SectionID != 0:
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("the section's model %s is no longer offered: choose another model, or edit the section", model))
+		return
+	case !claude.KnownModel(model):
 		writeError(w, http.StatusBadRequest, "model is not one of the models GET /settings lists")
 		return
 	case len(req.Prompt) > claude.MaxPromptBytes-promptReserve:
@@ -352,20 +418,22 @@ func (s *Server) createWorkspace(w http.ResponseWriter, r *http.Request) {
 	if strings.TrimSpace(req.Prompt) == "" {
 		req.Prompt = ""
 	}
-	s.mu.Lock()
-	image, script := s.defaultImage, s.defaultSetupScript
-	s.mu.Unlock()
+	var err error
 	if req.Image != nil {
-		var err error
 		if image, err = normalizeImage(*req.Image); err != nil {
 			writeError(w, http.StatusBadRequest, "image: "+err.Error())
 			return
 		}
 	}
 	if req.SetupScript != nil {
-		var err error
 		if script, err = normalizeSetupScript(*req.SetupScript); err != nil {
 			writeError(w, http.StatusBadRequest, "setup_script: "+err.Error())
+			return
+		}
+	}
+	if req.Instructions != nil {
+		if instructions, err = normalizeInstructions(*req.Instructions); err != nil {
+			writeError(w, http.StatusBadRequest, "instructions: "+err.Error())
 			return
 		}
 	}
@@ -377,12 +445,6 @@ func (s *Server) createWorkspace(w http.ResponseWriter, r *http.Request) {
 		if token, ok = s.loadClaudeToken(w, r); !ok {
 			return
 		}
-	}
-	model := req.Model
-	if model == "" {
-		s.mu.Lock()
-		model = s.defaultModel
-		s.mu.Unlock()
 	}
 	timeout := time.Duration(req.TimeoutSeconds) * time.Second
 	if timeout == 0 {
@@ -399,7 +461,7 @@ func (s *Server) createWorkspace(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadGateway, err.Error())
 		return
 	}
-	repo, err := gh.Repo(r.Context(), req.Repo)
+	repo, err := gh.Repo(r.Context(), repoName)
 	if err != nil {
 		status := http.StatusBadGateway
 		if github.IsNotFound(err) {
@@ -408,7 +470,6 @@ func (s *Server) createWorkspace(w http.ResponseWriter, r *http.Request) {
 		writeError(w, status, err.Error())
 		return
 	}
-	base := req.Base
 	if base == "" {
 		base = repo.DefaultBranch
 	}
@@ -437,10 +498,12 @@ func (s *Server) createWorkspace(w http.ResponseWriter, r *http.Request) {
 		Repo:         repo.FullName,
 		Base:         base,
 		Branch:       github.NewBranchName(),
-		Dir:          path.Join(claude.WorkDir, req.Repo[strings.IndexByte(req.Repo, '/')+1:]),
+		Dir:          path.Join(claude.WorkDir, repoName[strings.IndexByte(repoName, '/')+1:]),
 		Model:        model,
 		Image:        image,
 		SetupScript:  script,
+		Instructions: instructions,
+		SectionID:    req.SectionID,
 		Sandbox:      *sb,
 		ExpiresAt:    sb.ExpiresAt(),
 		CreatedAt:    time.Now().UTC(),
@@ -455,7 +518,7 @@ func (s *Server) createWorkspace(w http.ResponseWriter, r *http.Request) {
 		ws.ExpiresAt = sb.CreatedAt.Add(timeout)
 	}
 	if !github.ValidRepo(ws.Repo) {
-		ws.Repo = req.Repo
+		ws.Repo = repoName
 	}
 	ws.chat.persist = s.persister(ws)
 	firstIdx := -1
@@ -558,6 +621,13 @@ func (s *Server) createWorkspace(w http.ResponseWriter, r *http.Request) {
 	var saveErr error
 	if live && s.workspaces[sb.Name] == ws {
 		ws.BaseSHA = baseSHA
+		// deleteSection unsections the workspaces it finds; this one may
+		// have been read from its section just before it was listed.
+		if ws.SectionID != 0 && s.store != nil {
+			if _, err := s.store.section(ws.SectionID); errors.Is(err, errNoSection) {
+				ws.SectionID = 0
+			}
+		}
 		// The workspace exists once it is saved, with the chat so far. If
 		// it cannot be saved it is not created: Mosso would lose track of
 		// its sandbox at the next restart.

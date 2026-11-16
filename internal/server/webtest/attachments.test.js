@@ -1,4 +1,4 @@
-// Run with: node --test internal/server/webtest
+// Run with: node --test internal/server/webtest/*.test.js
 "use strict";
 const test = require("node:test");
 const assert = require("node:assert");

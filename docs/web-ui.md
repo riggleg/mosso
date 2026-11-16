@@ -20,7 +20,10 @@ frontend build step, Node.js dependency or separate frontend server.
    preconfigured GitHub token link, choose the repositories, generate the
    token and paste it into the password field. **Replace** swaps in a new
    token later. See [github.md](github.md#connect-github).
-3. Click **+ New** and pick or type a repository (`owner/repo`) and, optionally,
+3. Click **+ New** (or **+** on a section in the sidebar) and pick a
+   section, whose repository, base branch, model, sandbox environment and
+   agent instructions fill the dialog; see [sections.md](sections.md).
+   Or choose *No section* and pick or type a repository (`owner/repo`) and, optionally,
    a base branch. The suggestions list the repositories and branches your
    GitHub token can access. Choose the Claude model; the default model (set
    with **Change** next to *Model* in the sidebar footer) is preselected, and
@@ -58,6 +61,12 @@ frontend build step, Node.js dependency or separate frontend server.
 9. Open a past workspace from **History** to read its conversation. Click
    **Archive** to move it to the collapsed **Archived** section, and
    **Unarchive** to bring it back. See [history.md](history.md).
+
+The sidebar groups running workspaces by **section**, collapsible, with
+*Unsectioned* for the rest; **+ New section** adds one and **⋯** on a
+section edits, renames, duplicates or deletes it. The menu in a
+workspace's header moves it to another section. See
+[sections.md](sections.md).
 
 You can switch between workspaces, reload the page, open a second tab, quit
 Mosso or close the laptop at any time. Claude keeps working in the sandbox
@@ -136,8 +145,9 @@ browser ──POST /workspaces/{name}/chat──▶ Mosso ──POST /messages (
 These come in addition to the endpoints in [github.md](github.md) and
 [claude-code.md](claude-code.md), which the UI also uses (`POST /workspaces`,
 `POST …/pull-request`, `DELETE /workspaces/{name}`, `GET /claude/auth`,
-`GET /github/auth`, `POST /github/auth`) and [models.md](models.md)
-(`GET /settings`, `POST /settings`).
+`GET /github/auth`, `POST /github/auth`) [models.md](models.md)
+(`GET /settings`, `POST /settings`) and [sections.md](sections.md#api)
+(`/sections`, `POST /workspaces/{name}/section`).
 
 | Method & path                              | Description |
 | ------------------------------------------ | ----------- |

@@ -127,6 +127,8 @@ CREATE TABLE workspaces (
     model       TEXT NOT NULL DEFAULT '', -- the Claude model (migration 2); '' before model selection
     image       TEXT NOT NULL DEFAULT '', -- the sandbox's Vercel Container Registry image (migration 3); '' for the built-in runtime
     setup_script TEXT NOT NULL DEFAULT '', -- the setup script run once after the clone (migration 3); '' for none
+    instructions TEXT NOT NULL DEFAULT '', -- agent instructions for every turn (migration 4); '' for none
+    section_id  INTEGER REFERENCES sections (id) ON DELETE SET NULL, -- the section it is listed under (migration 4); NULL for none
     sandbox_id  TEXT NOT NULL,    -- the Vercel sandbox's name
     status      TEXT NOT NULL,    -- running, stopped, gone or terminated
     state       TEXT NOT NULL,    -- JSON, see below
@@ -141,15 +143,32 @@ CREATE TABLE chat_entries (
 );
 CREATE INDEX chat_entries_workspace ON chat_entries (workspace_id, id);
 CREATE TABLE settings (           -- migration 2
-    key   TEXT PRIMARY KEY,       -- "default_model", "default_image", "default_setup_script"
+    key   TEXT PRIMARY KEY,       -- "default_model", "default_image", "default_setup_script", "default_section"
     value TEXT NOT NULL
+);
+CREATE TABLE sections (           -- migration 4
+    id           INTEGER PRIMARY KEY,
+    name         TEXT NOT NULL COLLATE NOCASE UNIQUE,
+    repo         TEXT NOT NULL DEFAULT '', -- '' to choose per workspace
+    base         TEXT NOT NULL DEFAULT '', -- '' for the default branch
+    model        TEXT NOT NULL DEFAULT '', -- '' for the default model
+    image        TEXT NOT NULL DEFAULT '', -- '' for the built-in runtime
+    setup_script TEXT NOT NULL DEFAULT '', -- '' for none
+    instructions TEXT NOT NULL DEFAULT '', -- '' for none
+    created_at   TEXT NOT NULL,
+    updated_at   TEXT NOT NULL
 );
 ```
 
-`model`, `image` and `setup_script` are set when the workspace is created
-and never updated. `settings` holds what is configured in the web UI: the
-default model, sandbox image and setup script for new workspaces. See
-[models.md](models.md) and [sandbox-environment.md](sandbox-environment.md).
+`model`, `image`, `setup_script` and `instructions` are set when the
+workspace is created and never updated. `section_id` changes when the
+workspace is moved to another section; deleting a section sets it to NULL
+(unsectioned), and workspaces from before migration 4 have none.
+`settings` holds what is configured in the web UI: the default model,
+sandbox image and setup script for new workspaces, and the default
+section. `sections` holds the sections new workspaces start from. See
+[models.md](models.md), [sandbox-environment.md](sandbox-environment.md)
+and [sections.md](sections.md).
 
 A chat entry that cannot be read back is skipped with a log line; it never
 stops a workspace from being restored.
@@ -235,6 +254,10 @@ runs Mosso without a Vercel client over a database with a terminated
 workspace and one that has a sandbox: both are listed and replayed,
 archiving works, everything that needs a sandbox answers `503`, and a
 later start with Vercel reconnects.
+
+`sections_test.go` covers sections, moving workspaces between them and
+migration 4 on a database with existing workspaces; see
+[sections.md](sections.md#tests).
 
 To look at the History and Archived sections in a browser without any
 accounts:

@@ -197,7 +197,7 @@ restart. It needs `git` on the machine running Mosso (on macOS:
 | -------------------------------------------- | ----------- |
 | `GET /github/auth`                           | `{"configured": true, "source": "keychain"\|"env"\|"memory", "login": "...", "expires_at": "...", "create_url": "https://github.com/settings/personal-access-tokens/new?...", "storage": "keychain"\|"memory"}`, plus `error` if GitHub rejects the token. Never returns the token. |
 | `POST /github/auth`                          | Body: `{"token": "github_pat_..."}`. Checks the token with GitHub, then stores it (Keychain, or memory without one) for all workspaces. `200` with the status above; `400` malformed; `422` GitHub rejected it; `500` the Keychain refused. |
-| `POST /workspaces`                           | Body: `{"repo": "owner/repo", "base": "main", "model": "claude-opus-5-5", "prompt": "...", "image": "...", "setup_script": "...", "timeout_seconds": 1800}`. `base` defaults to the repository's default branch; `model` to the default model (see [models.md](models.md)); `image` and `setup_script` to the default sandbox environment (see [sandbox-environment.md](sandbox-environment.md)); `timeout_seconds` defaults to 1800 (max 2700). `prompt`, optional, is the first message: it is in the chat while the workspace is set up, and Claude starts on it as soon as the workspace is ready (the response then has `"status": "working"`), even if the client has disconnected; with a prompt, `503` if there is no Claude token, checked before a sandbox is created. Clones, runs the setup script, installs Claude Code and returns `201` with the workspace, once it is saved; `500` if it could not be saved (the sandbox is then destroyed). Setup continues if the client disconnects. |
+| `POST /workspaces`                           | Body: `{"repo": "owner/repo", "base": "main", "model": "claude-opus-5-5", "prompt": "...", "image": "...", "setup_script": "...", "section_id": 3, "instructions": "...", "timeout_seconds": 1800}`. With `section_id`, the section's configuration replaces the defaults below and the request's fields override it (see [sections.md](sections.md#how-the-configuration-is-chosen)); `instructions` are added to Claude's system prompt on every turn. `base` defaults to the repository's default branch; `model` to the default model (see [models.md](models.md)); `image` and `setup_script` to the default sandbox environment (see [sandbox-environment.md](sandbox-environment.md)); `timeout_seconds` defaults to 1800 (max 2700). `prompt`, optional, is the first message: it is in the chat while the workspace is set up, and Claude starts on it as soon as the workspace is ready (the response then has `"status": "working"`), even if the client has disconnected; with a prompt, `503` if there is no Claude token, checked before a sandbox is created. Clones, runs the setup script, installs Claude Code and returns `201` with the workspace, once it is saved; `500` if it could not be saved (the sandbox is then destroyed). Setup continues if the client disconnects. |
 | `GET /workspaces`, `GET /workspaces/{name}`  | Every saved workspace with its `status`, including ones still being created, terminated ones kept as history (`"status": "terminated"`) and archived ones (`archived_at` is set), and `pull_request` once one exists. |
 | `POST /workspaces/{name}/claude/messages`    | Same body and response as `POST /sandboxes/{name}/claude/messages`, run in the checkout after syncing `origin/*`. The turn is also recorded in the workspace's chat. |
 | `POST /workspaces/{name}/chat`, `GET /workspaces/{name}/events` | Asynchronous chat with streamed progress, used by the web UI; see [web-ui.md](web-ui.md#api-used-by-the-ui). |
@@ -335,6 +335,12 @@ MOSSO_E2E=1 MOSSO_E2E_GITHUB_REPO=you/mosso-playground \
   their 20-minute timeout), and `mosso/*` branches and open pull requests in
   the repository.
 - It uses a little of your Claude subscription and Vercel usage.
+
+Agent instructions (from a section, see [sections.md](sections.md)) can ask
+Claude to work towards several pull requests, but Claude cannot push or open
+pull requests itself: [sections.md](sections.md#github-capabilities-what-the-agent-can-do-today)
+lists what the agent can do today and recommends a minimal, Mosso-mediated
+way to close the gap.
 
 ## Security model and limitations
 

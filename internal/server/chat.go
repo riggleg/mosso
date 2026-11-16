@@ -517,9 +517,35 @@ func short(sha string) string {
 	return sha
 }
 
-// workspacePrompt tells Claude how Git works in a workspace: no
-// credentials, Mosso fetches and pushes.
+// workspacePrompt tells Claude how Git works in a workspace (no
+// credentials, Mosso fetches and pushes) and, if the workspace has agent
+// instructions, adds them after Mosso's own, which take precedence. It is
+// appended to Claude Code's system prompt on every turn, including turns
+// that resume a session, so the instructions always apply. They come from
+// the workspace's saved configuration, not from its section, so editing
+// the section or moving the workspace does not change them.
 func workspacePrompt(ws *workspace) string {
+	return gitPrompt(ws) + instructionsPrompt(ws.Instructions)
+}
+
+// instructionsPrompt frames agent instructions for the system prompt, or
+// returns "" for none. They guide how Claude works; they are not the task,
+// and they cannot lift Mosso's rules: what they ask that this sandbox
+// cannot do is left to the user, and said so.
+func instructionsPrompt(instructions string) string {
+	if instructions == "" {
+		return ""
+	}
+	return `
+
+The user saved the following instructions for this workspace in Mosso. Follow them on every turn, alongside the user's messages: they describe how to work, not the task itself, and the user's messages come first. They do not override the rules above. If they ask for something those rules or this sandbox do not allow (for example pushing, opening pull requests yourself, or using GitHub credentials), do the parts you can, such as preparing and committing the work, then say clearly in your reply what is left for the user to do in Mosso or on GitHub.
+<workspace-instructions>
+` + instructions + `
+</workspace-instructions>`
+}
+
+// gitPrompt tells Claude how Git works in a workspace.
+func gitPrompt(ws *workspace) string {
 	return fmt.Sprintf(`You are working in a Mosso workspace: a checkout of the GitHub repository %[1]s in %[2]s, on the working branch %[3]s, whose pull request targets %[4]s.
 Git in this sandbox has no GitHub credentials, on purpose. Do not try to push, authenticate, or use the gh CLI, and do not ask for a token.
 - Before each of your turns, Mosso fetches from GitHub for you: origin/%[4]s is the latest base branch, and origin/%[3]s is the working branch as last published (once it has been). git fetch and git pull may fail here; use those refs instead, for example "git rebase origin/%[4]s".

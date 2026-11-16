@@ -8,6 +8,7 @@
   <link rel="stylesheet" href="/assets/style.css">
   <script src="/assets/markdown.js" defer></script>
   <script src="/assets/attachments.js" defer></script>
+  <script src="/assets/sections.js" defer></script>
   <script src="/assets/app.js" defer></script>
 </head>
 <body>
@@ -44,10 +45,12 @@
           <span id="ws-branch" class="branch"></span>
           <span id="ws-model" class="model hidden"></span>
           <span id="ws-env" class="model hidden"></span>
+          <span id="ws-instructions" class="model hidden">Instructions</span>
           <span id="ws-status" class="status"></span>
         </div>
         <div class="ws-meta">
           <span id="ws-expiry" class="muted"></span>
+          <select id="ws-section" class="compact" title="Section: where this workspace is listed. Moving it keeps its configuration, sandbox and instructions." aria-label="Section"></select>
           <a id="ws-pr" class="pr-link hidden" target="_blank" rel="noopener noreferrer"></a>
           <button id="resume" class="hidden" type="button" title="Start a new sandbox session from the saved snapshot and fetch what Claude did meanwhile">Resume sandbox</button>
           <button id="publish" type="button">Create PR</button>
@@ -96,6 +99,10 @@
   <dialog id="create-dialog">
     <form id="create-form" method="dialog">
       <h2>New workspace</h2>
+      <label>Section
+        <select id="create-section"></select>
+      </label>
+      <p id="create-inherit" class="inherit small-text hidden"></p>
       <label>Repository
         <input id="create-repo" list="repo-options" placeholder="owner/repo" required spellcheck="false" autocapitalize="off">
         <datalist id="repo-options"></datalist>
@@ -110,6 +117,12 @@
       <label>First message <span class="muted">(optional)</span>
         <textarea id="create-prompt" rows="4" placeholder="What should Claude work on? It starts as soon as the workspace is ready."></textarea>
       </label>
+      <details id="create-instr" class="env-section">
+        <summary>Agent instructions <span id="create-instr-summary" class="muted"></span></summary>
+        <label class="sr-only" for="create-instructions">Agent instructions</label>
+        <textarea id="create-instructions" rows="5" spellcheck="true" placeholder="Persistent instructions added to Claude's system prompt on every turn, for example: Follow the repository's conventions and run the relevant tests."></textarea>
+        <p class="muted small-text">Saved with this workspace and applied to every turn. They guide Claude; they do not replace your messages or lift Mosso's restrictions (Claude still cannot push or use GitHub credentials).</p>
+      </details>
       <details id="create-env" class="env-section">
         <summary>Sandbox environment <span id="create-env-summary" class="muted"></span></summary>
         <label>Image <span class="muted">(Vercel Container Registry)</span>
@@ -118,9 +131,9 @@
         <label>Setup script <span class="muted">(Bash, runs once after the clone)</span>
           <textarea id="create-setup" class="code-input" rows="6" spellcheck="false" autocapitalize="off" placeholder="# For example:&#10;curl https://mise.run | sh&#10;mise trust &amp;&amp; mise install"></textarea>
         </label>
-        <p class="muted small-text">Prefilled with the defaults from Settings; changes apply to this workspace only. A failing setup script stops the creation and destroys the sandbox.</p>
+        <p class="muted small-text">Prefilled from the section, or the defaults from Settings without one; changes apply to this workspace only. A failing setup script stops the creation and destroys the sandbox.</p>
       </details>
-      <p class="muted small-text">Mosso provisions a persistent sandbox (sessions of up to 45 minutes, resumed as needed), clones the base branch onto a new working branch, runs the setup script if there is one, and installs Claude Code and the Mosso worker. This takes about a minute plus the setup script; the workspace opens while it is set up, and Claude starts on your first message when it is ready, even if you close Mosso's page. The workspace keeps its model, image and setup script for its whole life.</p>
+      <p class="muted small-text">Mosso provisions a persistent sandbox (sessions of up to 45 minutes, resumed as needed), clones the base branch onto a new working branch, runs the setup script if there is one, and installs Claude Code and the Mosso worker. This takes about a minute plus the setup script; the workspace opens while it is set up, and Claude starts on your first message when it is ready, even if you close Mosso's page. The workspace keeps its model, image, setup script and instructions for its whole life, even if its section changes.</p>
       <p id="create-error" class="error-text hidden"></p>
       <div class="dialog-actions">
         <button id="create-cancel" type="button">Cancel</button>
@@ -166,6 +179,49 @@
       <div class="dialog-actions">
         <button id="settings-cancel" type="button">Cancel</button>
         <button id="settings-submit" class="primary" type="submit">Save</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="section-dialog" class="wide">
+    <form id="section-form" autocomplete="off">
+      <h2 id="section-heading">New section</h2>
+      <label>Name
+        <input id="section-name" maxlength="80" required placeholder="For example: Perx API">
+      </label>
+      <div class="field-row">
+        <label>Repository <span class="muted">(optional)</span>
+          <input id="section-repo" list="repo-options" placeholder="owner/repo" spellcheck="false" autocapitalize="off">
+        </label>
+        <label>Base branch <span class="muted">(optional)</span>
+          <input id="section-base" list="section-branch-options" placeholder="default branch" spellcheck="false" autocapitalize="off">
+          <datalist id="section-branch-options"></datalist>
+        </label>
+      </div>
+      <label>Model
+        <select id="section-model"></select>
+      </label>
+      <label>Agent instructions <span class="muted">(optional)</span>
+        <textarea id="section-instructions" rows="7" placeholder="Added to Claude's system prompt on every turn of every workspace created from this section. For example:&#10;Follow the repository's existing conventions and run the relevant tests. When the work is complete, prepare it for pull requests targeting both master and uat."></textarea>
+      </label>
+      <details id="section-env" class="env-section">
+        <summary>Sandbox environment <span id="section-env-summary" class="muted"></span></summary>
+        <label>Image <span class="muted">(Vercel Container Registry; empty for the built-in runtime)</span>
+          <input id="section-image" spellcheck="false" autocapitalize="off" autocomplete="off">
+        </label>
+        <label>Setup script <span class="muted">(Bash, runs once after the clone)</span>
+          <textarea id="section-setup" class="code-input" rows="6" spellcheck="false" autocapitalize="off"></textarea>
+        </label>
+      </details>
+      <label class="inline"><input id="section-default" type="checkbox"> Preselect this section for new workspaces</label>
+      <p class="muted small-text">New workspaces in this section start from this configuration; you can change any of it in the New workspace dialog. Each workspace keeps what it was created with: editing or deleting the section never changes existing workspaces, and moving a workspace only changes where it is listed.</p>
+      <p id="section-error" class="error-text hidden"></p>
+      <div class="dialog-actions">
+        <button id="section-delete" class="danger hidden" type="button">Delete</button>
+        <button id="section-duplicate" class="hidden" type="button">Duplicate</button>
+        <span class="spacer"></span>
+        <button id="section-cancel" type="button">Cancel</button>
+        <button id="section-submit" class="primary" type="submit">Save</button>
       </div>
     </form>
   </dialog>
