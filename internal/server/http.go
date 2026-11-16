@@ -79,6 +79,11 @@ type Server struct {
 	// defaultModel is the Claude model new workspaces run unless the
 	// request names one; saved in the database (see settings.go).
 	defaultModel string
+	// defaultImage and defaultSetupScript are the sandbox image and setup
+	// script new workspaces get unless the request overrides them; empty
+	// for the built-in runtime and no setup. Saved in the database.
+	defaultImage       string
+	defaultSetupScript string
 	// memoryToken is a GitHub token pasted into the web UI on a system
 	// without a Keychain. It lasts until Mosso stops and takes precedence
 	// over MOSSO_GITHUB_TOKEN.

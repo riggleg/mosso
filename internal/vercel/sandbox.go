@@ -1,9 +1,9 @@
 // Package vercel is a minimal client for the Vercel Sandbox REST API.
 //
 // It mirrors the endpoints used by the official @vercel/sandbox SDK and only
-// implements what Mosso needs today: create a sandbox, run a command (with
-// optional environment and working directory), read its output and exit
-// status, and destroy the sandbox.
+// implements what Mosso needs today: create a sandbox (from a runtime or a
+// container image), run a command (with optional environment and working
+// directory), read its output and exit status, and destroy the sandbox.
 package vercel
 
 import (
@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"regexp"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -26,8 +27,11 @@ import (
 const (
 	// DefaultBaseURL is Vercel's documented public REST API endpoint.
 	DefaultBaseURL = "https://api.vercel.com"
-	// DefaultRuntime is the sandbox image used when none is requested.
+	// DefaultRuntime is the sandbox runtime used when neither a runtime nor
+	// an image is requested.
 	DefaultRuntime = "node22"
+	// MaxImageRefBytes bounds an image reference.
+	MaxImageRefBytes = 512
 	// DefaultTimeout is how long Vercel keeps a sandbox alive before stopping
 	// it on its own. It is the backstop against abandoned, chargeable sandboxes.
 	DefaultTimeout = 10 * time.Minute
@@ -138,7 +142,15 @@ func (sb Sandbox) ExpiresAt() time.Time {
 
 // CreateOptions configures a new sandbox. Zero values use defaults.
 type CreateOptions struct {
+	// Runtime is a Vercel runtime such as "node22". Leave it empty with
+	// Image; with neither, DefaultRuntime is used.
 	Runtime string
+	// Image is a Vercel Container Registry image reference to boot the
+	// sandbox from instead of a runtime: "repo", "repo:tag",
+	// "repo@sha256:…", "team/project/repo:tag", optionally prefixed with
+	// "vcr.vercel.com/" (see ValidImage). Vercel resolves bare repository
+	// names against the sandbox's project.
+	Image   string
 	Timeout time.Duration
 	// Persistent keeps the filesystem across sessions: Vercel snapshots it
 	// when a session stops (also at the timeout) and resumes from the
@@ -271,11 +283,34 @@ func (r sandboxResponse) sandbox(name string, created time.Time) (*Sandbox, erro
 	return sb, nil
 }
 
+// imagePattern is what Mosso accepts as an image reference: registry path
+// segments, an optional tag and an optional digest. It is deliberately
+// strict (no spaces, no leading "-") since the reference is user input;
+// Vercel decides whether it exists.
+var imagePattern = regexp.MustCompile(`^[a-z0-9]([a-z0-9._-]*[a-z0-9])?(/[a-z0-9]([a-z0-9._-]*[a-z0-9])?)*(:[A-Za-z0-9_][A-Za-z0-9_.-]{0,127})?(@sha256:[a-f0-9]{64})?$`)
+
+// ValidImage reports whether ref looks like a Vercel Container Registry
+// image reference, such as "my-image:v1",
+// "my-team/my-project/my-image@sha256:…" or
+// "vcr.vercel.com/vercel/sandbox/universal".
+func ValidImage(ref string) bool {
+	return len(ref) <= MaxImageRefBytes && imagePattern.MatchString(ref)
+}
+
 // Create provisions a sandbox called name. If the request fails after it
 // may have reached Vercel, Create attempts to delete the sandbox so it does
 // not linger and accrue charges.
+//
+// A sandbox with an Image is created with Vercel's v3 endpoint, which boots
+// container images (as the official SDK does); one with a runtime keeps
+// using the v2 endpoint.
 func (c *Client) Create(ctx context.Context, name string, opts CreateOptions) (sb *Sandbox, err error) {
-	if opts.Runtime == "" {
+	switch {
+	case opts.Image != "" && opts.Runtime != "":
+		return nil, errors.New("create sandbox: set a runtime or an image, not both")
+	case opts.Image != "" && !ValidImage(opts.Image):
+		return nil, fmt.Errorf("create sandbox: invalid image reference %q", opts.Image)
+	case opts.Image == "" && opts.Runtime == "":
 		opts.Runtime = DefaultRuntime
 	}
 	if opts.Timeout <= 0 {
@@ -287,10 +322,16 @@ func (c *Client) Create(ctx context.Context, name string, opts CreateOptions) (s
 	body := map[string]any{
 		"projectId":  c.cfg.ProjectID,
 		"name":       name,
-		"runtime":    opts.Runtime,
 		"timeout":    opts.Timeout.Milliseconds(),
 		"persistent": opts.Persistent,
 		"ports":      []int{},
+	}
+	endpoint := "/v2/sandboxes"
+	if opts.Image != "" {
+		endpoint = "/v3/sandboxes"
+		body["image"] = opts.Image
+	} else {
+		body["runtime"] = opts.Runtime
 	}
 	if opts.Persistent {
 		if opts.SnapshotExpiration > 0 {
@@ -311,7 +352,10 @@ func (c *Client) Create(ctx context.Context, name string, opts CreateOptions) (s
 			}
 		}
 	}()
-	if err := c.doJSON(ctx, http.MethodPost, "/v2/sandboxes", nil, body, &resp); err != nil {
+	if err := c.doJSON(ctx, http.MethodPost, endpoint, nil, body, &resp); err != nil {
+		if opts.Image != "" {
+			return nil, fmt.Errorf("create sandbox from image %s: %w", opts.Image, err)
+		}
 		return nil, fmt.Errorf("create sandbox: %w", err)
 	}
 	sb, err = resp.sandbox(name, time.Now().UTC())

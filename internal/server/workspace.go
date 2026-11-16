@@ -24,7 +24,8 @@ import (
 // sessions, so the longest allowed session is the most convenient.
 const defaultWorkspaceTimeout = vercel.MaxTimeout
 
-// setupTimeout bounds provisioning, cloning and installing Claude Code.
+// setupTimeout bounds provisioning, cloning and installing Claude Code; a
+// setup script gets setupScriptTimeout more.
 const setupTimeout = 10 * time.Minute
 
 // publishTimeout bounds committing and pushing a workspace's changes.
@@ -45,6 +46,16 @@ type workspace struct {
 	// workspace is created and never changed; empty (Claude Code's
 	// default) for workspaces from before models could be chosen.
 	Model string `json:"model,omitempty"`
+	// Image is the Vercel Container Registry image the sandbox was created
+	// from, or empty for the built-in runtime. SetupScript ran once after
+	// the clone; empty for none. Both are chosen at creation and kept for
+	// reference.
+	Image       string `json:"image,omitempty"`
+	SetupScript string `json:"setup_script,omitempty"`
+	// Step says what the setup is doing while Status is "creating":
+	// "cloning", "setup" (the setup script runs) or "installing" (Claude
+	// Code and the worker).
+	Step string `json:"step,omitempty"`
 	// SandboxState is "running", "stopped" (resumes on the next message),
 	// "gone" (deleted elsewhere or expired) or "terminated" (deleted by
 	// terminating the workspace); computed by snapshotLocked.
@@ -72,6 +83,7 @@ type workspace struct {
 
 	creating   bool
 	connecting bool
+	step       string // see Step
 	chat       *chat
 	// attachments are the files uploaded to the workspace's sandbox, by
 	// ID; attachBytes is their total size. Guarded by Server.mu.
@@ -109,7 +121,7 @@ func (s *Server) snapshotLocked(ws *workspace) workspace {
 	expired := !ws.ExpiresAt.IsZero() && time.Now().After(ws.ExpiresAt)
 	switch {
 	case ws.creating:
-		c.Status = "creating"
+		c.Status, c.Step = "creating", ws.step
 	case ws.connecting:
 		c.Status = "connecting"
 	case ws.sandboxState == sandboxTerminated:
@@ -293,10 +305,13 @@ func (s *Server) getWorkspace(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// createWorkspace provisions a persistent sandbox, clones the repository's
-// base branch into it, checks out a new working branch, installs Claude
-// Code and starts the Mosso worker. The workspace runs the requested Claude
-// model, or the default model. The sandbox is destroyed if any step fails.
+// createWorkspace provisions a persistent sandbox from the requested image
+// (or the default one, or the built-in runtime), clones the repository's
+// base branch into it, checks out a new working branch, runs the setup
+// script (the requested or default one, if any), installs Claude Code and
+// starts the Mosso worker. The workspace runs the requested Claude model,
+// or the default model. The sandbox is destroyed if any step fails,
+// including the setup script.
 //
 // With a prompt, the chat shows it at once and Claude starts on it as soon
 // as the workspace is ready, whether or not the client is still connected.
@@ -308,8 +323,12 @@ func (s *Server) createWorkspace(w http.ResponseWriter, r *http.Request) {
 		TimeoutSeconds int    `json:"timeout_seconds"`
 		// Prompt is the first message for Claude; optional.
 		Prompt string `json:"prompt"`
+		// Image and SetupScript override the defaults when present; ""
+		// asks for the built-in runtime or no setup script.
+		Image       *string `json:"image"`
+		SetupScript *string `json:"setup_script"`
 	}
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 2*claude.MaxPromptBytes)).Decode(&req); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 2*(claude.MaxPromptBytes+maxSetupScriptBytes))).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
@@ -332,6 +351,23 @@ func (s *Server) createWorkspace(w http.ResponseWriter, r *http.Request) {
 	}
 	if strings.TrimSpace(req.Prompt) == "" {
 		req.Prompt = ""
+	}
+	s.mu.Lock()
+	image, script := s.defaultImage, s.defaultSetupScript
+	s.mu.Unlock()
+	if req.Image != nil {
+		var err error
+		if image, err = normalizeImage(*req.Image); err != nil {
+			writeError(w, http.StatusBadRequest, "image: "+err.Error())
+			return
+		}
+	}
+	if req.SetupScript != nil {
+		var err error
+		if script, err = normalizeSetupScript(*req.SetupScript); err != nil {
+			writeError(w, http.StatusBadRequest, "setup_script: "+err.Error())
+			return
+		}
 	}
 	// Without a Claude token the first message could not run: say so
 	// before paying for a sandbox.
@@ -383,11 +419,15 @@ func (s *Server) createWorkspace(w http.ResponseWriter, r *http.Request) {
 
 	// Setup continues if the client disconnects (for example, the browser
 	// reloads), so the workspace still appears; Shutdown cancels it.
-	ctx, cancel := context.WithTimeout(s.ctx, setupTimeout)
+	budget := setupTimeout
+	if script != "" {
+		budget += setupScriptTimeout
+	}
+	ctx, cancel := context.WithTimeout(s.ctx, budget)
 	defer cancel()
 	// Persistent: the sandbox snapshots itself when a session stops and
 	// resumes later; one kept snapshot keeps storage flat.
-	sb, status, err := s.provision(ctx, vercel.CreateOptions{Timeout: timeout, Persistent: true, KeepLastSnapshots: 1})
+	sb, status, err := s.provision(ctx, vercel.CreateOptions{Image: image, Timeout: timeout, Persistent: true, KeepLastSnapshots: 1})
 	if err != nil {
 		writeError(w, status, err.Error())
 		return
@@ -399,10 +439,13 @@ func (s *Server) createWorkspace(w http.ResponseWriter, r *http.Request) {
 		Branch:       github.NewBranchName(),
 		Dir:          path.Join(claude.WorkDir, req.Repo[strings.IndexByte(req.Repo, '/')+1:]),
 		Model:        model,
+		Image:        image,
+		SetupScript:  script,
 		Sandbox:      *sb,
 		ExpiresAt:    sb.ExpiresAt(),
 		CreatedAt:    time.Now().UTC(),
 		creating:     true,
+		step:         "cloning",
 		chat:         newChat(),
 		sandboxState: sandboxRunning,
 
@@ -463,8 +506,8 @@ func (s *Server) createWorkspace(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadGateway, err.Error())
 		return
 	}
-	log.Printf("workspace %s: cloned %s@%s (%s) onto %s in %s",
-		sb.Name, ws.Repo, base, baseSHA[:12], ws.Branch, time.Since(start).Round(time.Millisecond))
+	log.Printf("workspace %s: cloned %s@%s (%s) onto %s in %s (sandbox: %s)",
+		sb.Name, ws.Repo, base, baseSHA[:12], ws.Branch, time.Since(start).Round(time.Millisecond), imageLabel(image))
 	mirror, err := github.NewMirror(s.vercel, sb.SessionID, github.MirrorOptions{
 		Repo: ws.Repo, Base: base, BaseSHA: baseSHA, Branch: ws.Branch, Dir: ws.Dir,
 	})
@@ -482,8 +525,27 @@ func (s *Server) createWorkspace(w http.ResponseWriter, r *http.Request) {
 			s.addEntry(ws.chat, chatEntry{Type: "notice", Text: "Could not fetch from GitHub on the Mosso server: " + err.Error() + " Mosso tries again before each message and when publishing."})
 		}
 	}()
+	// The setup script runs once, before anything else runs in the
+	// checkout. If it fails, the workspace is not created and the deferred
+	// cleanup destroys the sandbox.
+	if script != "" {
+		s.setStep(ws, "setup")
+		if err := s.runSetup(ctx, ws, sb.SessionID); err != nil {
+			log.Printf("workspace %s: setup script: %v", sb.Name, err)
+			cancel()
+			<-primed
+			_ = mirror.Close()
+			status := http.StatusBadGateway
+			if errors.Is(err, errSetupFailed) {
+				status = http.StatusUnprocessableEntity
+			}
+			writeError(w, status, err.Error()+"\nThe workspace was not created and its sandbox is destroyed.")
+			return
+		}
+	}
 	// Install Claude Code and start the worker now so the first message is
 	// quick. If either fails, the first message tries again.
+	s.setStep(ws, "installing")
 	_ = s.ensureClaude(ctx, sb.Name, sb.SessionID)
 	if _, err := s.ensureWorker(ctx, sb.Name, sb.SessionID); err != nil {
 		log.Printf("workspace %s: %v", sb.Name, err)
@@ -501,7 +563,7 @@ func (s *Server) createWorkspace(w http.ResponseWriter, r *http.Request) {
 		// its sandbox at the next restart.
 		if saveErr = s.saveLocked(ws); saveErr == nil {
 			ws.git = mirror
-			ws.creating = false
+			ws.creating, ws.step = false, ""
 			delete(s.busy, sb.Name)
 			ws.chat.notify()
 			snapshot = s.snapshotLocked(ws)
@@ -545,6 +607,14 @@ func (s *Server) createWorkspace(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, http.StatusCreated, snapshot)
+}
+
+// setStep records what a workspace's setup is doing, for the web UI.
+func (s *Server) setStep(ws *workspace, step string) {
+	s.mu.Lock()
+	ws.step = step
+	ws.chat.notify()
+	s.mu.Unlock()
 }
 
 // archiveWorkspace archives a terminated workspace (POST …/archive) or

@@ -7,7 +7,9 @@ the web UI and saved in Mosso's database, is preselected for new workspaces.
 ## Use it
 
 - **Default model.** The sidebar footer shows *Model* with the current
-  default. Click **Change**, pick a model and save. The choice is saved in
+  default. Click **Change**, pick a model in *Settings for new workspaces*
+  and save (the same dialog has the sandbox image and setup script; see
+  [sandbox-environment.md](sandbox-environment.md)). The choice is saved in
   the SQLite database (see [history.md](history.md)), so it survives
   restarts; no environment variable is involved. Until you choose one, the
   default is Claude Opus 5.5. Changing it does not affect existing
@@ -53,7 +55,7 @@ longer offered for new workspaces.
 
 | Method & path | Description |
 | --- | --- |
-| `GET /settings` | `{"default_model": "claude-opus-5-5", "models": [{"id": "…", "name": "…"}]}`. Works without Vercel credentials. |
-| `POST /settings` | Body: `{"default_model": "<id>"}`. Saves the default and returns the settings. `400` if the model is not in the list; `500` if it could not be saved (the default is then unchanged). |
+| `GET /settings` | `{"default_model": "claude-opus-5-5", "models": [{"id": "…", "name": "…"}], …}`, plus the sandbox environment defaults (see [sandbox-environment.md](sandbox-environment.md#api)). Works without Vercel credentials. |
+| `POST /settings` | Body: `{"default_model": "<id>"}`, optionally with the sandbox environment defaults; settings left out are unchanged. Saves them and returns the settings. `400` if the model is not in the list; `500` if they could not be saved (nothing is then changed). |
 | `POST /workspaces` | Accepts `"model": "<id>"`; omitted, the workspace gets the current default. `400` if the model is not in the list. |
 | `GET /workspaces`, `GET /workspaces/{name}` | Each workspace has `model` (absent for workspaces from before model selection). |

@@ -82,13 +82,16 @@ func (s *Server) Restore(ctx context.Context, dbPath, legacyDir string) error {
 		st.close()
 		return fmt.Errorf("load workspaces: %w", err)
 	}
-	model, err := st.setting(settingDefaultModel)
-	if err != nil {
-		st.close()
-		return fmt.Errorf("load settings: %w", err)
+	var model, image, script string
+	for key, v := range map[string]*string{settingDefaultModel: &model, settingDefaultImage: &image, settingDefaultSetupScript: &script} {
+		if *v, err = st.setting(key); err != nil {
+			st.close()
+			return fmt.Errorf("load settings: %w", err)
+		}
 	}
 	s.mu.Lock()
 	s.store = st
+	s.defaultImage, s.defaultSetupScript = image, script
 	switch {
 	case claude.KnownModel(model):
 		s.defaultModel = model
@@ -133,6 +136,7 @@ func (s *Server) Restore(ctx context.Context, dbPath, legacyDir string) error {
 func (s *Server) loadWorkspace(rec workspaceRecord) (*workspace, error) {
 	ws := &workspace{
 		Name: rec.Name, Repo: rec.Repo, Base: rec.Base, BaseSHA: rec.BaseSHA, Branch: rec.Branch, Dir: rec.Dir, Model: rec.Model,
+		Image: rec.Image, SetupScript: rec.SetupScript,
 		Sandbox: rec.Sandbox, ExpiresAt: rec.ExpiresAt, PullRequest: rec.PullRequest, CreatedAt: rec.CreatedAt,
 		ArchivedAt:   rec.ArchivedAt,
 		chat:         newChat(),
@@ -572,7 +576,8 @@ func (s *Server) saveLocked(ws *workspace) error {
 		return nil // no database: workspaces live in memory only
 	}
 	rec := workspaceRecord{
-		Name: ws.Name, Repo: ws.Repo, Base: ws.Base, Branch: ws.Branch, Model: ws.Model, SandboxState: ws.sandboxState,
+		Name: ws.Name, Repo: ws.Repo, Base: ws.Base, Branch: ws.Branch, Model: ws.Model,
+		Image: ws.Image, SetupScript: ws.SetupScript, SandboxState: ws.sandboxState,
 		CreatedAt: ws.CreatedAt, ArchivedAt: ws.ArchivedAt,
 		workspaceState: workspaceState{
 			BaseSHA: ws.BaseSHA, Dir: ws.Dir, Sandbox: ws.Sandbox, ExpiresAt: ws.ExpiresAt, PullRequest: ws.PullRequest,

@@ -60,7 +60,9 @@ curl -s -X DELETE localhost:8080/sandboxes/mosso-1a2b3c4d5e6f   # 204 No Content
 
 To run Claude Code in a sandbox, see [claude-code.md](claude-code.md). To
 work on a GitHub repository and open a pull request, see [github.md](github.md).
-Workspaces use the same sandboxes, limit and cleanup.
+Workspaces use the same sandboxes, limit and cleanup. A workspace's sandbox
+can boot from a custom Vercel Container Registry image instead of `node22`
+and run a setup script; see [sandbox-environment.md](sandbox-environment.md).
 
 `POST` requests must send `Content-Type: application/json`. Mosso also rejects
 requests whose `Host` or `Origin` is not loopback, so a web page you visit cannot

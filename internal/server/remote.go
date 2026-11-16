@@ -49,12 +49,16 @@ const followMaxTime = 10 * time.Minute
 // workerStartScript starts the worker ($1 binary, $2 state directory, $3
 // port) unless one already answers, and waits until it does. The worker is
 // detached from the command, so it keeps running after the command ends
-// and after Mosso disconnects.
+// and after Mosso disconnects. It starts with the workspace's environment
+// file, if the setup script made one (see setup.go), so the worker and
+// Claude Code find what the script installed; a broken line in it does
+// not stop the worker.
 const workerStartScript = `set -euo pipefail
 bin=$1 state=$2 port=$3
 mkdir -p "$state"
 chmod +x "$bin"
 if curl -sf --max-time 5 "http://127.0.0.1:$port/status" >/dev/null 2>&1; then echo running; exit 0; fi
+if [ -f "$state/env" ]; then set +eu; . "$state/env"; set -eu; fi
 setsid nohup "$bin" -state "$state" -listen "127.0.0.1:$port" >>"$state/worker.log" 2>&1 </dev/null &
 for _ in $(seq 1 50); do
   if curl -sf --max-time 2 "http://127.0.0.1:$port/status" >/dev/null 2>&1; then echo started; exit 0; fi
