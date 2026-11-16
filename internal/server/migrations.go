@@ -40,6 +40,24 @@ var migrations = []string{
 	// Workspaces from before ran the built-in runtime with no setup script.
 	`ALTER TABLE workspaces ADD COLUMN image TEXT NOT NULL DEFAULT '';        -- Vercel Container Registry image; '' for the built-in runtime
 	ALTER TABLE workspaces ADD COLUMN setup_script TEXT NOT NULL DEFAULT ''; -- the Bash script run once after the clone; '' for none`,
+	// 4: sections, named groups of workspaces with the configuration new
+	// workspaces in them start from, and each workspace's section and
+	// agent instructions. Workspaces from before are in no section
+	// ("Unsectioned") and have no instructions.
+	`CREATE TABLE sections (
+		id           INTEGER PRIMARY KEY,
+		name         TEXT NOT NULL COLLATE NOCASE UNIQUE,
+		repo         TEXT NOT NULL DEFAULT '', -- "owner/repo"; '' to choose per workspace
+		base         TEXT NOT NULL DEFAULT '', -- '' for the repository's default branch
+		model        TEXT NOT NULL DEFAULT '', -- '' for the default model
+		image        TEXT NOT NULL DEFAULT '', -- '' for the built-in runtime
+		setup_script TEXT NOT NULL DEFAULT '', -- '' for none
+		instructions TEXT NOT NULL DEFAULT '', -- added to the agent's system prompt; '' for none
+		created_at   TEXT NOT NULL,
+		updated_at   TEXT NOT NULL
+	);
+	ALTER TABLE workspaces ADD COLUMN section_id INTEGER REFERENCES sections (id) ON DELETE SET NULL; -- NULL: unsectioned; changes when the workspace is moved
+	ALTER TABLE workspaces ADD COLUMN instructions TEXT NOT NULL DEFAULT ''; -- the agent instructions, fixed when the workspace is created`,
 }
 
 // migrate applies the migrations the database has not seen yet, each in

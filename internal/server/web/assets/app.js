@@ -25,6 +25,11 @@ const state = {
   github: null, // GET /github/auth: whether GitHub is connected (never the token)
   vercel: null, // GET /vercel/auth: whether sandboxes can be used at all
   settings: null, // GET /settings: the defaults for new workspaces and the models to choose from
+  sections: [], // GET /sections: named groups of workspaces and their configuration
+  // Sections collapsed in the sidebar, by ID ("unsectioned" for that
+  // group): a preference of this browser, kept in localStorage.
+  collapsed: new Set(JSON.parse(localStorage.getItem("mosso.collapsedSections") || "[]")),
+  moving: false,
 };
 
 // ---------- helpers ----------
@@ -273,12 +278,145 @@ async function submitSettings(ev) {
   }
 }
 
+// ---------- sections ----------
+
+// editingSection is the section the section dialog edits; null for a new one.
+let editingSection = null;
+
+// openSection opens the section dialog to edit a section, or to create one
+// (null), prefilled with the defaults from Settings.
+async function openSection(sec) {
+  if (!state.settings) state.settings = await api("GET", "/settings").catch(() => null);
+  editingSection = sec;
+  const s = state.settings || {};
+  const start = sec || { name: "", repo: "", base: "", model: "", image: s.default_image || "", setup_script: s.default_setup_script || "", instructions: "" };
+  $("section-heading").textContent = sec ? `Section: ${sec.name}` : "New section";
+  $("section-name").value = start.name;
+  $("section-repo").value = start.repo;
+  $("section-base").value = start.base;
+  const models = s.models || [];
+  $("section-model").replaceChildren(
+    h("option", { value: "", text: `Default model (${modelName(s.default_model)})` }),
+    ...models.map((m) => h("option", { value: m.id, text: m.name })),
+  );
+  if (start.model && !models.some((m) => m.id === start.model)) $("section-model").append(h("option", { value: start.model, text: start.model + " (no longer offered)" }));
+  $("section-model").value = start.model;
+  $("section-instructions").value = start.instructions;
+  $("section-image").value = start.image;
+  $("section-image").placeholder = imageName("");
+  $("section-setup").value = start.setup_script;
+  $("section-env").open = false;
+  updateSectionEnvSummary();
+  $("section-default").checked = !!sec && s.default_section_id === sec.id;
+  $("section-delete").classList.toggle("hidden", !sec);
+  $("section-duplicate").classList.toggle("hidden", !sec);
+  $("section-error").classList.add("hidden");
+  setSectionBusy(false);
+  if (start.repo) loadBranches(start.repo, "section-branch-options", "section-base");
+  $("section-dialog").showModal();
+  $("section-name").focus();
+  if (!state.repos) {
+    try {
+      state.repos = (await api("GET", "/github/repos")).repos;
+      $("repo-options").replaceChildren(...state.repos.map((r) => h("option", { value: r.full_name, label: r.private ? "private" : "" })));
+    } catch (e) {
+      /* typing a repository still works */
+    }
+  }
+}
+
+function updateSectionEnvSummary() {
+  const setup = $("section-setup").value.trim();
+  $("section-env-summary").textContent = "· " + imageName($("section-image").value.trim()) + (setup ? " · setup script" : " · no setup script");
+}
+
+function setSectionBusy(on) {
+  for (const id of ["section-submit", "section-delete", "section-duplicate"]) $(id).disabled = on;
+}
+
+function sectionError(e) {
+  const err = $("section-error");
+  err.textContent = e.message;
+  err.classList.remove("hidden");
+  setSectionBusy(false);
+}
+
+// setDefaultSection makes the section the default (or stops it being the
+// default) if the checkbox says so.
+async function setDefaultSection(id) {
+  const want = $("section-default").checked;
+  const current = state.settings && state.settings.default_section_id === id;
+  if (want === current) return;
+  state.settings = await api("POST", "/settings", { default_section_id: want ? id : 0 });
+}
+
+async function submitSection(ev) {
+  ev.preventDefault();
+  $("section-error").classList.add("hidden");
+  setSectionBusy(true);
+  const body = {
+    name: $("section-name").value,
+    repo: Sections.cleanRepo($("section-repo").value),
+    base: $("section-base").value.trim(),
+    model: $("section-model").value,
+    image: $("section-image").value.trim(),
+    setup_script: $("section-setup").value,
+    instructions: $("section-instructions").value,
+  };
+  try {
+    const sec = editingSection ? await api("PATCH", "/sections/" + editingSection.id, body) : await api("POST", "/sections", body);
+    editingSection = sec;
+    await setDefaultSection(sec.id);
+    $("section-dialog").close();
+    await refreshList();
+    loadChecks();
+  } catch (e) {
+    sectionError(e);
+  }
+}
+
+// duplicateSection copies the section being edited and opens the copy, to
+// rename or change it.
+async function duplicateSection() {
+  if (!editingSection) return;
+  setSectionBusy(true);
+  try {
+    const copy = await api("POST", "/sections/" + editingSection.id + "/duplicate", {});
+    await refreshList();
+    $("section-dialog").close();
+    openSection(copy);
+    $("section-name").select();
+  } catch (e) {
+    sectionError(e);
+  }
+}
+
+async function deleteSection() {
+  const sec = editingSection;
+  if (!sec) return;
+  const n = state.workspaces.filter((w) => w.section_id === sec.id).length;
+  const what = n ? ` Its ${n} workspace${n === 1 ? "" : "s"} (history included) move to Unsectioned, keeping their configuration, sandbox and instructions.` : "";
+  if (!confirm(`Delete the section "${sec.name}"?${what}`)) return;
+  setSectionBusy(true);
+  try {
+    await api("DELETE", "/sections/" + sec.id);
+    state.collapsed.delete(String(sec.id));
+    localStorage.setItem("mosso.collapsedSections", JSON.stringify([...state.collapsed]));
+    $("section-dialog").close();
+    await refreshList();
+    loadChecks();
+  } catch (e) {
+    sectionError(e);
+  }
+}
+
 // ---------- workspace list ----------
 
 async function refreshList() {
   try {
-    const data = await api("GET", "/workspaces");
+    const [data, sections] = await Promise.all([api("GET", "/workspaces"), api("GET", "/sections").catch(() => null)]);
     state.workspaces = data.workspaces;
+    if (sections) state.sections = sections.sections;
     const hadError = state.listError;
     state.listError = null;
     if (hadError) loadChecks();
@@ -292,8 +430,8 @@ async function refreshList() {
     // Open the workspace in the URL, else the newest one with a sandbox,
     // else the newest in the history. Archived ones only open when asked.
     const fromHash = decodeURIComponent(location.hash.replace(/^#\/?/, ""));
-    const groups = groupWorkspaces(state.workspaces);
-    const pick = state.workspaces.find((w) => w.name === fromHash) || groups.active[groups.active.length - 1] || groups.history[0];
+    const groups = Sections.group(state.workspaces, []);
+    const pick = state.workspaces.find((w) => w.name === fromHash) || groups.unsectioned[groups.unsectioned.length - 1] || groups.history[0];
     if (pick) select(pick.name);
   }
   const cur = state.workspaces.find((w) => w.name === state.selected);
@@ -307,23 +445,94 @@ function renderSidebar() {
     nav.replaceChildren(h("div", { class: "list-empty error-text", text: state.listError.message }));
     return;
   }
-  if (!state.workspaces.length) {
-    nav.replaceChildren(h("div", { class: "list-empty", text: "No workspaces yet." }));
-    return;
-  }
+  const sectionName = (id) => {
+    const sec = id && state.sections.find((x) => x.id === id);
+    return sec ? sec.name : "";
+  };
   const item = (w) => {
     const past = isTerminated(w);
     const branch = w.branch.replace(/^mosso\//, "");
+    // History and archived workspaces are not grouped, so they name
+    // the section they belong to.
+    const sec = past ? sectionName(w.section_id) : "";
     return h(
       "button",
-      { type: "button", class: "ws-item" + (past ? " past" : "") + (w.name === state.selected ? " selected" : ""), title: `${w.repo} (${w.name})`, onclick: () => select(w.name) },
-      h("div", { class: "ws-item-top" }, h("span", { class: "dot " + w.status, title: statusLabel(w) }), h("span", { class: "ws-item-repo", text: shortRepo(w.repo) })),
+      { type: "button", class: "ws-item" + (past ? " past" : "") + (w.name === state.selected ? " selected" : ""), title: `${w.repo} (${w.name})` + (sec ? `\nSection: ${sec}` : ""), onclick: () => select(w.name) },
+      h(
+        "div",
+        { class: "ws-item-top" },
+        h("span", { class: "dot " + w.status, title: statusLabel(w) }),
+        h("span", { class: "ws-item-repo", text: shortRepo(w.repo) }),
+        sec ? h("span", { class: "ws-item-section", text: sec }) : null,
+      ),
       h("div", { class: "ws-item-sub", text: past ? `${shortDate(w.created_at)} · ${branch}` : `${w.base} → ${branch}` }),
     );
   };
-  const groups = groupWorkspaces(state.workspaces);
-  const nodes = groups.active.map(item);
-  if (!groups.active.length) nodes.push(h("div", { class: "list-empty", text: "No running workspaces." }));
+  const groups = Sections.group(state.workspaces, state.sections);
+  const nodes = [];
+  const canCreate = !state.listError && !noVercel();
+  // group renders a collapsible section (or the Unsectioned group, for a
+  // null section) with its workspaces.
+  const group = (sec, list) => {
+    const key = sec ? String(sec.id) : "unsectioned";
+    // A collapsed section still opens to show the selected workspace.
+    const open = !state.collapsed.has(key) || list.some((w) => w.name === state.selected);
+    const isDefault = sec && state.settings && state.settings.default_section_id === sec.id;
+    const actions = h(
+      "span",
+      { class: "section-actions" },
+      h("button", {
+        type: "button",
+        class: "section-btn",
+        text: "+",
+        title: noVercel() ? vercelHelp : sec ? `New workspace in ${sec.name}` : "New workspace without a section",
+        "aria-label": sec ? `New workspace in ${sec.name}` : "New workspace without a section",
+        disabled: !canCreate,
+        onclick: (e) => {
+          e.preventDefault();
+          openCreate(sec ? sec.id : null);
+        },
+      }),
+      sec
+        ? h("button", {
+            type: "button",
+            class: "section-btn",
+            text: "⋯",
+            title: `Configure ${sec.name}: rename, edit, duplicate or delete`,
+            "aria-label": `Configure ${sec.name}`,
+            onclick: (e) => {
+              e.preventDefault();
+              openSection(sec);
+            },
+          })
+        : null,
+    );
+    const summary = h(
+      "summary",
+      { class: "section-head", title: sec ? sectionTitle(sec) : "Workspaces in no section" },
+      h("span", { class: "section-name", text: sec ? sec.name : "Unsectioned" }),
+      h("span", { class: "section-count", text: String(list.length) }),
+      isDefault ? h("span", { class: "section-default", text: "default" }) : null,
+      actions,
+    );
+    const details = h("details", { class: "section" + (sec ? "" : " unsectioned"), open }, summary, ...list.map(item));
+    if (!list.length) details.append(h("div", { class: "list-empty section-empty", text: "No workspaces." }));
+    details.addEventListener("toggle", () => {
+      if (details.open) state.collapsed.delete(key);
+      else state.collapsed.add(key);
+      localStorage.setItem("mosso.collapsedSections", JSON.stringify([...state.collapsed]));
+    });
+    return details;
+  };
+  for (const g of groups.sections) nodes.push(group(g.section, g.workspaces));
+  // Without sections, the list looks as it always did.
+  if (groups.sections.length) {
+    if (groups.unsectioned.length) nodes.push(group(null, groups.unsectioned));
+  } else {
+    nodes.push(...groups.unsectioned.map(item));
+    if (!groups.unsectioned.length) nodes.push(h("div", { class: "list-empty", text: state.workspaces.length ? "No running workspaces." : "No workspaces yet." }));
+  }
+  nodes.push(h("button", { type: "button", class: "new-section", text: "+ New section", title: "Group workspaces with a repository, model, sandbox environment and agent instructions that new workspaces start from", onclick: () => openSection(null) }));
   if (groups.history.length) nodes.push(h("div", { class: "list-heading", text: "History" }), ...groups.history.map(item));
   if (groups.archived.length) {
     // Archived workspaces stay out of the way until asked for.
@@ -335,21 +544,19 @@ function renderSidebar() {
   nav.replaceChildren(...nodes);
 }
 
+// sectionTitle describes a section's configuration, for tooltips.
+function sectionTitle(sec) {
+  const parts = [sec.repo ? sec.repo + (sec.base ? "@" + sec.base : "") : "any repository", modelName(sec.model || (state.settings && state.settings.default_model))];
+  if (sec.image) parts.push(sec.image);
+  if (sec.setup_script) parts.push("setup script");
+  if (sec.instructions) parts.push("agent instructions");
+  return parts.join(" · ");
+}
+
 // isTerminated reports whether the workspace is history: it was terminated,
 // so its sandbox is deleted and only the conversation is left.
 function isTerminated(ws) {
   return !!ws && ws.sandbox_state === "terminated";
-}
-
-// groupWorkspaces splits the list for the sidebar: workspaces that still
-// have a sandbox (oldest first, as created), the history of terminated
-// ones, and the archived ones (both newest first).
-function groupWorkspaces(list) {
-  const groups = { active: [], history: [], archived: [] };
-  for (const w of list) (w.archived_at ? groups.archived : isTerminated(w) ? groups.history : groups.active).push(w);
-  groups.history.reverse();
-  groups.archived.reverse();
-  return groups;
 }
 
 function shortDate(iso) {
@@ -403,6 +610,10 @@ function renderHeader() {
   env.title =
     (ws.image ? `The sandbox was created from the image ${ws.image}.` : "The sandbox runs Mosso's built-in runtime.") +
     (ws.setup_script ? "\n\nSetup script, run once after the clone:\n\n" + ws.setup_script : "");
+  const instr = $("ws-instructions");
+  instr.classList.toggle("hidden", !ws.instructions);
+  instr.title = ws.instructions ? "Agent instructions, added to Claude's system prompt on every turn:\n\n" + ws.instructions : "";
+  renderSectionSelect(ws);
   const status = $("ws-status");
   status.textContent = statusLabel(ws);
   status.className = "status " + ws.status;
@@ -453,6 +664,43 @@ function renderHeader() {
     err.classList.add("hidden");
   }
   renderExpiry();
+}
+
+// renderSectionSelect shows the workspace's section in the header, where
+// choosing another moves it.
+function renderSectionSelect(ws) {
+  const sel = $("ws-section");
+  const known = state.sections.some((x) => x.id === ws.section_id);
+  const options = [h("option", { value: "0", text: "Unsectioned" }), ...state.sections.map((x) => h("option", { value: String(x.id), text: x.name }))];
+  // Rebuild only when the choices change, so an open menu is not reset.
+  const sig = JSON.stringify(state.sections.map((x) => [x.id, x.name]));
+  if (sel.dataset.sig !== sig) {
+    sel.replaceChildren(...options);
+    sel.dataset.sig = sig;
+  }
+  sel.value = known ? String(ws.section_id) : "0";
+  sel.disabled = state.moving || ws.status === "creating";
+  sel.classList.toggle("hidden", !state.sections.length && !ws.section_id);
+}
+
+async function moveWorkspace() {
+  const ws = state.ws;
+  if (!ws) return;
+  const id = Number($("ws-section").value);
+  if (id === (ws.section_id || 0)) return;
+  state.moving = true;
+  render();
+  try {
+    state.ws = await api("POST", wsPath(ws.name) + "/section", { section_id: id });
+    // Show the section the workspace moved to, even if it was collapsed.
+    state.collapsed.delete(id ? String(id) : "unsectioned");
+    localStorage.setItem("mosso.collapsedSections", JSON.stringify([...state.collapsed]));
+  } catch (e) {
+    showBanner("Could not move the workspace: " + e.message);
+  } finally {
+    state.moving = false;
+    await refreshList();
+  }
 }
 
 function renderExpiry() {
@@ -1241,25 +1489,32 @@ async function submitPublish(ev) {
   }
 }
 
-async function openCreate() {
-  const repo = $("create-repo");
-  repo.value = localStorage.getItem("mosso.lastRepo") || "";
-  $("create-base").value = "";
+// openCreate opens the New workspace dialog for a section: its ID, null
+// for none, or undefined for the default section.
+async function openCreate(sectionId) {
   if (!state.settings) state.settings = await api("GET", "/settings").catch(() => null);
-  if (state.settings) {
-    modelOptions($("create-model"), state.settings.default_model);
-    $("create-image").value = state.settings.default_image || "";
-    $("create-setup").value = state.settings.default_setup_script || "";
-  }
-  $("create-image").placeholder = imageName("");
+  if (sectionId === undefined) sectionId = (state.settings && state.settings.default_section_id) || null;
+  if (sectionId && !state.sections.some((x) => x.id === sectionId)) sectionId = null;
+  const sel = $("create-section");
+  sel.replaceChildren(
+    h("option", { value: "0", text: "No section" }),
+    ...state.sections.map((x) => h("option", { value: String(x.id), text: x.name + (state.settings && state.settings.default_section_id === x.id ? " (default)" : "") })),
+  );
+  sel.value = String(sectionId || 0);
+  sel.closest("label").classList.toggle("hidden", !state.sections.length);
+  fillCreate();
   $("create-env").open = false;
-  updateEnvSummary();
+  $("create-instr").open = false;
   $("create-error").classList.add("hidden");
   createSeq++; // a create still running no longer owns the dialog
   setCreating(false);
   $("create-dialog").showModal();
-  repo.select();
-  if (repo.value) loadBranches(repo.value);
+  const repo = $("create-repo");
+  if (repo.value) {
+    $("create-prompt").focus();
+  } else {
+    repo.select();
+  }
   if (!state.repos) {
     try {
       state.repos = (await api("GET", "/github/repos")).repos;
@@ -1270,29 +1525,85 @@ async function openCreate() {
   }
 }
 
-let branchesFor = "";
-async function loadBranches(repo) {
-  repo = repo.trim();
-  if (!/^[\w.-]+\/[\w.-]+$/.test(repo) || repo === branchesFor) return;
-  branchesFor = repo;
-  const list = $("branch-options");
+// createSection is the section chosen in the New workspace dialog, or null.
+function createSection() {
+  const id = Number($("create-section").value);
+  return state.sections.find((x) => x.id === id) || null;
+}
+
+// fillCreate fills the New workspace dialog with what the chosen section
+// (or, without one, the defaults) gives a new workspace. The first message
+// is kept.
+function fillCreate() {
+  const sec = createSection();
+  const start = Sections.startingPoint(sec, state.settings);
+  $("create-repo").value = start.repo || (sec ? "" : localStorage.getItem("mosso.lastRepo") || "");
+  $("create-base").value = start.base;
+  if (state.settings) modelOptions($("create-model"), start.model);
+  $("create-image").value = start.image;
+  $("create-setup").value = start.setup_script;
+  $("create-instructions").value = start.instructions;
+  $("create-image").placeholder = imageName("");
+  if ($("create-repo").value) loadBranches($("create-repo").value);
+  updateCreateSummary();
+}
+
+// createValues are the New workspace dialog's configuration fields.
+function createValues() {
+  return {
+    repo: Sections.cleanRepo($("create-repo").value),
+    base: $("create-base").value.trim(),
+    model: $("create-model").value,
+    image: $("create-image").value.trim(),
+    setup_script: $("create-setup").value,
+    instructions: $("create-instructions").value,
+  };
+}
+
+// updateCreateSummary says, in the New workspace dialog, what the chosen
+// section gives the workspace and what has been changed for this one, and
+// sums up the collapsed parts.
+function updateCreateSummary() {
+  const v = createValues();
+  $("create-env-summary").textContent = "· " + imageName(v.image) + (v.setup_script.trim() ? " · setup script" : " · no setup script");
+  const lines = v.instructions.trim() ? v.instructions.trim().split("\n").length : 0;
+  $("create-instr-summary").textContent = lines ? `· ${lines} line${lines === 1 ? "" : "s"}` : "· none";
+  const sec = createSection();
+  const p = $("create-inherit");
+  p.classList.toggle("hidden", !sec);
+  if (!sec) return;
+  const start = Sections.startingPoint(sec, state.settings);
+  const labels = { repo: "repository", base: "base branch", model: "model", image: "image", setup_script: "setup script", instructions: "instructions" };
+  const changed = Sections.changed(start, v);
+  const parts = [start.repo || "any repository", start.base || "default branch", modelName(start.model), imageName(start.image)];
+  if (start.setup_script) parts.push("setup script");
+  if (start.instructions) parts.push("agent instructions");
+  p.replaceChildren(
+    h("span", { class: "muted", text: "From " }),
+    h("strong", { text: sec.name }),
+    h("span", { class: "muted", text: ": " + parts.join(" · ") }),
+    changed.length ? h("span", { class: "changed", text: " · changed for this workspace: " + changed.map((f) => labels[f]).join(", ") }) : null,
+  );
+}
+
+// branchesFor is the repository whose branches each branch list shows.
+const branchesFor = new Map();
+// loadBranches offers the repository's branches in a base branch field: the
+// New workspace dialog's, or the section dialog's.
+async function loadBranches(repo, listId = "branch-options", inputId = "create-base") {
+  repo = Sections.cleanRepo(repo);
+  if (!/^[\w.-]+\/[\w.-]+$/.test(repo) || repo === branchesFor.get(listId)) return;
+  branchesFor.set(listId, repo);
+  const list = $(listId);
   list.replaceChildren();
   const known = (state.repos || []).find((r) => r.full_name.toLowerCase() === repo.toLowerCase());
-  $("create-base").placeholder = known ? `${known.default_branch} (default)` : "default branch";
+  $(inputId).placeholder = known ? `${known.default_branch} (default)` : "default branch";
   try {
     const { branches } = await api("GET", `/github/repos/${repo}/branches`);
-    if (branchesFor === repo) list.replaceChildren(...branches.map((b) => h("option", { value: b })));
+    if (branchesFor.get(listId) === repo) list.replaceChildren(...branches.map((b) => h("option", { value: b })));
   } catch (e) {
     /* the create request reports a bad repository */
   }
-}
-
-// updateEnvSummary says what the New workspace dialog's sandbox
-// environment is while it is collapsed.
-function updateEnvSummary() {
-  const image = $("create-image").value.trim();
-  const setup = $("create-setup").value.trim();
-  $("create-env-summary").textContent = "· " + imageName(image) + (setup ? " · setup script" : " · no setup script");
 }
 
 function setCreating(on) {
@@ -1304,6 +1615,8 @@ function setCreating(on) {
   $("create-prompt").disabled = on;
   $("create-image").disabled = on;
   $("create-setup").disabled = on;
+  $("create-section").disabled = on;
+  $("create-instructions").disabled = on;
 }
 
 // createSeq identifies the dialog's current use: each create request and
@@ -1314,12 +1627,10 @@ let createSeq = 0;
 
 async function submitCreate(ev) {
   ev.preventDefault();
-  const repo = $("create-repo").value.trim().replace(/^https:\/\/github\.com\//, "").replace(/\.git$/, "").replace(/\/$/, "");
-  const base = $("create-base").value.trim();
-  const model = $("create-model").value;
+  const values = createValues();
+  const repo = values.repo;
   const prompt = $("create-prompt").value.trim();
-  const image = $("create-image").value.trim();
-  const setupScript = $("create-setup").value;
+  const sec = createSection();
   if (!repo) return;
   const err = $("create-error");
   err.classList.add("hidden");
@@ -1347,19 +1658,11 @@ async function submitCreate(ev) {
     select(fresh.name);
   }, 1000);
   try {
-    const body = { repo };
-    if (base) body.base = base;
-    if (model) body.model = model;
-    if (prompt) body.prompt = prompt;
-    // What the dialog shows, defaults included: empty means none. Without
-    // the settings the fields were not prefilled, so the server's
-    // defaults apply.
-    if (state.settings) {
-      body.image = image;
-      body.setup_script = setupScript;
-    }
+    // What the dialog shows, the section's values and defaults included:
+    // empty means none.
+    const body = Sections.createBody(sec ? sec.id : null, { ...values, prompt }, !!state.settings);
     const ws = await api("POST", "/workspaces", body);
-    localStorage.setItem("mosso.lastRepo", repo);
+    if (!sec) localStorage.setItem("mosso.lastRepo", repo);
     if (!current()) {
       await refreshList(); // listed; the dialog belongs to a newer use
       return;
@@ -1398,8 +1701,20 @@ async function submitCreate(ev) {
 // ---------- wiring ----------
 
 function init() {
-  $("new-workspace").addEventListener("click", openCreate);
-  $("empty-new").addEventListener("click", openCreate);
+  $("new-workspace").addEventListener("click", () => openCreate());
+  $("empty-new").addEventListener("click", () => openCreate());
+  $("create-section").addEventListener("change", fillCreate);
+  for (const id of ["create-repo", "create-base", "create-model", "create-image", "create-setup", "create-instructions"]) {
+    $(id).addEventListener("input", updateCreateSummary);
+    $(id).addEventListener("change", updateCreateSummary);
+  }
+  $("ws-section").addEventListener("change", moveWorkspace);
+  $("section-form").addEventListener("submit", submitSection);
+  $("section-cancel").addEventListener("click", () => $("section-dialog").close());
+  $("section-duplicate").addEventListener("click", duplicateSection);
+  $("section-delete").addEventListener("click", deleteSection);
+  $("section-repo").addEventListener("change", (e) => loadBranches(e.target.value, "section-branch-options", "section-base"));
+  for (const id of ["section-image", "section-setup"]) $(id).addEventListener("input", updateSectionEnvSummary);
   $("create-form").addEventListener("submit", submitCreate);
   $("create-cancel").addEventListener("click", () => $("create-dialog").close());
   $("create-prompt").addEventListener("keydown", (e) => {
@@ -1424,8 +1739,6 @@ function init() {
   $("github-form").addEventListener("submit", submitGitHub);
   $("settings-form").addEventListener("submit", submitSettings);
   $("settings-cancel").addEventListener("click", () => $("settings-dialog").close());
-  $("create-image").addEventListener("input", updateEnvSummary);
-  $("create-setup").addEventListener("input", updateEnvSummary);
   $("github-cancel").addEventListener("click", closeGitHub);
   $("github-dialog").addEventListener("close", () => ($("github-token").value = ""));
   $("stop").addEventListener("click", stopTurn);

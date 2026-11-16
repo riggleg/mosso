@@ -24,6 +24,8 @@ Each workspace runs Claude Code with the Claude model you pick when creating it 
 
 New workspaces can get a **custom sandbox environment**: a Bash **setup script** that runs once after the clone (install system packages, mise, languages and tools), and/or a **custom image** from Vercel Container Registry to boot the sandbox from. Both have defaults in the web UI's settings and can be changed per workspace. See [docs/sandbox-environment.md](docs/sandbox-environment.md).
 
+Workspaces are grouped into **sections** in the sidebar, Conductor-style: a section (say *Perx API*) has a repository, base branch, model, sandbox environment and **agent instructions** that new workspaces in it start from, and that you can change per workspace. The instructions are added to Claude's system prompt on every turn. Each workspace keeps the configuration it was created with, and can be moved between sections. See [docs/sections.md](docs/sections.md), which also describes what Claude can and cannot do on GitHub (it cannot push or open pull requests itself).
+
 Chat messages can carry screenshots and files: paste with Cmd+V, drag them in or use the paperclip; Claude sees images visually. See [docs/attachments.md](docs/attachments.md) for how it works and the browser clipboard limitations.
 
 See [docs/mup.md](docs/mup.md) for the first milestone and [SECURITY.md](SECURITY.md) for credential handling rules. Pull requests are reviewed automatically by Claude Code; see [docs/claude-review.md](docs/claude-review.md) for setup.

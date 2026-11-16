@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/riggleg/mosso/internal/claude"
@@ -82,8 +83,8 @@ func (s *Server) Restore(ctx context.Context, dbPath, legacyDir string) error {
 		st.close()
 		return fmt.Errorf("load workspaces: %w", err)
 	}
-	var model, image, script string
-	for key, v := range map[string]*string{settingDefaultModel: &model, settingDefaultImage: &image, settingDefaultSetupScript: &script} {
+	var model, image, script, defaultSection string
+	for key, v := range map[string]*string{settingDefaultModel: &model, settingDefaultImage: &image, settingDefaultSetupScript: &script, settingDefaultSection: &defaultSection} {
 		if *v, err = st.setting(key); err != nil {
 			st.close()
 			return fmt.Errorf("load settings: %w", err)
@@ -92,6 +93,9 @@ func (s *Server) Restore(ctx context.Context, dbPath, legacyDir string) error {
 	s.mu.Lock()
 	s.store = st
 	s.defaultImage, s.defaultSetupScript = image, script
+	// Deleting a section clears the setting; anything else unreadable
+	// means no default.
+	s.defaultSection, _ = strconv.ParseInt(defaultSection, 10, 64)
 	switch {
 	case claude.KnownModel(model):
 		s.defaultModel = model
@@ -136,7 +140,7 @@ func (s *Server) Restore(ctx context.Context, dbPath, legacyDir string) error {
 func (s *Server) loadWorkspace(rec workspaceRecord) (*workspace, error) {
 	ws := &workspace{
 		Name: rec.Name, Repo: rec.Repo, Base: rec.Base, BaseSHA: rec.BaseSHA, Branch: rec.Branch, Dir: rec.Dir, Model: rec.Model,
-		Image: rec.Image, SetupScript: rec.SetupScript,
+		Image: rec.Image, SetupScript: rec.SetupScript, Instructions: rec.Instructions, SectionID: rec.SectionID,
 		Sandbox: rec.Sandbox, ExpiresAt: rec.ExpiresAt, PullRequest: rec.PullRequest, CreatedAt: rec.CreatedAt,
 		ArchivedAt:   rec.ArchivedAt,
 		chat:         newChat(),
@@ -577,8 +581,9 @@ func (s *Server) saveLocked(ws *workspace) error {
 	}
 	rec := workspaceRecord{
 		Name: ws.Name, Repo: ws.Repo, Base: ws.Base, Branch: ws.Branch, Model: ws.Model,
-		Image: ws.Image, SetupScript: ws.SetupScript, SandboxState: ws.sandboxState,
-		CreatedAt: ws.CreatedAt, ArchivedAt: ws.ArchivedAt,
+		Image: ws.Image, SetupScript: ws.SetupScript, Instructions: ws.Instructions, SectionID: ws.SectionID,
+		SandboxState: ws.sandboxState,
+		CreatedAt:    ws.CreatedAt, ArchivedAt: ws.ArchivedAt,
 		workspaceState: workspaceState{
 			BaseSHA: ws.BaseSHA, Dir: ws.Dir, Sandbox: ws.Sandbox, ExpiresAt: ws.ExpiresAt, PullRequest: ws.PullRequest,
 			Pushed: ws.pushed, SessionID: ws.chat.sessionID, LastSeq: ws.lastSeq, TaskRunning: ws.taskRunning,

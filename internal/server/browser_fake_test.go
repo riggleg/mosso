@@ -28,7 +28,10 @@ import (
 // refuse updates, to look at a termination that cannot be saved.
 // MOSSO_FAKE_SCENARIO=setup configures a default image and setup script
 // whose output new workspaces show; with MOSSO_FAKE_SETUP_FAIL=1 the
-// script fails, to look at how that is reported.
+// script fails, to look at how that is reported. MOSSO_FAKE_SCENARIO=sections
+// creates sections (one of them the default) with workspaces in them, an
+// unsectioned one and one in the history, to look at the sidebar's
+// sections and the New workspace dialog.
 func TestServeFakeForBrowser(t *testing.T) {
 	addr := os.Getenv("MOSSO_FAKE_ADDR")
 	if addr == "" {
@@ -87,6 +90,9 @@ func TestServeFakeForBrowser(t *testing.T) {
 			t.Logf("workspace %s: %q", ws.Name, prompt)
 		}
 	}
+	if scenario == "sections" {
+		fakeSections(t, srv.Handler())
+	}
 	switch scenario {
 	case "novercel":
 		// The same database, opened by a server with no Vercel client.
@@ -121,4 +127,30 @@ func TestServeFakeForBrowser(t *testing.T) {
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, os.Interrupt)
 	<-c
+}
+
+// fakeSections fills a fake Mosso with sections and workspaces in them.
+func fakeSections(t *testing.T, h http.Handler) {
+	const perxInstructions = "Follow the repository's existing conventions and run relevant tests. When implementation is complete, create pull requests targeting both master and uat. Handle branch differences as appropriate."
+	mosso := createSection(t, h, map[string]string{"name": "Mosso", "repo": "octo/widgets", "model": "claude-opus-5-5", "setup_script": "curl https://mise.run | sh\nmise trust && mise install\n", "instructions": "Run go vet and go test ./... before finishing."})
+	perx := createSection(t, h, map[string]string{"name": "Perx API", "repo": "octo/widgets", "base": "main", "model": "claude-sonnet-5-5", "instructions": perxInstructions})
+	layer6 := createSection(t, h, map[string]string{"name": "Perx API Layer 6", "repo": "octo/widgets", "base": "dev", "model": "claude-fable-5-2", "instructions": "Layer 6 only: keep changes inside the layer6 module."})
+	do(t, h, http.MethodPost, "/settings", `{"default_section_id":`+sid(perx.ID)+`}`)
+	for _, w := range []struct {
+		section int64
+		prompt  string
+		end     bool
+	}{
+		{perx.ID, "Add pagination to the vouchers endpoint", false},
+		{perx.ID, "Fix the flaky rewards spec", false},
+		{mosso.ID, "Add workspace sections", false},
+		{0, "Tidy the Makefile", false},
+		{layer6.ID, "Upgrade the layer 6 client", true},
+	} {
+		ws := createSectionWorkspace(t, h, `{"section_id":`+sid(w.section)+`,"repo":"octo/widgets"}`)
+		do(t, h, http.MethodPost, "/workspaces/"+ws.Name+"/claude/messages", `{"prompt":"`+w.prompt+`"}`)
+		if w.end {
+			do(t, h, http.MethodDelete, "/workspaces/"+ws.Name, "")
+		}
+	}
 }

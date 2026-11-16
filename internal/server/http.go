@@ -84,6 +84,9 @@ type Server struct {
 	// for the built-in runtime and no setup. Saved in the database.
 	defaultImage       string
 	defaultSetupScript string
+	// defaultSection is the section the web UI preselects for new
+	// workspaces, 0 for none. Saved in the database.
+	defaultSection int64
 	// memoryToken is a GitHub token pasted into the web UI on a system
 	// without a Keychain. It lasts until Mosso stops and takes precedence
 	// over MOSSO_GITHUB_TOKEN.
@@ -139,6 +142,12 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /github/auth", s.githubConnect)
 	mux.HandleFunc("GET /settings", s.getSettings)
 	mux.HandleFunc("POST /settings", s.updateSettings)
+	// Sections only need the database, like the history below.
+	mux.HandleFunc("GET /sections", s.listSections)
+	mux.HandleFunc("POST /sections", s.createSection)
+	mux.HandleFunc("PATCH /sections/{id}", s.updateSection)
+	mux.HandleFunc("DELETE /sections/{id}", s.deleteSection)
+	mux.HandleFunc("POST /sections/{id}/duplicate", s.duplicateSection)
 	// Reading saved workspaces and their conversations, and archiving,
 	// only need the database, so they work without Vercel credentials.
 	// Everything that touches a sandbox requires them.
@@ -147,6 +156,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /workspaces/{name}/events", s.workspaceEvents)
 	mux.HandleFunc("POST /workspaces/{name}/archive", s.archiveWorkspace(true))
 	mux.HandleFunc("POST /workspaces/{name}/unarchive", s.archiveWorkspace(false))
+	mux.HandleFunc("POST /workspaces/{name}/section", s.moveWorkspace)
 	mux.HandleFunc("POST /workspaces", s.requireVercel(s.createWorkspace))
 	mux.HandleFunc("POST /workspaces/{name}/claude/messages", s.requireVercel(s.workspaceClaudeMessage))
 	mux.HandleFunc("POST /workspaces/{name}/pull-request", s.requireVercel(s.workspacePullRequest))
@@ -187,8 +197,9 @@ func isLoopbackHost(host string) bool {
 
 // localOnly protects the unauthenticated API from browsers: it rejects
 // requests whose Host is not loopback (DNS rebinding), cross-origin requests
-// from non-loopback pages, and POSTs without a JSON content type (which would
-// otherwise be "simple" cross-site requests sent without a CORS preflight).
+// from non-loopback pages, and POSTs and PATCHes without a JSON content type
+// (a POST would otherwise be a "simple" cross-site request sent without a
+// CORS preflight).
 func localOnly(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		host := r.Host
@@ -206,7 +217,7 @@ func localOnly(next http.Handler) http.Handler {
 				return
 			}
 		}
-		if r.Method == http.MethodPost {
+		if r.Method == http.MethodPost || r.Method == http.MethodPatch {
 			mt, _, _ := mime.ParseMediaType(r.Header.Get("Content-Type"))
 			// Uploads are multipart; the Host and Origin checks above
 			// still apply to them.

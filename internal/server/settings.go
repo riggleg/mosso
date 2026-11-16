@@ -31,6 +31,10 @@ type settings struct {
 	// BuiltInRuntime is what a workspace without an image runs, for the
 	// web UI to say so.
 	BuiltInRuntime string `json:"built_in_runtime"`
+	// DefaultSectionID is the section the New workspace dialog
+	// preselects; 0 for none. Creating a workspace through the API never
+	// puts it in a section unless the request names one.
+	DefaultSectionID int64 `json:"default_section_id"`
 }
 
 func (s *Server) currentSettings() settings {
@@ -39,7 +43,7 @@ func (s *Server) currentSettings() settings {
 	return settings{
 		DefaultModel: s.defaultModel, Models: claude.Models,
 		DefaultImage: s.defaultImage, DefaultSetupScript: s.defaultSetupScript,
-		BuiltInRuntime: vercel.DefaultRuntime,
+		BuiltInRuntime: vercel.DefaultRuntime, DefaultSectionID: s.defaultSection,
 	}
 }
 
@@ -56,12 +60,14 @@ const maxSettingsBytes = 2*maxSetupScriptBytes + 4096
 // updateSettings changes the settings given in the body (the others stay
 // as they are) and saves them in the database, all or nothing, so they
 // survive restarts. It fails if they cannot be saved. Existing workspaces
-// keep their model, image and setup script.
+// keep their model, image and setup script. The default section is for the
+// web UI only; see settings.DefaultSectionID.
 func (s *Server) updateSettings(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		DefaultModel       *string `json:"default_model"`
 		DefaultImage       *string `json:"default_image"`
 		DefaultSetupScript *string `json:"default_setup_script"`
+		DefaultSectionID   *int64  `json:"default_section_id"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxSettingsBytes)).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid JSON body")
@@ -91,11 +97,35 @@ func (s *Server) updateSettings(w http.ResponseWriter, r *http.Request) {
 		}
 		changes[settingDefaultSetupScript] = script
 	}
+	if req.DefaultSectionID != nil {
+		if *req.DefaultSectionID < 0 {
+			writeError(w, http.StatusBadRequest, "default_section_id must be a section's ID, or 0 for none")
+			return
+		}
+		changes[settingDefaultSection] = formatSectionID(*req.DefaultSectionID)
+	}
 	if len(changes) == 0 {
-		writeError(w, http.StatusBadRequest, "set default_model, default_image or default_setup_script")
+		writeError(w, http.StatusBadRequest, "set default_model, default_image, default_setup_script or default_section_id")
 		return
 	}
 	s.mu.Lock()
+	if id := req.DefaultSectionID; id != nil && *id != 0 {
+		// Checked under the lock, so the section cannot be deleted before
+		// the setting is saved.
+		var err error = errNoSection
+		if s.store != nil {
+			_, err = s.store.section(*id)
+		}
+		if err != nil {
+			s.mu.Unlock()
+			if errors.Is(err, errNoSection) {
+				writeError(w, http.StatusBadRequest, "default_section_id: no such section")
+			} else {
+				writeSectionError(w, "read the section", err)
+			}
+			return
+		}
+	}
 	if s.store != nil {
 		if err := s.store.setSettings(changes); err != nil {
 			s.mu.Unlock()
@@ -115,6 +145,9 @@ func (s *Server) updateSettings(w http.ResponseWriter, r *http.Request) {
 		case settingDefaultSetupScript:
 			s.defaultSetupScript = v
 			log.Printf("default setup script: %d bytes", len(v))
+		case settingDefaultSection:
+			s.defaultSection = *req.DefaultSectionID
+			log.Printf("default section: %d", s.defaultSection)
 		}
 	}
 	s.mu.Unlock()

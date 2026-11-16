@@ -22,7 +22,8 @@ and workspaces are created exactly as before.
 - **Defaults.** In the sidebar footer, click **Change** next to *Sandbox*
   (or *Model*). The *Settings for new workspaces* dialog has the default
   model, sandbox image and setup script. Changing them never affects
-  existing workspaces.
+  existing workspaces. A [section](sections.md) can have its own image and
+  setup script instead, used for workspaces created in it.
 - **One workspace.** The **+ New** dialog has a collapsed *Sandbox
   environment* section, prefilled with the defaults. Edit the image or the
   script for this workspace only, or clear them for none.
