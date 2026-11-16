@@ -35,6 +35,50 @@ money can be hidden in the archive.
 A workspace whose setup fails (or that is destroyed while it is being set
 up) never worked, and leaves no history.
 
+### Without Vercel credentials
+
+The history only needs the database. If Mosso starts without
+`VERCEL_TOKEN`, `VERCEL_TEAM_ID` and `VERCEL_PROJECT_ID`, it still loads
+every saved workspace, and you can list them, read their conversations and
+archive or unarchive terminated ones: `GET /workspaces`,
+`GET /workspaces/{name}`, `GET /workspaces/{name}/events` and
+`POST /workspaces/{name}/archive|unarchive` work as usual.
+
+Workspaces that still have a sandbox are shown as Mosso last saved them
+and are read-only: they are not reconnected, so their status is not
+checked against Vercel, and creating, messaging, resuming, publishing and
+terminating answer `503`. The web UI says so (the Vercel check in the
+sidebar reads "not configured · read-only", from `GET /vercel/auth`) and
+disables those controls. Nothing is changed in the database, so the next
+start with credentials reconnects them as usual.
+
+### If the database cannot be written
+
+Creating, terminating and archiving do not report success unless the
+result is saved:
+
+- **Create.** The workspace record and the chat from setup are saved in
+  one transaction before the workspace is reported as created. If that
+  fails, the request answers `500`, nothing is saved, and the new sandbox
+  is destroyed: otherwise it would keep running where a restarted Mosso
+  would not know about it.
+- **Terminate.** The sandbox is deleted first, so nothing is left running
+  whatever happens next. If the termination then cannot be saved, the
+  request answers `500` and says that the sandbox is deleted but the result
+  is not saved. The workspace shows as terminated and `unsaved`, with a
+  **Save again** button; `DELETE /workspaces/{name}` again saves it without
+  touching Vercel. Mosso also tries once more when it shuts down. If none
+  of that succeeds, the next start finds no sandbox and shows the workspace
+  as gone, with its conversation.
+- **Archive, unarchive.** If the change cannot be saved, the request
+  answers `500` and the workspace stays as it was.
+
+Other saves happen in the background, with nobody waiting on them (chat
+entries as Claude works, a session ending). A failure there is logged and
+the workspace is marked `unsaved` (the web UI shows a warning) until a
+later save succeeds. Nothing is dropped meanwhile: every save writes all
+the chat entries that are not in the database yet, in order.
+
 There is no button to delete a workspace's history. To remove one, stop
 Mosso and delete its rows (the name is in the URL after `#`):
 
@@ -123,16 +167,19 @@ database with a higher version than the running Mosso knows is refused.
 
 ## Startup
 
-On start Mosso opens the database, applies migrations and loads every
-workspace:
+On start Mosso opens the database and applies migrations. Then it does two
+separate things (`Restore` in `internal/server/restore.go`):
 
-- **Terminated** workspaces are listed at once. They have no sandbox, so
-  Vercel is not asked about them, and their conversation is only read from
-  the database when you open one.
-- **The others** are reconciled with Vercel in the background, as described
-  in [worker.md](worker.md#lifecycle): running sandboxes are followed again,
-  stopped ones stay stopped (or are resumed to catch up on an interrupted
-  task), and ones that no longer exist become `gone`.
+1. **Load.** Every workspace is loaded from the database as last saved and
+   listed. This needs no credentials. Terminated workspaces have no
+   sandbox, and their conversation is only read from the database when you
+   open one.
+2. **Reconnect.** With Vercel configured, the workspaces that have a
+   sandbox are reconciled with it in the background, as described in
+   [worker.md](worker.md#lifecycle): running sandboxes are followed again,
+   stopped ones stay stopped (or are resumed to catch up on an interrupted
+   task), and ones that no longer exist become `gone`. Without Vercel this
+   step is skipped; see [Without Vercel credentials](#without-vercel-credentials).
 
 ### Workspaces saved by earlier versions
 
@@ -166,6 +213,17 @@ uploads and publishing; terminating mid-task ends the turn; archiving
 (refused while a sandbox exists, kept across a restart, undone by
 unarchive); and a failed setup saves nothing.
 
+`save_failure_test.go` makes the database refuse writes (with a trigger,
+like a full disk) and checks that a create fails, destroys its sandbox and
+saves nothing; that a terminate reports the unsaved result, deletes the
+sandbox once, and succeeds when retried; that an unsaved termination shows
+as gone after a restart; that a failed archive is not shown as done; and
+that chat entries whose save failed are written later, in order. It also
+runs Mosso without a Vercel client over a database with a terminated
+workspace and one that has a sandbox: both are listed and replayed,
+archiving works, everything that needs a sandbox answers `503`, and a
+later start with Vercel reconnects.
+
 To look at the History and Archived sections in a browser without any
 accounts:
 
@@ -173,3 +231,7 @@ accounts:
 MOSSO_FAKE_ADDR=127.0.0.1:8099 MOSSO_FAKE_SCENARIO=history \
   go test ./internal/server -run TestServeFakeForBrowser -timeout 1h
 ```
+
+`MOSSO_FAKE_SCENARIO=novercel` serves the same workspaces from a Mosso
+without Vercel credentials, and `MOSSO_FAKE_SCENARIO=unsaved` makes the
+database refuse updates, to see a termination that cannot be saved.

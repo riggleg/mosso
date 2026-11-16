@@ -123,13 +123,20 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /sandboxes", s.requireVercel(s.createSandbox))
 	mux.HandleFunc("POST /sandboxes/{name}/exec", s.requireVercel(s.execSandbox))
 	mux.HandleFunc("DELETE /sandboxes/{name}", s.requireVercel(s.destroySandbox))
+	mux.HandleFunc("GET /vercel/auth", s.vercelAuthStatus)
 	mux.HandleFunc("GET /claude/auth", s.claudeAuthStatus)
 	mux.HandleFunc("POST /sandboxes/{name}/claude/messages", s.requireVercel(s.claudeMessage))
 	mux.HandleFunc("GET /github/auth", s.githubAuthStatus)
 	mux.HandleFunc("POST /github/auth", s.githubConnect)
-	mux.HandleFunc("GET /workspaces", s.requireVercel(s.listWorkspaces))
+	// Reading saved workspaces and their conversations, and archiving,
+	// only need the database, so they work without Vercel credentials.
+	// Everything that touches a sandbox requires them.
+	mux.HandleFunc("GET /workspaces", s.listWorkspaces)
+	mux.HandleFunc("GET /workspaces/{name}", s.getWorkspace)
+	mux.HandleFunc("GET /workspaces/{name}/events", s.workspaceEvents)
+	mux.HandleFunc("POST /workspaces/{name}/archive", s.archiveWorkspace(true))
+	mux.HandleFunc("POST /workspaces/{name}/unarchive", s.archiveWorkspace(false))
 	mux.HandleFunc("POST /workspaces", s.requireVercel(s.createWorkspace))
-	mux.HandleFunc("GET /workspaces/{name}", s.requireVercel(s.getWorkspace))
 	mux.HandleFunc("POST /workspaces/{name}/claude/messages", s.requireVercel(s.workspaceClaudeMessage))
 	mux.HandleFunc("POST /workspaces/{name}/pull-request", s.requireVercel(s.workspacePullRequest))
 	mux.HandleFunc("DELETE /workspaces/{name}", s.requireVercel(s.destroySandbox))
@@ -138,9 +145,6 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /workspaces/{name}/attachments/{id}", s.requireVercel(s.downloadAttachment))
 	mux.HandleFunc("POST /workspaces/{name}/chat/stop", s.requireVercel(s.workspaceStop))
 	mux.HandleFunc("POST /workspaces/{name}/connect", s.requireVercel(s.workspaceConnect))
-	mux.HandleFunc("POST /workspaces/{name}/archive", s.requireVercel(s.archiveWorkspace(true)))
-	mux.HandleFunc("POST /workspaces/{name}/unarchive", s.requireVercel(s.archiveWorkspace(false)))
-	mux.HandleFunc("GET /workspaces/{name}/events", s.requireVercel(s.workspaceEvents))
 	mux.HandleFunc("GET /github/repos", s.githubRepos)
 	mux.HandleFunc("GET /github/repos/{owner}/{repo}/branches", s.githubBranches)
 	ui := webUI()
@@ -214,6 +218,13 @@ func (s *Server) requireVercel(h http.HandlerFunc) http.HandlerFunc {
 		}
 		h(w, r)
 	}
+}
+
+// vercelAuthStatus reports whether Vercel Sandbox credentials are
+// configured, so the web UI can say why workspaces are read-only. It never
+// returns them.
+func (s *Server) vercelAuthStatus(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{"configured": s.vercel != nil})
 }
 
 func (s *Server) listSandboxes(w http.ResponseWriter, _ *http.Request) {
@@ -345,6 +356,12 @@ func (s *Server) execSandbox(w http.ResponseWriter, r *http.Request) {
 // Mosso, with its conversation, as history (see terminateLocked); one that
 // is still being set up is removed altogether. The branch and pull request
 // stay on GitHub.
+//
+// It only reports success once the termination is saved. If the sandbox
+// was deleted but that could not be saved, it answers 500 and says so;
+// calling it again saves it. (Left unsaved, the workspace would show as
+// "gone" after a restart, when Mosso finds no sandbox: the conversation is
+// kept either way and nothing is left running.)
 func (s *Server) destroySandbox(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	s.mu.Lock()
@@ -354,14 +371,22 @@ func (s *Server) destroySandbox(w http.ResponseWriter, r *http.Request) {
 		ws.follower() // stop following before the session goes away
 		ws.follower = nil
 	}
+	var saveErr error
+	if !ok && ws != nil && ws.unsaved {
+		// Already terminated, so there is no sandbox left to delete, but an
+		// earlier attempt could not save that: try again.
+		saveErr = s.saveLocked(ws)
+	}
 	s.mu.Unlock()
 	if !ok {
-		if ws != nil {
-			// Already terminated: there is no sandbox left to delete.
+		switch {
+		case ws == nil:
+			writeError(w, http.StatusNotFound, "unknown sandbox")
+		case saveErr != nil:
+			s.terminateUnsaved(w, name, saveErr)
+		default:
 			w.WriteHeader(http.StatusNoContent)
-			return
 		}
-		writeError(w, http.StatusNotFound, "unknown sandbox")
 		return
 	}
 	// Finish cleanup even if the client disconnects.
@@ -374,42 +399,57 @@ func (s *Server) destroySandbox(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mu.Lock()
 	if cur := s.workspaces[name]; cur != nil && cur == ws && !ws.creating {
-		s.terminateLocked(ws)
+		saveErr = s.terminateLocked(ws)
 	} else {
 		s.forgetLocked(name)
 	}
 	s.mu.Unlock()
 	log.Printf("destroyed sandbox %s", sb.Name)
+	if saveErr != nil {
+		s.terminateUnsaved(w, name, saveErr)
+		return
+	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// terminateUnsaved answers a terminate whose sandbox is deleted but whose
+// outcome could not be saved.
+func (s *Server) terminateUnsaved(w http.ResponseWriter, name string, err error) {
+	log.Printf("workspace %s: terminated, but not saved: %v", name, err)
+	writeError(w, http.StatusInternalServerError,
+		"the sandbox and its snapshots were deleted, but Mosso could not save that the workspace is terminated: "+err.Error()+
+			". Terminate it again to save it; if Mosso restarts first, the workspace shows as gone, with its conversation.")
 }
 
 // terminateLocked records that the workspace's sandbox has been deleted.
 // The workspace and its conversation stay, in memory and in the database,
 // as history: it can be read and archived, but nothing runs in it any
-// more. Call with s.mu held.
-func (s *Server) terminateLocked(ws *workspace) {
+// more. It returns an error if that could not be saved; the workspace is
+// terminated in memory regardless, because its sandbox no longer exists.
+// Call with s.mu held.
+func (s *Server) terminateLocked(ws *workspace) error {
 	delete(s.sandboxes, ws.Name)
 	delete(s.claudeInstalled, ws.Name)
 	if ws.follower != nil {
 		ws.follower()
 		ws.follower = nil
 	}
+	ws.sandboxState = sandboxTerminated
+	ws.Sandbox.Status = "stopped"
+	ws.ExpiresAt = time.Time{}
 	if ws.taskRunning {
 		if run := ws.chat.running; run != nil {
 			run.err = errors.New("the workspace was terminated")
 		}
 		s.finishTurnLocked(ws, ws.chat.running)
 	}
-	ws.sandboxState = sandboxTerminated
-	ws.Sandbox.Status = "stopped"
-	ws.ExpiresAt = time.Time{}
 	ws.chat.err = ""
 	ws.chat.add(chatEntry{Type: "notice", Text: "Workspace terminated: its sandbox and snapshots were deleted. This conversation is kept as history."})
-	s.persistLocked(ws)
 	if ws.git != nil {
 		s.closeGit(ws.Name, ws.git)
 		ws.git = nil
 	}
+	return s.saveLocked(ws)
 }
 
 // closeGit removes a workspace's server-side Git repository in the
@@ -522,6 +562,13 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		s.persistLocked(ws)
 		if ws.git != nil {
 			s.closeGit(name, ws.git) // the server-side Git repository is recreated on demand
+		}
+	}
+	// One more try for workspaces whose last save failed (for example a
+	// terminated one, which has no sandbox to be listed under above).
+	for name, ws := range s.workspaces {
+		if _, hasSandbox := s.sandboxes[name]; !hasSandbox && ws.unsaved {
+			s.persistLocked(ws)
 		}
 	}
 	s.mu.Unlock()

@@ -45,8 +45,11 @@ type chat struct {
 	err     string   // why the last turn or publish failed
 	size    int      // approximate bytes held by entries
 	full    bool     // size reached maxChatBytes
-	// persist, if set, is called with each appended entry.
-	persist func(chatEntry)
+	// persist, if set, is called after an entry is appended, to save it.
+	persist func()
+	// saved is how many of the entries are in the database. Saving writes
+	// the rest, so an entry whose save failed goes out with the next one.
+	saved int
 	// unloaded says entries has not been read from the database yet: the
 	// chat of a terminated workspace is only loaded when it is opened.
 	unloaded bool
@@ -62,6 +65,7 @@ func (c *chat) notify() {
 // load replaces the entries with ones read from the database.
 func (c *chat) load(entries []chatEntry) {
 	c.entries = entries
+	c.saved = len(entries)
 	c.size, c.full = 0, false
 	for _, e := range entries {
 		c.size += entrySize(e)
@@ -106,7 +110,7 @@ func (c *chat) append(e chatEntry) *chatEntry {
 	}
 	c.entries = append(c.entries, e)
 	if c.persist != nil {
-		c.persist(e)
+		c.persist()
 	}
 	c.notify()
 	return &c.entries[len(c.entries)-1]

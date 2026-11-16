@@ -131,7 +131,8 @@ These come in addition to the endpoints in [github.md](github.md) and
 | `POST /workspaces/{name}/attachments`      | Multipart upload into the sandbox; see [attachments.md](attachments.md). `GET /workspaces/{name}/attachments/{id}` reads one back. |
 | `POST /workspaces/{name}/chat/stop`        | Stops the running turn (`202`); `409` if Claude is not running. |
 | `POST /workspaces/{name}/connect`          | Resumes a stopped sandbox, restarts the worker and catches up on events; returns the workspace. `410` if the sandbox is gone or the workspace was terminated. |
-| `POST /workspaces/{name}/archive`, `POST /workspaces/{name}/unarchive` | Archives a terminated workspace, or brings it back; returns the workspace. `409` if the workspace still has a sandbox (terminate it first). |
+| `POST /workspaces/{name}/archive`, `POST /workspaces/{name}/unarchive` | Archives a terminated workspace, or brings it back; returns the workspace. `409` if the workspace still has a sandbox (terminate it first); `500` if the change could not be saved (it is then not made). |
+| `GET /vercel/auth`                         | `{"configured": true}` if Vercel Sandbox credentials are set. Without them, the endpoints that only read saved workspaces (`GET /workspaces`, `GET /workspaces/{name}`, `GET …/events`) and the archive endpoints still work; everything that needs a sandbox answers `503`. See [history.md](history.md#without-vercel-credentials). |
 | `GET /workspaces/{name}/events`            | Server-sent events, see below. |
 | `GET /github/repos`                        | `{"repos": [{"full_name", "default_branch", "private"}]}`: up to 100 repositories the GitHub token can access, most recently pushed first. |
 | `GET /github/repos/{owner}/{repo}/branches`| `{"branches": ["main", …]}`: up to 100 branches. |
@@ -150,10 +151,14 @@ These come in addition to the endpoints in [github.md](github.md) and
 
 `status` is `creating`, `connecting` (Mosso restarted and is checking the
 sandbox), `ready`, `working` (Claude or a publish is running), `stopped`
-(the sandbox session ended; the next message resumes it) or `error` (the
-last turn or publish failed, or the sandbox is gone; `error` says why).
-`sandbox_state` is `running`, `stopped` or `gone`; `expires_at`, the end of
-the current session, is omitted while the sandbox is stopped. Workspace
+(the sandbox session ended; the next message resumes it), `terminated`
+(history: the sandbox was deleted) or `error` (the last turn or publish
+failed, or the sandbox is gone; `error` says why).
+`sandbox_state` is `running`, `stopped`, `gone` or `terminated`;
+`expires_at`, the end of the current session, is omitted while the sandbox
+is stopped. `archived_at` is set while the workspace is archived, and
+`"unsaved": true` while Mosso's last attempt to save the workspace failed
+(see [history.md](history.md#if-the-database-cannot-be-written)). Workspace
 creation also installs Claude Code and starts the worker, so the first
 message starts straight away.
 

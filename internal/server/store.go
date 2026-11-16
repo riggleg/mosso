@@ -168,9 +168,15 @@ func parseTime(s string) time.Time {
 	return t
 }
 
-// save inserts or updates the workspace's row.
-func (st *store) save(rec workspaceRecord) error {
-	return st.tx(func(tx *sql.Tx) error { return saveRecord(tx, rec) })
+// save inserts or updates the workspace's row and adds entries to the end
+// of its conversation, all or nothing.
+func (st *store) save(rec workspaceRecord, entries ...chatEntry) error {
+	return st.tx(func(tx *sql.Tx) error {
+		if err := saveRecord(tx, rec); err != nil {
+			return err
+		}
+		return insertEntries(tx, rec.Name, entries)
+	})
 }
 
 func saveRecord(tx *sql.Tx, rec workspaceRecord) error {

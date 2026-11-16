@@ -28,7 +28,10 @@ shell commands in it, and destroy it through its local HTTP API. The Go client i
    ```
 
    The log prints `Vercel Sandbox credentials loaded`. If any variable is
-   missing, Mosso still starts but the `/sandboxes` endpoints return `503`.
+   missing, Mosso still starts but the `/sandboxes` endpoints, and
+   everything else that needs a sandbox, return `503`; saved workspaces and
+   their conversations can still be read
+   (see [history.md](history.md#without-vercel-credentials)).
    Credential values are never logged or returned by the API.
 
 ## Try it

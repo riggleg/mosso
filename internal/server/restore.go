@@ -48,15 +48,18 @@ func noSandbox(state string) string {
 // resumeTimeout bounds resuming a sandbox and starting its worker.
 const resumeTimeout = 3 * time.Minute
 
-// Restore opens Mosso's database at dbPath (creating it if needed), loads
-// the workspaces saved there and reconciles them with their sandboxes in
-// the background: a running sandbox is followed again from the last event
-// Mosso saw; a stopped one whose Claude task was still running when Mosso
-// last saw it is resumed to fetch what happened meanwhile; other stopped
-// sandboxes are left stopped (and unbilled) until the next message or
-// connect; one that no longer exists is marked gone. Terminated workspaces
-// have no sandbox and are listed as history. New workspaces are saved in
-// the database too.
+// Restore opens Mosso's database at dbPath (creating it if needed) and
+// does two separate things with the workspaces saved there:
+//
+//   - It loads them all, with their state as last saved, so they are listed
+//     and their conversations can be read. This needs nothing but the
+//     database: it works without Vercel credentials.
+//   - It reconnects the ones that have a sandbox, in the background (see
+//     reconnect). This needs Vercel and is skipped without it; those
+//     workspaces then stay as they were last saved, read-only, until Mosso
+//     is started with credentials.
+//
+// New workspaces are saved in the database too.
 //
 // legacyDir, if not empty, is the "workspaces" directory in which a Mosso
 // from before the database saved workspaces as files; any found there are
@@ -81,26 +84,41 @@ func (s *Server) Restore(ctx context.Context, dbPath, legacyDir string) error {
 	s.mu.Lock()
 	s.store = st
 	s.mu.Unlock()
+
+	// Load: every workspace, from the database alone.
+	type loaded struct {
+		ws  *workspace
+		rec workspaceRecord
+	}
+	var active []loaded // the ones with a sandbox to reconnect to
 	for _, rec := range records {
-		ws, err := s.restoreWorkspace(rec)
+		ws, err := s.loadWorkspace(rec)
 		if err != nil {
-			log.Printf("workspace %s: not restored: %v", rec.Name, err)
+			log.Printf("workspace %s: not loaded: %v", rec.Name, err)
 			continue
 		}
-		if rec.SandboxState == sandboxTerminated {
-			continue // history: no sandbox to reconnect to
+		if rec.SandboxState != sandboxTerminated {
+			active = append(active, loaded{ws, rec})
 		}
-		log.Printf("workspace %s: restored (%s, %d chat entries, sandbox %s)", ws.Name, ws.Repo, len(ws.chat.entries), rec.SandboxState)
-		go s.reconnect(ws, rec.SandboxState, rec.TaskRunning)
+	}
+	log.Printf("loaded %d workspaces from %s (%d with a sandbox, %d in the history)", len(records), dbPath, len(active), len(records)-len(active))
+
+	// Reconnect: only with a sandbox provider.
+	if s.vercel == nil {
+		if len(active) > 0 {
+			log.Printf("%d workspaces with a sandbox are shown as last saved and are not reconnected: Vercel is not configured", len(active))
+		}
+		return nil
+	}
+	for _, l := range active {
+		go s.reconnect(l.ws, l.rec.SandboxState, l.rec.TaskRunning)
 	}
 	return nil
 }
 
-// restoreWorkspace rebuilds a workspace from its record and chat log.
-func (s *Server) restoreWorkspace(rec workspaceRecord) (*workspace, error) {
-	if s.vercel == nil {
-		return nil, errors.New("Vercel is not configured")
-	}
+// loadWorkspace rebuilds a workspace from its record, as last saved, and
+// lists it. It does not contact the sandbox; reconnect does.
+func (s *Server) loadWorkspace(rec workspaceRecord) (*workspace, error) {
 	ws := &workspace{
 		Name: rec.Name, Repo: rec.Repo, Base: rec.Base, BaseSHA: rec.BaseSHA, Branch: rec.Branch, Dir: rec.Dir,
 		Sandbox: rec.Sandbox, ExpiresAt: rec.ExpiresAt, PullRequest: rec.PullRequest, CreatedAt: rec.CreatedAt,
@@ -119,7 +137,7 @@ func (s *Server) restoreWorkspace(rec workspaceRecord) (*workspace, error) {
 		ws.attachBytes += a.Size
 	}
 	ws.chat.sessionID = rec.SessionID
-	ws.chat.persist = s.persister(ws.Name)
+	ws.chat.persist = s.persister(ws)
 	if ws.sandboxState == sandboxTerminated {
 		// History: nothing more happens in it, so its chat stays in the
 		// database until someone opens it (see loadChatLocked).
@@ -136,14 +154,19 @@ func (s *Server) restoreWorkspace(rec workspaceRecord) (*workspace, error) {
 	if err != nil {
 		return nil, err
 	}
-	ws.connecting = true
 	ws.chat.load(entries)
 	for _, e := range entries {
 		if e.Seq > ws.lastSeq {
 			ws.lastSeq = e.Seq
 		}
 	}
-	if rec.BaseSHA != "" {
+	// Whether a Claude task was in flight is kept as saved, so that it is
+	// still known the next time Mosso can reach the sandbox.
+	ws.taskRunning = rec.TaskRunning && ws.sandboxState != sandboxGone
+	// The rest prepares for reconnecting, which needs Vercel.
+	reconnecting := s.vercel != nil
+	ws.connecting = reconnecting
+	if rec.BaseSHA != "" && reconnecting {
 		mirror, err := github.NewMirror(s.vercel, rec.Sandbox.SessionID, github.MirrorOptions{
 			Repo: rec.Repo, Base: rec.Base, BaseSHA: rec.BaseSHA, Branch: rec.Branch, Dir: rec.Dir, Pushed: rec.Pushed,
 		})
@@ -159,16 +182,17 @@ func (s *Server) restoreWorkspace(rec workspaceRecord) (*workspace, error) {
 	}
 	s.workspaces[rec.Name] = ws
 	s.sandboxes[rec.Name] = rec.Sandbox
-	if rec.TaskRunning && ws.sandboxState != sandboxGone {
+	if ws.taskRunning && reconnecting {
 		// Claude may still be working, or have finished while Mosso was
 		// away; the follower finds out.
 		s.busy[rec.Name] = true
-		ws.taskRunning = true
 	}
 	return ws, nil
 }
 
-// reconnect is Restore's background step for one workspace.
+// reconnect is Restore's background step for one workspace that has a
+// sandbox: it asks Vercel what became of the sandbox and squares the
+// workspace with it.
 func (s *Server) reconnect(ws *workspace, lastState string, taskRunning bool) {
 	ctx, cancel := context.WithTimeout(s.ctx, resumeTimeout)
 	defer cancel()
@@ -439,37 +463,33 @@ func (s *Server) markGoneLocked(ws *workspace) {
 	s.persistLocked(ws)
 }
 
-// persister returns the chat's persist callback for a workspace.
-func (s *Server) persister(name string) func(chatEntry) {
-	return func(e chatEntry) {
-		if s.store == nil {
+// persister returns the chat's persist callback for a workspace: it saves
+// the chat entries not saved yet. Nothing is saved of a workspace that is
+// still being set up, so a failed setup leaves nothing behind. A failure
+// is logged; the entries go out with the next save.
+func (s *Server) persister(ws *workspace) func() {
+	return func() {
+		if s.store == nil || ws.creating {
 			return
 		}
-		if err := s.store.appendEntries(name, []chatEntry{e}); err != nil {
-			log.Printf("workspace %s: save chat entry: %v", name, err)
+		c := ws.chat
+		if err := s.store.appendEntries(ws.Name, c.entries[c.saved:]); err != nil {
+			log.Printf("workspace %s: save the chat: %v", ws.Name, err)
+			ws.unsaved = true
+			return
 		}
+		c.saved = len(c.entries)
 	}
 }
 
-// saveNewLocked saves a workspace that has just been set up: its record,
-// the chat so far and, from now on, every new chat entry. Nothing is saved
-// of a workspace before that, so a failed setup leaves nothing behind.
+// saveLocked saves the workspace in the database: its record and the chat
+// entries not saved yet, all or nothing. Requests that create, terminate
+// or archive a workspace use it and fail if it does. While a save has
+// failed and none has succeeded since, the workspace is marked unsaved.
 // Call with s.mu held.
-func (s *Server) saveNewLocked(ws *workspace) {
+func (s *Server) saveLocked(ws *workspace) error {
 	if s.store == nil {
-		return
-	}
-	s.persistLocked(ws)
-	if err := s.store.appendEntries(ws.Name, ws.chat.entries); err != nil {
-		log.Printf("workspace %s: save the chat: %v", ws.Name, err)
-	}
-	ws.chat.persist = s.persister(ws.Name)
-}
-
-// persistLocked saves the workspace's record. Call with s.mu held.
-func (s *Server) persistLocked(ws *workspace) {
-	if s.store == nil || ws.creating {
-		return
+		return nil // no database: workspaces live in memory only
 	}
 	rec := workspaceRecord{
 		Name: ws.Name, Repo: ws.Repo, Base: ws.Base, Branch: ws.Branch, SandboxState: ws.sandboxState,
@@ -482,7 +502,24 @@ func (s *Server) persistLocked(ws *workspace) {
 	for _, a := range ws.attachments {
 		rec.Attachments = append(rec.Attachments, a)
 	}
-	if err := s.store.save(rec); err != nil {
+	c := ws.chat
+	if err := s.store.save(rec, c.entries[c.saved:]...); err != nil {
+		ws.unsaved = true
+		return err
+	}
+	c.saved = len(c.entries)
+	ws.unsaved = false
+	return nil
+}
+
+// persistLocked saves the workspace after a change that no request is
+// waiting on (a worker event, a session ending). A failure is logged and
+// the next save writes the current state again. Call with s.mu held.
+func (s *Server) persistLocked(ws *workspace) {
+	if ws.creating {
+		return
+	}
+	if err := s.saveLocked(ws); err != nil {
 		log.Printf("workspace %s: save: %v", ws.Name, err)
 	}
 }

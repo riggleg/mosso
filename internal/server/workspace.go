@@ -61,6 +61,10 @@ type workspace struct {
 	// are computed by snapshotLocked.
 	Status string `json:"status"`
 	Error  string `json:"error,omitempty"`
+	// Unsaved says the last attempt to save the workspace in the database
+	// failed, so what is shown may be lost if Mosso restarts before a
+	// later save succeeds; computed by snapshotLocked.
+	Unsaved bool `json:"unsaved,omitempty"`
 
 	creating   bool
 	connecting bool
@@ -74,6 +78,8 @@ type workspace struct {
 	git *github.Mirror
 	// pushed is the working branch head Mosso last pushed.
 	pushed string
+	// unsaved is set while the database is behind what is in memory.
+	unsaved bool
 
 	// Sandbox worker state, guarded by Server.mu. lastSeq is the last
 	// worker event applied to the chat; taskRunning says a Claude task is
@@ -92,6 +98,7 @@ type workspace struct {
 func (s *Server) snapshotLocked(ws *workspace) workspace {
 	c := *ws
 	c.SandboxState = ws.sandboxState
+	c.Unsaved = ws.unsaved
 	expired := !ws.ExpiresAt.IsZero() && time.Now().After(ws.ExpiresAt)
 	switch {
 	case ws.creating:
@@ -246,7 +253,8 @@ func (s *Server) githubConnect(w http.ResponseWriter, r *http.Request) {
 
 // listWorkspaces lists every workspace, oldest first: the ones with a
 // sandbox, the terminated ones kept as history, and the archived ones
-// (archived_at is set).
+// (archived_at is set). Like the other endpoints that only read saved
+// workspaces, it works without Vercel credentials.
 func (s *Server) listWorkspaces(w http.ResponseWriter, _ *http.Request) {
 	s.mu.Lock()
 	list := make([]workspace, 0, len(s.workspaces))
@@ -368,6 +376,7 @@ func (s *Server) createWorkspace(w http.ResponseWriter, r *http.Request) {
 	if !github.ValidRepo(ws.Repo) {
 		ws.Repo = req.Repo
 	}
+	ws.chat.persist = s.persister(ws)
 	// List the workspace as "creating" and hold it while cloning so nothing
 	// else runs in it. Destroy it if it does not come up.
 	s.mu.Lock()
@@ -441,17 +450,29 @@ func (s *Server) createWorkspace(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	_, live := s.sandboxes[sb.Name]
 	var snapshot workspace
+	var saveErr error
 	if live && s.workspaces[sb.Name] == ws {
-		ws.git = mirror
 		ws.BaseSHA = baseSHA
-		ws.creating = false
-		delete(s.busy, sb.Name)
-		ws.chat.notify()
-		s.saveNewLocked(ws)
-		snapshot = s.snapshotLocked(ws)
-		ready = true
+		// The workspace exists once it is saved, with the chat so far. If
+		// it cannot be saved it is not created: Mosso would lose track of
+		// its sandbox at the next restart.
+		if saveErr = s.saveLocked(ws); saveErr == nil {
+			ws.git = mirror
+			ws.creating = false
+			delete(s.busy, sb.Name)
+			ws.chat.notify()
+			snapshot = s.snapshotLocked(ws)
+			ready = true
+		}
 	}
 	s.mu.Unlock()
+	if saveErr != nil {
+		// The deferred cleanup removes the workspace and destroys the sandbox.
+		_ = mirror.Close()
+		log.Printf("workspace %s: save: %v", sb.Name, saveErr)
+		writeError(w, http.StatusInternalServerError, "the workspace could not be saved, so it was not created and its sandbox is destroyed: "+saveErr.Error())
+		return
+	}
 	if !ready {
 		_ = mirror.Close()
 		writeError(w, http.StatusServiceUnavailable, "the sandbox was destroyed while the workspace was being set up")
@@ -472,7 +493,9 @@ func (s *Server) createWorkspace(w http.ResponseWriter, r *http.Request) {
 // brings it back (POST …/unarchive). An archived workspace keeps its
 // conversation and stays readable; the web UI lists it apart from the rest
 // of the history. A workspace that still has a sandbox cannot be archived:
-// out of sight, it would keep costing money.
+// out of sight, it would keep costing money. Archiving only touches the
+// database, so it works without Vercel credentials; it fails if the change
+// cannot be saved.
 func (s *Server) archiveWorkspace(archive bool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		s.mu.Lock()
@@ -487,13 +510,26 @@ func (s *Server) archiveWorkspace(archive bool) http.HandlerFunc {
 			writeError(w, http.StatusConflict, "terminate the workspace before archiving it: its sandbox still exists")
 			return
 		}
+		if ws.creating {
+			s.mu.Unlock()
+			writeError(w, http.StatusConflict, "the workspace is still being set up")
+			return
+		}
+		before, unsaved := ws.ArchivedAt, ws.unsaved
 		switch {
 		case !archive:
 			ws.ArchivedAt = time.Time{}
 		case ws.ArchivedAt.IsZero():
 			ws.ArchivedAt = time.Now().UTC()
 		}
-		s.persistLocked(ws)
+		if err := s.saveLocked(ws); err != nil {
+			// Not saved is not archived: it would come back after a restart.
+			ws.ArchivedAt, ws.unsaved = before, unsaved
+			s.mu.Unlock()
+			log.Printf("workspace %s: save: %v", ws.Name, err)
+			writeError(w, http.StatusInternalServerError, "the change could not be saved: "+err.Error())
+			return
+		}
 		ws.chat.notify()
 		snapshot := s.snapshotLocked(ws)
 		s.mu.Unlock()

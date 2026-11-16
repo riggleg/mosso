@@ -2,7 +2,6 @@ package server
 
 import (
 	"bufio"
-	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -60,13 +59,7 @@ func (st *store) importFiles(dir string) (int, error) {
 		if err != nil {
 			return imported, fmt.Errorf("read the chat of workspace %s: %w", name, err)
 		}
-		err = st.tx(func(tx *sql.Tx) error {
-			if err := saveRecord(tx, rec); err != nil {
-				return err
-			}
-			return insertEntries(tx, name, chat)
-		})
-		if err != nil {
+		if err := st.save(rec, chat...); err != nil {
 			return imported, fmt.Errorf("import workspace %s: %w", name, err)
 		}
 		imported++
