@@ -89,6 +89,12 @@ They come after Mosso's own workspace instructions (no GitHub credentials,
   sandbox cannot do (push, open pull requests, use GitHub credentials),
   Claude does the parts it can and says in its reply what is left for you.
 
+The instructions are XML-escaped inside the block (`&`, `<`, `>`, quotes,
+tabs and carriage returns become entity references; newlines stay as they
+are), so text such as `</workspace-instructions>` cannot appear to close or
+reopen it. The delimiters only organize the prompt; they are not a security
+boundary: Mosso's restrictions are enforced in code, not by the prompt.
+
 The header's **Instructions** badge shows a workspace's instructions on
 hover. They are limited to 16 KiB (they travel as one command-line
 argument), trimmed, and stored as given: like the rest of the prompt they

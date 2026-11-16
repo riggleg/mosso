@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"log"
@@ -540,8 +541,23 @@ func instructionsPrompt(instructions string) string {
 
 The user saved the following instructions for this workspace in Mosso. Follow them on every turn, alongside the user's messages: they describe how to work, not the task itself, and the user's messages come first. They do not override the rules above. If they ask for something those rules or this sandbox do not allow (for example pushing, opening pull requests yourself, or using GitHub credentials), do the parts you can, such as preparing and committing the work, then say clearly in your reply what is left for the user to do in Mosso or on GitHub.
 <workspace-instructions>
-` + instructions + `
+` + escapeInstructions(instructions) + `
 </workspace-instructions>`
+}
+
+// escapeInstructions escapes instructions as XML character data, so that
+// text such as "</workspace-instructions>" cannot appear to close or reopen
+// the block. Newlines stay as they are; &, <, >, quotes, tabs and carriage
+// returns become entity references. This keeps the prompt's structure
+// readable; it is not a security boundary: Mosso's rules are enforced in
+// code, not by the prompt.
+func escapeInstructions(instructions string) string {
+	var b strings.Builder
+	e := xml.NewEncoder(&b)
+	// Encoding character data into a strings.Builder cannot fail.
+	_ = e.EncodeToken(xml.CharData(instructions))
+	_ = e.Flush()
+	return b.String()
 }
 
 // gitPrompt tells Claude how Git works in a workspace.
