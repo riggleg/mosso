@@ -221,7 +221,9 @@ func (s *Server) createSection(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	s.saveSection(w, sec, http.StatusCreated)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.saveSectionLocked(w, sec, http.StatusCreated)
 }
 
 // updateSection changes the fields given in the body, for example only
@@ -235,14 +237,15 @@ func (s *Server) updateSection(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	// Read, change and save under the lock, so concurrent changes cannot
+	// undo each other or slip a duplicate name past the check.
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	st := s.sectionStoreLocked(w)
 	if st == nil {
-		s.mu.Unlock()
 		return
 	}
 	sec, err := st.section(id)
-	s.mu.Unlock()
 	if err != nil {
 		writeSectionError(w, "read the section", err)
 		return
@@ -251,14 +254,12 @@ func (s *Server) updateSection(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	s.saveSection(w, sec, http.StatusOK)
+	s.saveSectionLocked(w, sec, http.StatusOK)
 }
 
-// saveSection saves sec, refusing a name another section has, and writes
-// the saved section with status.
-func (s *Server) saveSection(w http.ResponseWriter, sec section, status int) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+// saveSectionLocked saves sec, refusing a name another section has, and
+// writes the saved section with status. Call with s.mu held.
+func (s *Server) saveSectionLocked(w http.ResponseWriter, sec section, status int) {
 	st := s.sectionStoreLocked(w)
 	if st == nil {
 		return
@@ -297,9 +298,9 @@ func (s *Server) duplicateSection(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	st := s.sectionStoreLocked(w)
 	if st == nil {
-		s.mu.Unlock()
 		return
 	}
 	sec, err := st.section(id)
@@ -308,7 +309,6 @@ func (s *Server) duplicateSection(w http.ResponseWriter, r *http.Request) {
 		name, err = copyName(st, sec.Name)
 		req.Name = &name
 	}
-	s.mu.Unlock()
 	if err != nil {
 		writeSectionError(w, "read the section", err)
 		return
@@ -318,7 +318,7 @@ func (s *Server) duplicateSection(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	s.saveSection(w, sec, http.StatusCreated)
+	s.saveSectionLocked(w, sec, http.StatusCreated)
 }
 
 // copyName returns the first free name of "<name> copy", "<name> copy 2",
