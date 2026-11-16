@@ -31,13 +31,14 @@ const (
 
 	// NewTokenURL opens GitHub's form for a fine-grained personal access
 	// token with Mosso's settings preselected: name, description, a 90-day
-	// expiration, and Contents and Pull requests: Read and write (Metadata:
-	// Read is always included). The user still picks the repositories.
-	// Nothing else is requested; in particular not Workflows, so the token
-	// cannot change .github/workflows.
+	// expiration, Contents and Pull requests: Read and write, and Checks
+	// and Commit statuses: Read-only, for the agent's github_checks
+	// (Metadata: Read is always included). The user still picks the
+	// repositories. Nothing else is requested; in particular not
+	// Workflows, so the token cannot change .github/workflows.
 	NewTokenURL = "https://github.com/settings/personal-access-tokens/new" +
 		"?name=Mosso&description=GitHub+access+for+Mosso+coding+workspaces&expires_in=90" +
-		"&contents=write&pull_requests=write"
+		"&contents=write&pull_requests=write&checks=read&statuses=read"
 
 	keychainLabel = "Mosso: GitHub token"
 )

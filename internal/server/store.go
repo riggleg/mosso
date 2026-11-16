@@ -120,6 +120,12 @@ type workspaceState struct {
 	// created (its first user entry) is not known to have reached the
 	// worker, so a restart must send it or match it to the worker's copy.
 	QueuedPrompt bool `json:"queued_prompt,omitempty"`
+	// PullRequests are all the workspace's pull requests, by the user or
+	// the agent; PullRequest is the one Create PR publishes to.
+	PullRequests []pullRequestRecord `json:"pull_requests,omitempty"`
+	// Branches are the extra branches the workspace's mirror keeps in
+	// sync (see workspace.branches).
+	Branches []string `json:"branches,omitempty"`
 }
 
 // store keeps workspaces and their chats in a SQLite database. It is the

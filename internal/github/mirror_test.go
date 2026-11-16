@@ -281,9 +281,9 @@ func TestPushLeaseRejectsMovedBranch(t *testing.T) {
 	// The branch moves between Mosso's fetch and its push.
 	e.remoteCommit(t, e.opts.Branch, "docs/guide.md", "race\n")
 	e.mirror.mu.Lock()
-	err = e.mirror.push(context.Background(), Token(testGitHubToken), e.base, pub.Commit)
+	err = e.mirror.push(context.Background(), Token(testGitHubToken), e.opts.Branch, e.base, pub.Commit)
 	e.mirror.mu.Unlock()
-	if err == nil || !strings.Contains(err.Error(), "publish again") {
+	if err == nil || !strings.Contains(err.Error(), "while Mosso was pushing; try again") {
 		t.Fatalf("err = %v, want a lease failure", err)
 	}
 }

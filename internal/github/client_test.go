@@ -92,7 +92,7 @@ func TestClientReportsTokenExpirationAndPermissionHints(t *testing.T) {
 	if got := c.TokenExpiration(); got.Format(time.RFC3339) != "2026-12-01T08:00:00Z" {
 		t.Fatalf("expiration = %v", got)
 	}
-	_, err := c.createPullRequest(context.Background(), testRepo, NewPullRequest{Title: "x", Head: "mosso/x", Base: "main"})
+	_, _, err := c.OpenPullRequest(context.Background(), testRepo, NewPullRequest{Title: "x", Head: "mosso/x", Base: "main"})
 	if err == nil || !strings.Contains(err.Error(), "Pull requests set to Read and write") {
 		t.Fatalf("err = %v, want a permissions hint", err)
 	}

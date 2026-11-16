@@ -189,15 +189,99 @@ func (c *Client) Branches(ctx context.Context, repo string) ([]string, error) {
 	return names, nil
 }
 
+// BranchHead returns the commit branch points to in repo, or an error that
+// IsNotFound recognizes if there is no such branch.
+func (c *Client) BranchHead(ctx context.Context, repo, branch string) (string, error) {
+	if !ValidBranch(branch) {
+		return "", fmt.Errorf("%q is not a branch name Mosso accepts", branch)
+	}
+	var ref struct {
+		Object struct {
+			SHA string `json:"sha"`
+		} `json:"object"`
+	}
+	// git/ref takes the ref with its slashes; ValidBranch keeps it safe in
+	// the path.
+	if err := c.do(ctx, http.MethodGet, "/repos/"+repo+"/git/ref/heads/"+branch, nil, &ref); err != nil {
+		if IsNotFound(err) {
+			return "", fmt.Errorf("branch %s not found in %s: %w", branch, repo, err)
+		}
+		return "", fmt.Errorf("read branch %s: %w", branch, err)
+	}
+	if !shaPattern.MatchString(ref.Object.SHA) {
+		return "", fmt.Errorf("read branch %s: unexpected answer", branch)
+	}
+	return ref.Object.SHA, nil
+}
+
 // PullRequest is a created or existing pull request.
 type PullRequest struct {
 	Number int    `json:"number"`
 	URL    string `json:"url"`
 }
 
+// PullRequestInfo describes a pull request in more detail.
+type PullRequestInfo struct {
+	Number int    `json:"number"`
+	URL    string `json:"url"`
+	Title  string `json:"title"`
+	Body   string `json:"body,omitempty"`
+	// State is "open" or "closed"; Merged says whether a closed pull
+	// request was merged.
+	State  string `json:"state"`
+	Draft  bool   `json:"draft"`
+	Merged bool   `json:"merged"`
+	// Head and Base are branch names; HeadRepo is the repository the
+	// head branch is in ("owner/repo"), which differs for forks.
+	Head     string `json:"head"`
+	HeadSHA  string `json:"head_sha"`
+	HeadRepo string `json:"-"`
+	Base     string `json:"base"`
+	// Mergeable and MergeableState are GitHub's view of whether the pull
+	// request can merge (only on GetPullRequest; nil while GitHub is
+	// still computing it).
+	Mergeable      *bool  `json:"mergeable,omitempty"`
+	MergeableState string `json:"mergeable_state,omitempty"`
+	nodeID         string
+}
+
 type apiPull struct {
-	Number  int    `json:"number"`
-	HTMLURL string `json:"html_url"`
+	Number         int        `json:"number"`
+	HTMLURL        string     `json:"html_url"`
+	NodeID         string     `json:"node_id"`
+	Title          string     `json:"title"`
+	Body           *string    `json:"body"`
+	State          string     `json:"state"`
+	Draft          bool       `json:"draft"`
+	Merged         bool       `json:"merged"`
+	MergedAt       *time.Time `json:"merged_at"`
+	Mergeable      *bool      `json:"mergeable"`
+	MergeableState string     `json:"mergeable_state"`
+	Head           struct {
+		Ref  string `json:"ref"`
+		SHA  string `json:"sha"`
+		Repo *struct {
+			FullName string `json:"full_name"`
+		} `json:"repo"`
+	} `json:"head"`
+	Base struct {
+		Ref string `json:"ref"`
+	} `json:"base"`
+}
+
+func (p apiPull) info() *PullRequestInfo {
+	out := &PullRequestInfo{
+		Number: p.Number, URL: p.HTMLURL, Title: p.Title, State: p.State, Draft: p.Draft,
+		Merged: p.Merged || p.MergedAt != nil, Head: p.Head.Ref, HeadSHA: p.Head.SHA, Base: p.Base.Ref,
+		Mergeable: p.Mergeable, MergeableState: p.MergeableState, nodeID: p.NodeID,
+	}
+	if p.Body != nil {
+		out.Body = *p.Body
+	}
+	if p.Head.Repo != nil {
+		out.HeadRepo = p.Head.Repo.FullName
+	}
+	return out
 }
 
 // NewPullRequest describes a pull request to open.
@@ -209,27 +293,228 @@ type NewPullRequest struct {
 	Draft bool
 }
 
-// openPullRequest returns the open pull request from head into base, if any.
-func (c *Client) openPullRequest(ctx context.Context, repo, head, base string) (*PullRequest, error) {
+// OpenPullRequest returns the open pull request from pr.Head into pr.Base
+// in repo, or opens one; created says which. A pull request is never
+// opened twice for the same head and base.
+func (c *Client) OpenPullRequest(ctx context.Context, repo string, pr NewPullRequest) (*PullRequest, bool, error) {
+	open, err := c.PullRequests(ctx, repo, pr.Head, "open")
+	if err != nil {
+		return nil, false, err
+	}
+	for _, p := range open {
+		if p.Base == pr.Base {
+			return &PullRequest{Number: p.Number, URL: p.URL}, false, nil
+		}
+	}
+	if strings.TrimSpace(pr.Body) == "" {
+		pr.Body = "Created with Mosso."
+	}
+	in := map[string]any{"title": pr.Title, "body": pr.Body, "head": pr.Head, "base": pr.Base, "draft": pr.Draft}
+	var out apiPull
+	if err := c.do(ctx, http.MethodPost, "/repos/"+repo+"/pulls", in, &out); err != nil {
+		return nil, false, fmt.Errorf("create pull request: %w", err)
+	}
+	return &PullRequest{Number: out.Number, URL: out.HTMLURL}, true, nil
+}
+
+// PullRequests returns up to 100 pull requests from the branch head of
+// repo itself (not forks), newest first. state is "open", "closed" or
+// "all".
+func (c *Client) PullRequests(ctx context.Context, repo, head, state string) ([]PullRequestInfo, error) {
 	owner := repo[:strings.IndexByte(repo, '/')]
-	q := url.Values{"head": {owner + ":" + head}, "base": {base}, "state": {"open"}}
+	q := url.Values{"head": {owner + ":" + head}, "state": {state}, "per_page": {"100"}}
 	var pulls []apiPull
 	if err := c.do(ctx, http.MethodGet, "/repos/"+repo+"/pulls?"+q.Encode(), nil, &pulls); err != nil {
 		return nil, fmt.Errorf("list pull requests: %w", err)
 	}
-	if len(pulls) == 0 {
-		return nil, nil
+	out := make([]PullRequestInfo, 0, len(pulls))
+	for _, p := range pulls {
+		out = append(out, *p.info())
 	}
-	return &PullRequest{Number: pulls[0].Number, URL: pulls[0].HTMLURL}, nil
+	return out, nil
 }
 
-func (c *Client) createPullRequest(ctx context.Context, repo string, pr NewPullRequest) (*PullRequest, error) {
-	in := map[string]any{"title": pr.Title, "body": pr.Body, "head": pr.Head, "base": pr.Base, "draft": pr.Draft}
-	var out apiPull
-	if err := c.do(ctx, http.MethodPost, "/repos/"+repo+"/pulls", in, &out); err != nil {
-		return nil, fmt.Errorf("create pull request: %w", err)
+// GetPullRequest returns pull request number of repo.
+func (c *Client) GetPullRequest(ctx context.Context, repo string, number int) (*PullRequestInfo, error) {
+	var p apiPull
+	if err := c.do(ctx, http.MethodGet, fmt.Sprintf("/repos/%s/pulls/%d", repo, number), nil, &p); err != nil {
+		if IsNotFound(err) {
+			return nil, fmt.Errorf("pull request #%d not found in %s: %w", number, repo, err)
+		}
+		return nil, fmt.Errorf("get pull request #%d: %w", number, err)
 	}
-	return &PullRequest{Number: out.Number, URL: out.HTMLURL}, nil
+	return p.info(), nil
+}
+
+// PullRequestUpdate changes the fields that are not nil.
+type PullRequestUpdate struct {
+	Title *string
+	Body  *string
+	Draft *bool
+}
+
+// UpdatePullRequest changes a pull request's title, description or draft
+// status, and returns it as it is then. GitHub's REST API cannot change the
+// draft status, so that goes through GraphQL.
+func (c *Client) UpdatePullRequest(ctx context.Context, repo string, pr *PullRequestInfo, u PullRequestUpdate) (*PullRequestInfo, error) {
+	in := map[string]any{}
+	if u.Title != nil {
+		in["title"] = *u.Title
+	}
+	if u.Body != nil {
+		in["body"] = *u.Body
+	}
+	if len(in) > 0 {
+		var p apiPull
+		if err := c.do(ctx, http.MethodPatch, fmt.Sprintf("/repos/%s/pulls/%d", repo, pr.Number), in, &p); err != nil {
+			return nil, fmt.Errorf("update pull request #%d: %w", pr.Number, err)
+		}
+	}
+	if u.Draft != nil && *u.Draft != pr.Draft {
+		mutation := "markPullRequestReadyForReview"
+		if *u.Draft {
+			mutation = "convertPullRequestToDraft"
+		}
+		q := "mutation($id: ID!) { " + mutation + "(input: {pullRequestId: $id}) { pullRequest { isDraft } } }"
+		if err := c.graphQL(ctx, q, map[string]any{"id": pr.nodeID}); err != nil {
+			return nil, fmt.Errorf("change the draft status of pull request #%d: %w", pr.Number, err)
+		}
+	}
+	return c.GetPullRequest(ctx, repo, pr.Number)
+}
+
+// graphQL runs a GraphQL mutation or query and fails on any GraphQL error.
+func (c *Client) graphQL(ctx context.Context, query string, vars map[string]any) error {
+	var out struct {
+		Errors []struct {
+			Message string `json:"message"`
+		} `json:"errors"`
+	}
+	if err := c.do(ctx, http.MethodPost, "/graphql", map[string]any{"query": query, "variables": vars}, &out); err != nil {
+		return err
+	}
+	if len(out.Errors) > 0 {
+		return &APIError{StatusCode: http.StatusOK, Message: c.token.redact(out.Errors[0].Message)}
+	}
+	return nil
+}
+
+// Check is one CI result for a commit: a check run (GitHub Actions and
+// other apps) or a commit status.
+type Check struct {
+	Name string `json:"name"`
+	// Status is "queued", "in_progress" or "completed" for check runs,
+	// and "completed" or "pending" for commit statuses.
+	Status string `json:"status"`
+	// Conclusion, once completed: "success", "failure", "neutral",
+	// "cancelled", "skipped", "timed_out", "action_required" (check runs)
+	// or "error" (commit statuses).
+	Conclusion string `json:"conclusion,omitempty"`
+	URL        string `json:"url,omitempty"`
+	Summary    string `json:"summary,omitempty"`
+}
+
+// Checks are the CI results for a commit.
+type Checks struct {
+	Commit string `json:"commit"`
+	// State sums them up: "success", "failure", "pending", or "none" when
+	// nothing reported on the commit.
+	State  string  `json:"state"`
+	Checks []Check `json:"checks"`
+	// Missing says which kind of result could not be read, and why.
+	Missing []string `json:"missing,omitempty"`
+}
+
+// CommitChecks returns the check runs and commit statuses of commit sha in
+// repo. One kind failing to load (for example, a token without the Checks
+// permission) is reported in Missing; both failing is an error.
+func (c *Client) CommitChecks(ctx context.Context, repo, sha string) (*Checks, error) {
+	if !shaPattern.MatchString(sha) {
+		return nil, errors.New("checks: invalid commit")
+	}
+	out := &Checks{Commit: sha, Checks: []Check{}}
+	var runs struct {
+		CheckRuns []struct {
+			Name       string  `json:"name"`
+			Status     string  `json:"status"`
+			Conclusion *string `json:"conclusion"`
+			HTMLURL    string  `json:"html_url"`
+			Output     struct {
+				Title *string `json:"title"`
+			} `json:"output"`
+		} `json:"check_runs"`
+	}
+	runsErr := c.do(ctx, http.MethodGet, "/repos/"+repo+"/commits/"+sha+"/check-runs?per_page=100", nil, &runs)
+	if runsErr == nil {
+		for _, r := range runs.CheckRuns {
+			ch := Check{Name: r.Name, Status: r.Status, URL: r.HTMLURL}
+			if r.Conclusion != nil {
+				ch.Conclusion = *r.Conclusion
+			}
+			if r.Output.Title != nil {
+				ch.Summary = *r.Output.Title
+			}
+			out.Checks = append(out.Checks, ch)
+		}
+	} else {
+		out.Missing = append(out.Missing, "check runs: "+checksHint(runsErr, "Checks"))
+	}
+	var status struct {
+		Statuses []struct {
+			Context     string `json:"context"`
+			State       string `json:"state"`
+			TargetURL   string `json:"target_url"`
+			Description string `json:"description"`
+		} `json:"statuses"`
+	}
+	statusErr := c.do(ctx, http.MethodGet, "/repos/"+repo+"/commits/"+sha+"/status?per_page=100", nil, &status)
+	if statusErr == nil {
+		for _, st := range status.Statuses {
+			ch := Check{Name: st.Context, Status: "completed", Conclusion: st.State, URL: st.TargetURL, Summary: st.Description}
+			if st.State == "pending" {
+				ch.Status, ch.Conclusion = "pending", ""
+			}
+			out.Checks = append(out.Checks, ch)
+		}
+	} else {
+		out.Missing = append(out.Missing, "commit statuses: "+checksHint(statusErr, "Commit statuses"))
+	}
+	if runsErr != nil && statusErr != nil {
+		return nil, fmt.Errorf("read the checks of %s: %s; %s", sha[:12], out.Missing[0], out.Missing[1])
+	}
+	out.State = checksState(out.Checks)
+	return out, nil
+}
+
+// checksHint explains a failure to read CI results.
+func checksHint(err error, permission string) string {
+	var apiErr *APIError
+	if errors.As(err, &apiErr) && (apiErr.StatusCode == http.StatusForbidden || apiErr.StatusCode == http.StatusNotFound) {
+		return err.Error() + " (the GitHub token may lack the " + permission + " permission: give it " + permission + ": Read-only)"
+	}
+	return err.Error()
+}
+
+// checksState sums up CI results like GitHub's merge box: any failure
+// fails, then anything unfinished is pending.
+func checksState(checks []Check) string {
+	if len(checks) == 0 {
+		return "none"
+	}
+	pending := false
+	for _, ch := range checks {
+		switch ch.Conclusion {
+		case "failure", "error", "cancelled", "timed_out", "action_required", "startup_failure":
+			return "failure"
+		}
+		if ch.Status != "completed" {
+			pending = true
+		}
+	}
+	if pending {
+		return "pending"
+	}
+	return "success"
 }
 
 // do sends an authenticated JSON request and decodes a 2xx JSON response

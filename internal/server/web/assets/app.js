@@ -618,14 +618,13 @@ function renderHeader() {
   status.textContent = statusLabel(ws);
   status.className = "status " + ws.status;
 
-  const pr = $("ws-pr");
-  if (ws.pull_request) {
-    pr.textContent = `PR #${ws.pull_request.number} ↗`;
-    pr.href = ws.pull_request.url;
-    pr.classList.remove("hidden");
-  } else {
-    pr.classList.add("hidden");
-  }
+  // Every pull request of the workspace: Create PR's, and Claude's.
+  const prs = $("ws-prs");
+  prs.replaceChildren(
+    ...GitHub.pullRequests(ws).map((pr) =>
+      h("a", { class: "pr-link", href: pr.url, target: "_blank", rel: "noopener noreferrer", text: pr.label, title: pr.title }),
+    ),
+  );
   const busy = ws.status === "working" || ws.status === "creating" || ws.status === "connecting";
   // History is read-only: it can only be archived (or brought back).
   const past = isTerminated(ws);
@@ -977,6 +976,21 @@ function renderEntry(e) {
       box.appendChild(h("div", { class: "entry notice", text: e.text }));
       if (e.text.startsWith("Stopped")) markPendingTools();
       break;
+    case "github": {
+      // Claude had Mosso push, or open or update a pull request.
+      const a = GitHub.action(e.github);
+      box.appendChild(
+        h(
+          "div",
+          { class: "entry pr-card agent" + (a.ok ? "" : " failed") },
+          h("strong", { text: a.heading }),
+          a.link ? h("a", { href: a.link.url, target: "_blank", rel: "noopener noreferrer", text: a.link.text }) : null,
+          a.detail ? h("span", { class: "muted", text: a.detail }) : null,
+          a.error ? h("span", { class: "pr-error", text: a.error }) : null,
+        ),
+      );
+      break;
+    }
     case "pull_request": {
       const pr = e.pull_request;
       box.appendChild(
@@ -1042,7 +1056,13 @@ function renderEvent(ev) {
     const details = h(
       "details",
       { class: "entry tool" },
-      h("summary", {}, h("span", { class: "tool-name", text: ev.name }), h("span", { class: "tool-desc", text: toolSummary(ev.name, input) }), stateEl),
+      h(
+        "summary",
+        {},
+        h("span", { class: "tool-name", text: GitHub.toolName(ev.name) }),
+        h("span", { class: "tool-desc", text: GitHub.toolSummary(ev.name, input) || toolSummary(ev.name, input) }),
+        stateEl,
+      ),
       body,
     );
     if (ev.name === "Task" || ev.name === "Agent") details.appendChild(children);

@@ -163,6 +163,34 @@ type fakeGitHub struct {
 	// pushStatus, if set, is the HTTP status for every push request, to
 	// simulate a token without write access.
 	pushStatus int
+	// checkRuns are the check runs of every commit; statusForbidden
+	// makes commit statuses unreadable, like a token without the
+	// Commit statuses permission.
+	checkRuns       []map[string]any
+	statusForbidden bool
+}
+
+// pull returns pull request number n. Call with f.mu held.
+func (f *fakeGitHub) pull(n string) map[string]any {
+	for _, p := range f.pulls {
+		if fmt.Sprint(p["number"]) == n {
+			return p
+		}
+	}
+	return nil
+}
+
+// apiPull renders a stored pull request like GitHub's REST API.
+func (f *fakeGitHub) apiPull(p map[string]any) map[string]any {
+	head, _ := p["head"].(string)
+	sha, _ := gitCmd(f.bare, "", nil, "rev-parse", "--verify", "--quiet", "refs/heads/"+head)
+	return map[string]any{
+		"number": p["number"], "html_url": p["html_url"], "node_id": fmt.Sprintf("PR_%v", p["number"]),
+		"title": p["title"], "body": p["body"], "state": p["state"], "draft": p["draft"] == true,
+		"merged_at": nil,
+		"head":      map[string]any{"ref": head, "sha": sha, "repo": map[string]any{"full_name": testRepo}},
+		"base":      map[string]any{"ref": p["base"]},
+	}
 }
 
 func newFakeGitHub(t *testing.T, backend, token string, private bool) *fakeGitHub {
@@ -225,10 +253,15 @@ func newFakeGitHub(t *testing.T, backend, token string, private bool) *fakeGitHu
 		f.mu.Lock()
 		defer f.mu.Unlock()
 		out := []map[string]any{}
-		for _, p := range f.pulls {
-			if "octo:"+p["head"].(string) == q.Get("head") && p["base"] == q.Get("base") && p["state"] == "open" {
-				out = append(out, p)
+		for i := len(f.pulls) - 1; i >= 0; i-- {
+			p := f.pulls[i]
+			if "octo:"+p["head"].(string) != q.Get("head") || (q.Get("base") != "" && p["base"] != q.Get("base")) {
+				continue
 			}
+			if st := q.Get("state"); st != "all" && p["state"] != st {
+				continue
+			}
+			out = append(out, f.apiPull(p))
 		}
 		f.json(w, 200, out)
 	})
@@ -236,12 +269,85 @@ func newFakeGitHub(t *testing.T, backend, token string, private bool) *fakeGitHu
 		var in map[string]any
 		_ = json.NewDecoder(r.Body).Decode(&in)
 		f.mu.Lock()
+		defer f.mu.Unlock()
+		head, _ := in["head"].(string)
+		if f.must("rev-parse", "--verify", "--quiet", "refs/heads/"+head) == "" {
+			f.json(w, 422, map[string]any{"message": "Validation Failed", "errors": []map[string]string{{"field": "head", "code": "invalid"}}})
+			return
+		}
 		n := len(f.pulls) + 1
 		in["number"], in["state"] = n, "open"
 		in["html_url"] = fmt.Sprintf("https://github.com/%s/pull/%d", testRepo, n)
 		f.pulls = append(f.pulls, in)
-		f.mu.Unlock()
-		f.json(w, 201, in)
+		f.json(w, 201, f.apiPull(in))
+	})
+	mux.HandleFunc("GET /repos/octo/widgets/pulls/{n}", func(w http.ResponseWriter, r *http.Request) {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		p := f.pull(r.PathValue("n"))
+		if p == nil {
+			f.json(w, 404, map[string]any{"message": "Not Found"})
+			return
+		}
+		out := f.apiPull(p)
+		out["mergeable"], out["mergeable_state"] = true, "clean"
+		f.json(w, 200, out)
+	})
+	mux.HandleFunc("PATCH /repos/octo/widgets/pulls/{n}", func(w http.ResponseWriter, r *http.Request) {
+		var in map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&in)
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		p := f.pull(r.PathValue("n"))
+		if p == nil {
+			f.json(w, 404, map[string]any{"message": "Not Found"})
+			return
+		}
+		for _, k := range []string{"title", "body"} {
+			if v, ok := in[k]; ok {
+				p[k] = v
+			}
+		}
+		f.json(w, 200, f.apiPull(p))
+	})
+	mux.HandleFunc("POST /graphql", func(w http.ResponseWriter, r *http.Request) {
+		var in struct {
+			Query     string         `json:"query"`
+			Variables map[string]any `json:"variables"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&in)
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		id, _ := in.Variables["id"].(string)
+		p := f.pull(strings.TrimPrefix(id, "PR_"))
+		if p == nil {
+			f.json(w, 200, map[string]any{"errors": []map[string]string{{"message": "Could not resolve to a node"}}})
+			return
+		}
+		p["draft"] = strings.Contains(in.Query, "convertPullRequestToDraft")
+		f.json(w, 200, map[string]any{"data": map[string]any{}})
+	})
+	mux.HandleFunc("GET /repos/octo/widgets/git/ref/heads/{branch...}", func(w http.ResponseWriter, r *http.Request) {
+		sha, err := gitCmd(f.bare, "", nil, "rev-parse", "--verify", "--quiet", "refs/heads/"+r.PathValue("branch"))
+		if err != nil || sha == "" {
+			f.json(w, 404, map[string]any{"message": "Not Found"})
+			return
+		}
+		f.json(w, 200, map[string]any{"ref": "refs/heads/" + r.PathValue("branch"), "object": map[string]any{"sha": sha, "type": "commit"}})
+	})
+	mux.HandleFunc("GET /repos/octo/widgets/commits/{sha}/check-runs", func(w http.ResponseWriter, r *http.Request) {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		f.json(w, 200, map[string]any{"total_count": len(f.checkRuns), "check_runs": f.checkRuns})
+	})
+	mux.HandleFunc("GET /repos/octo/widgets/commits/{sha}/status", func(w http.ResponseWriter, r *http.Request) {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		if f.statusForbidden {
+			f.json(w, 403, map[string]any{"message": "Resource not accessible by personal access token"})
+			return
+		}
+		f.json(w, 200, map[string]any{"state": "success", "statuses": []any{}})
 	})
 	f.api = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()

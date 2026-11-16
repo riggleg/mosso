@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -31,7 +32,9 @@ import (
 // script fails, to look at how that is reported. MOSSO_FAKE_SCENARIO=sections
 // creates sections (one of them the default) with workspaces in them, an
 // unsectioned one and one in the history, to look at the sidebar's
-// sections and the New workspace dialog.
+// sections and the New workspace dialog. MOSSO_FAKE_SCENARIO=github creates
+// a workspace in which Claude pushed and opened pull requests into master
+// and uat with Mosso's GitHub tools, and one push failed.
 func TestServeFakeForBrowser(t *testing.T) {
 	addr := os.Getenv("MOSSO_FAKE_ADDR")
 	if addr == "" {
@@ -39,8 +42,30 @@ func TestServeFakeForBrowser(t *testing.T) {
 	}
 	srv, fake := newTestServer(t)
 	withToken(srv, testClaudeToken, nil)
-	withGitHub(t, srv, &fakeGitHubAPI{})
+	gh := &fakeGitHubAPI{remote: map[string]string{"uat": "5555555555555555555555555555555555555555"}}
+	withGitHub(t, srv, gh)
 	fake.stdoutFor = fakeRepoSandbox()
+	if os.Getenv("MOSSO_FAKE_SCENARIO") == "github" {
+		rec := do(t, srv.Handler(), http.MethodPost, "/workspaces", `{"repo":"octo/widgets","base":"main","instructions":"Run the relevant tests. When done, create pull requests targeting both main and uat."}`)
+		var ws testWorkspace
+		_ = json.Unmarshal(rec.Body.Bytes(), &ws)
+		uat := ws.Branch + "-uat"
+		fake.claude.script(
+			call("github_push", `{}`),
+			call("github_create_pr", `{"title":"Fix the flaky widget test","body":"Waits for the widget to render."}`),
+			call("github_fetch", `{"branch":"uat"}`),
+			call("github_push", `{"branch":"`+uat+`","source":"fix-uat"}`),
+			call("github_create_pr", `{"title":"Fix the flaky widget test (uat)","head":"`+uat+`","base":"uat"}`),
+			call("github_checks", `{"pr":1}`),
+		)
+		do(t, srv.Handler(), http.MethodPost, "/workspaces/"+ws.Name+"/claude/messages", `{"prompt":"Fix the flaky widget test"}`)
+		gh.mu.Lock()
+		gh.pushErr = errors.New("push: the push is not a fast-forward: " + uat + " on GitHub (555555555555) has commits that fix-uat (4444444) does not contain, and Mosso does not force-push for agents. Mosso has fetched it as origin/" + uat + " in the sandbox: rebase onto or merge it, then push again")
+		gh.mu.Unlock()
+		fake.claude.script(call("github_push", `{"branch":"`+uat+`","source":"fix-uat"}`))
+		do(t, srv.Handler(), http.MethodPost, "/workspaces/"+ws.Name+"/claude/messages", `{"prompt":"Push the uat fix again"}`)
+		t.Logf("workspace %s", ws.Name)
+	}
 	if os.Getenv("MOSSO_FAKE_SCENARIO") == "setup" {
 		body, _ := json.Marshal(map[string]string{
 			"default_image":        "my-team/my-project/dev-image:v1",

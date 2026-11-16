@@ -100,60 +100,34 @@ hover. They are limited to 16 KiB (they travel as one command-line
 argument), trimmed, and stored as given: like the rest of the prompt they
 are text you write, not secrets; do not put tokens in them.
 
-## GitHub capabilities: what the agent can do today
+## GitHub capabilities: what the agent can do
 
 Mosso keeps GitHub credentials on the Mosso server (Keychain, memory or
 `MOSSO_GITHUB_TOKEN`); see [github.md](github.md#security-model-and-limitations).
-The sandbox, and so Claude, never has a GitHub token. Concretely:
+The sandbox, and so Claude, never has a GitHub token. Instead Claude has
+Mosso's GitHub tools, which Mosso runs on its server for the workspace's
+repository only; see [agent-github.md](agent-github.md).
 
-| Capability | Today |
+| Capability | |
 | --- | --- |
 | Read the repository, edit files, run tests | Yes, in the sandbox checkout. |
 | Commit, create and switch local branches, rebase, merge, cherry-pick | Yes, locally. |
-| See the latest base branch | Yes: before each turn Mosso fetches the workspace's **base** and **working** branches into `origin/<base>` and `origin/<branch>`. |
-| See other remote branches (for example `uat` when the base is `master`) | Only for public repositories, where anonymous `git fetch` works. For private repositories, no: they are not fetched. |
-| Push | No. Only Mosso pushes, when you click **Create PR** / **Update PR**, and only `HEAD` to the workspace's own `mosso/*` branch. |
-| Open or update pull requests | No. Mosso opens **one** pull request per workspace, from its `mosso/*` branch into its base branch, when you publish. |
-| `gh`, GitHub API, issues, reviews, CI status | No credentials, so no. |
+| See the latest base branch | Yes: before each turn Mosso fetches the workspace's **base** and **working** branches, and every branch Claude fetched or pushed, into `origin/<branch>`. |
+| See other branches (for example `uat` when the base is `master`) | Yes, with `github_fetch`; they are then kept current before each turn. |
+| Push | Yes, with `github_push`: committed work, fast-forward only, to the workspace's own branches (`mosso/<id>` and `mosso/<id>-<suffix>`). |
+| Open, read and update pull requests | Yes, any number, into any base branch of the repository, from the workspace's own branches (`github_create_pr`, `github_list_prs`, `github_get_pr`, `github_update_pr`). |
+| CI results | Yes, with `github_checks`. |
+| Force-push, delete branches, merge or close pull requests, push to other branches, other repositories, `gh` | No. |
 
 So an instruction such as *"create pull requests targeting both master and
-uat"* cannot be carried out by the agent alone today. With the framing
-above, Claude prepares what it can (the change on the working branch, and,
-if asked, a second local branch with the change applied for `uat`) and tells
-you what is left. You publish the first pull request from Mosso; the second
-has to be opened by hand (for example by pushing the prepared branch from
-another clone, or creating a second workspace on base `uat`).
-
-### Gap and recommendation (not implemented here)
-
-Multiple pull requests per workspace need two small, Mosso-mediated
-capabilities, not a workflow engine and not a token in the sandbox:
-
-1. **Fetch extra base branches.** Let a section list additional branches to
-   keep fetched (e.g. `uat`), synced into `origin/<branch>` before each turn
-   like the base branch, through the existing server-side mirror. Without
-   this, Claude cannot see `uat` in a private repository.
-2. **A narrow "publish request" tool for the agent.** The worker already
-   runs inside the sandbox and talks to Mosso; add one agent-facing command
-   (for example `mosso-publish --branch <local-branch> --base uat --title …`)
-   that records a *request*, which Mosso validates and performs with the
-   same code path as **Create PR** (`Mirror.Publish`: bundle out of the
-   sandbox, `fsck`, refuse tokens in commits, `--force-with-lease`, open or
-   update the pull request). Constraints that keep it safe:
-   - the token stays on the Mosso server; the tool only names refs;
-   - head branches are always Mosso's (`mosso/<workspace>-<suffix>`), never
-     the base or arbitrary branches;
-   - base branches must be in an allowlist on the section (e.g. `master`,
-     `uat`);
-   - every request shows in the chat, and a section setting can require a
-     click to approve it before anything is pushed;
-   - rate limits per turn.
-
-That keeps "multi-PR" in the instructions, where the user can describe
-branch differences in plain words, while Mosso only adds one audited,
-allow-listed push/PR primitive. It needs changes to the worker, the mirror
-(several head branches per workspace) and the workspace state (several pull
-requests), so it is deliberately left out of this change.
+uat"* is carried out by Claude in its turn: it pushes the working branch and
+opens a pull request into `master`, fetches `uat`, ports the change onto a
+local branch from `origin/uat` (handling where the branches differ), pushes
+that to `mosso/<id>-uat` and opens a pull request into `uat`. Mosso does not
+know the instruction asked for two: the instructions say what to do, the
+tools are the same for one pull request or five. **Create PR** still
+publishes the working branch into the base branch, and is the same pull
+request as the one Claude opened from it.
 
 ## API
 

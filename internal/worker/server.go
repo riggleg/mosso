@@ -18,8 +18,9 @@ import (
 	"github.com/riggleg/mosso/internal/claude"
 )
 
-// Version identifies the worker protocol and build.
-const Version = "1"
+// Version identifies the worker protocol. 2 added Mosso's tools (calls.go,
+// mcp.go); the server replaces an idle worker of another version.
+const Version = "2"
 
 // followPing is how often a followed event stream sends a heartbeat.
 const followPing = 15 * time.Second
@@ -36,9 +37,15 @@ type Server struct {
 	log        *Log
 	claudePath string
 	run        Runner
+	// mcp is the command that runs the worker's MCP server, which Claude
+	// Code starts to reach Mosso's tools; nil offers no tools.
+	mcp []string
+	// pickupTimeout and callTimeout bound how long a tool call waits.
+	pickupTimeout, callTimeout time.Duration
 
-	mu  sync.Mutex
-	cur *task // running task, if any
+	mu    sync.Mutex
+	cur   *task            // running task, if any
+	calls map[string]*call // tool calls in flight, by ID
 }
 
 // task is one message being worked on.
@@ -49,6 +56,7 @@ type task struct {
 	cancel  context.CancelFunc
 	stopped bool // the user asked to stop it
 	done    chan struct{}
+	calls   int // tool calls made so far
 }
 
 // New returns a worker over the log. If the log ends in a task that was
@@ -56,14 +64,25 @@ type task struct {
 // while Claude Code worked), that task is marked interrupted now, so the
 // server can tell the user and nothing waits for a result that never comes.
 func New(l *Log, claudePath string) *Server {
-	s := &Server{log: l, claudePath: claudePath}
+	s := &Server{log: l, claudePath: claudePath, pickupTimeout: DefaultPickupTimeout, callTimeout: DefaultCallTimeout}
 	s.run = s.runClaude
+	s.markOpenCalls()
 	s.markInterrupted()
 	return s
 }
 
 // SetRunner replaces how tasks are run, for tests.
 func (s *Server) SetRunner(r Runner) { s.run = r }
+
+// SetMCP gives Claude Code the command that runs the worker's MCP server
+// (for example the worker binary with "mcp"), so it can use Mosso's tools.
+func (s *Server) SetMCP(command ...string) { s.mcp = command }
+
+// SetCallTimeouts changes how long a tool call waits to be picked up by the
+// server, and in all; for tests.
+func (s *Server) SetCallTimeouts(pickup, total time.Duration) {
+	s.pickupTimeout, s.callTimeout = pickup, total
+}
 
 // markInterrupted closes a task left open by a previous worker process.
 func (s *Server) markInterrupted() {
@@ -88,6 +107,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /events", s.events)
 	mux.HandleFunc("POST /messages", s.message)
 	mux.HandleFunc("POST /stop", s.stop)
+	mux.HandleFunc("POST /tools/calls", s.toolCall)
+	mux.HandleFunc("POST /tools/calls/{id}/start", s.startCall)
+	mux.HandleFunc("POST /tools/calls/{id}/result", s.callResult)
 	return mux
 }
 
@@ -95,8 +117,9 @@ func (s *Server) Handler() http.Handler {
 func (s *Server) Status() Status {
 	s.mu.Lock()
 	cur := s.cur
+	pending := s.pendingCallsLocked()
 	s.mu.Unlock()
-	st := Status{State: "idle", Seq: s.log.Seq(), SessionID: s.log.LastSessionID(), Version: Version, PID: os.Getpid()}
+	st := Status{State: "idle", Seq: s.log.Seq(), SessionID: s.log.LastSessionID(), Version: Version, PID: os.Getpid(), PendingCalls: pending}
 	if cur != nil {
 		started := cur.started
 		st.State, st.TaskID, st.StartedAt = "running", cur.id, &started

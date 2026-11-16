@@ -17,20 +17,23 @@ import (
 // worker logs) and whose database outlive the server, so a second server
 // can be started over them like Mosso after a restart.
 type persistentHarness struct {
-	t       *testing.T
-	fake    *fakeVercel
-	api     *httptest.Server
-	dataDir string
-	srv     *Server
-	ts      *httptest.Server
-	ws      testWorkspace
+	t         *testing.T
+	fake      *fakeVercel
+	vercelAPI *httptest.Server
+	dataDir   string
+	srv       *Server
+	ts        *httptest.Server
+	ws        testWorkspace
+	// api, if set, is the fake GitHub the next start uses; a new one
+	// otherwise.
+	api *fakeGitHubAPI
 }
 
 func newPersistentHarness(t *testing.T) *persistentHarness {
 	t.Helper()
 	fake, api := newFakeVercel(t)
 	fake.stdoutFor = fakeRepoSandbox()
-	h := &persistentHarness{t: t, fake: fake, api: api, dataDir: t.TempDir()}
+	h := &persistentHarness{t: t, fake: fake, vercelAPI: api, dataDir: t.TempDir()}
 	h.start()
 	rec := do(t, h.srv.Handler(), http.MethodPost, "/workspaces", `{"repo":"octo/widgets"}`)
 	if rec.Code != http.StatusCreated {
@@ -43,9 +46,13 @@ func newPersistentHarness(t *testing.T) *persistentHarness {
 // start runs a new Mosso server over the saved state, like a restart.
 func (h *persistentHarness) start() {
 	h.t.Helper()
-	h.srv = newServerOver(h.t, h.fake, h.api, h.dataDir, func(srv *Server) {
+	gh := h.api
+	if gh == nil {
+		gh = &fakeGitHubAPI{}
+	}
+	h.srv = newServerOver(h.t, h.fake, h.vercelAPI, h.dataDir, func(srv *Server) {
 		withToken(srv, testClaudeToken, nil)
-		withGitHub(h.t, srv, &fakeGitHubAPI{})
+		withGitHub(h.t, srv, gh)
 	})
 	h.ts = httptest.NewServer(h.srv.Handler())
 	h.t.Cleanup(h.ts.Close)
