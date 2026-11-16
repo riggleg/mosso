@@ -29,6 +29,13 @@ var migrations = []string{
 		entry        TEXT NOT NULL        -- JSON, as the web UI shows it
 	);
 	CREATE INDEX chat_entries_workspace ON chat_entries (workspace_id, id);`,
+	// 2: each workspace's Claude model, and settings such as the default
+	// model. Workspaces from before have no model: Claude Code's default.
+	`ALTER TABLE workspaces ADD COLUMN model TEXT NOT NULL DEFAULT ''; -- passed to claude --model, fixed for the workspace's life
+	CREATE TABLE settings (
+		key   TEXT PRIMARY KEY, -- for example "default_model"
+		value TEXT NOT NULL
+	);`,
 }
 
 // migrate applies the migrations the database has not seen yet, each in

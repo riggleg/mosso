@@ -39,6 +39,11 @@ func (s *Server) runClaude(ctx context.Context, msg Message, emit func(Event)) (
 	if msg.SystemPrompt != "" {
 		args = append(args, "--append-system-prompt", msg.SystemPrompt)
 	}
+	// Every turn, resumed or not, passes the model: Claude Code does not
+	// remember it in the session.
+	if msg.Model != "" {
+		args = append(args, "--model", msg.Model)
+	}
 	cmd := exec.CommandContext(ctx, s.claudePath, args...)
 	cmd.Dir = msg.Dir
 	cmd.Stdin = strings.NewReader(msg.Prompt)

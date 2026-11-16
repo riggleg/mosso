@@ -172,11 +172,14 @@ type turnRun struct {
 // it, or the sandbox session ends. A nil sessionID continues the chat's
 // conversation. It reports false if something else is running in the
 // workspace.
-func (s *Server) startTurn(ws *workspace, token claude.Token, prompt string, atts []attachment, sessionID *string) (*turnRun, bool) {
+//
+// userIdx is the chat entry already showing the prompt, or -1 to add one:
+// a workspace created with a first message shows it while it is set up.
+func (s *Server) startTurn(ws *workspace, token claude.Token, prompt string, atts []attachment, sessionID *string, userIdx int) (*turnRun, bool) {
 	if !s.acquire(ws.Name) {
 		return nil, false
 	}
-	run := &turnRun{done: make(chan struct{}), userIdx: -1}
+	run := &turnRun{done: make(chan struct{}), userIdx: userIdx}
 	c := ws.chat
 	s.mu.Lock()
 	sid := c.sessionID
@@ -185,7 +188,9 @@ func (s *Server) startTurn(ws *workspace, token claude.Token, prompt string, att
 	}
 	c.running, c.err = run, ""
 	ws.taskRunning = true
-	run.userIdx = c.add(chatEntry{Type: "user", Text: prompt, Attachments: atts}).ID
+	if run.userIdx < 0 {
+		run.userIdx = c.add(chatEntry{Type: "user", Text: prompt, Attachments: atts}).ID
+	}
 	s.persistLocked(ws)
 	s.mu.Unlock()
 
@@ -250,6 +255,7 @@ func (s *Server) submitTurn(ctx context.Context, ws *workspace, run *turnRun, to
 		SessionID:    sid,
 		Dir:          ws.Dir,
 		SystemPrompt: workspacePrompt(ws),
+		Model:        ws.Model,
 		Token:        token.Reveal(),
 	})
 	if err != nil {
@@ -261,6 +267,7 @@ func (s *Server) submitTurn(ctx context.Context, ws *workspace, run *turnRun, to
 		return nil // terminated meanwhile; the sandbox is going away
 	}
 	run.taskID = acc.TaskID
+	ws.queuedPrompt = false // the worker has it
 	// The follower may already have delivered the worker's user event.
 	if acc.Seq > ws.lastSeq {
 		ws.lastSeq = acc.Seq
@@ -313,7 +320,18 @@ func (s *Server) applyEvent(ws *workspace, e worker.Event) {
 			if run.taskID == "" {
 				run.taskID = e.TaskID
 			}
+			ws.queuedPrompt = false
 			break
+		}
+		if ws.queuedPrompt {
+			// The worker got the first message before Mosso stopped and
+			// recorded it: this is its copy, not a new message.
+			ws.queuedPrompt = false
+			if i := queuedEntry(c); i >= 0 {
+				c.entries[i].Seq = e.Seq
+				s.persistLocked(ws)
+				break
+			}
 		}
 		var atts []attachment
 		_ = json.Unmarshal(e.Attachments, &atts)
@@ -446,7 +464,7 @@ func (s *Server) startTurnWithAttachments(w http.ResponseWriter, name string, to
 		writeError(w, http.StatusConflict, "the workspace is still being set up")
 		return nil, false
 	}
-	run, ok := s.startTurn(live, token, req.Prompt, atts, sessionID)
+	run, ok := s.startTurn(live, token, req.Prompt, atts, sessionID, -1)
 	if !ok {
 		writeBusy(w)
 	}

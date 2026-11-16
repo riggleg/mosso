@@ -334,3 +334,22 @@ func TestParseStreamBoundsKeptEvents(t *testing.T) {
 		t.Fatalf("streamed %d, kept %d of %d events, result %q", streamed, len(turn.Events), n, turn.Result)
 	}
 }
+
+func TestModels(t *testing.T) {
+	if !KnownModel(DefaultModel) {
+		t.Fatalf("the default model %s is not offered", DefaultModel)
+	}
+	for _, m := range Models {
+		if !ValidModelID(m.ID) || m.Name == "" {
+			t.Errorf("model %+v", m)
+		}
+	}
+	for _, id := range []string{"", "--resume", "-x", "claude opus", "claude-opus;rm", strings.Repeat("a", 65)} {
+		if ValidModelID(id) {
+			t.Errorf("ValidModelID(%q) = true", id)
+		}
+	}
+	if KnownModel("claude-retired-1") || !ValidModelID("claude-retired-1") {
+		t.Error("an unknown but well-formed ID should be valid but not known")
+	}
+}

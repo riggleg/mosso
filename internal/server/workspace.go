@@ -41,6 +41,10 @@ type workspace struct {
 	Branch  string         `json:"branch"`
 	Dir     string         `json:"dir"`
 	Sandbox vercel.Sandbox `json:"sandbox"`
+	// Model is the Claude model every turn runs with, chosen when the
+	// workspace is created and never changed; empty (Claude Code's
+	// default) for workspaces from before models could be chosen.
+	Model string `json:"model,omitempty"`
 	// SandboxState is "running", "stopped" (resumes on the next message),
 	// "gone" (deleted elsewhere or expired) or "terminated" (deleted by
 	// terminating the workspace); computed by snapshotLocked.
@@ -80,6 +84,9 @@ type workspace struct {
 	pushed string
 	// unsaved is set while the database is behind what is in memory.
 	unsaved bool
+	// queuedPrompt is set while the first message given with the workspace
+	// has not reached the worker; see workspaceState.QueuedPrompt.
+	queuedPrompt bool
 
 	// Sandbox worker state, guarded by Server.mu. lastSeq is the last
 	// worker event applied to the chat; taskRunning says a Claude task is
@@ -288,15 +295,21 @@ func (s *Server) getWorkspace(w http.ResponseWriter, r *http.Request) {
 
 // createWorkspace provisions a persistent sandbox, clones the repository's
 // base branch into it, checks out a new working branch, installs Claude
-// Code and starts the Mosso worker. The sandbox is destroyed if any step
-// fails.
+// Code and starts the Mosso worker. The workspace runs the requested Claude
+// model, or the default model. The sandbox is destroyed if any step fails.
+//
+// With a prompt, the chat shows it at once and Claude starts on it as soon
+// as the workspace is ready, whether or not the client is still connected.
 func (s *Server) createWorkspace(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Repo           string `json:"repo"`
 		Base           string `json:"base"`
+		Model          string `json:"model"`
 		TimeoutSeconds int    `json:"timeout_seconds"`
+		// Prompt is the first message for Claude; optional.
+		Prompt string `json:"prompt"`
 	}
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&req); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 2*claude.MaxPromptBytes)).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
@@ -310,6 +323,30 @@ func (s *Server) createWorkspace(w http.ResponseWriter, r *http.Request) {
 	case req.TimeoutSeconds < 0 || req.TimeoutSeconds > maxSeconds:
 		writeError(w, http.StatusBadRequest, fmt.Sprintf("timeout_seconds must be between 0 and %d", maxSeconds))
 		return
+	case req.Model != "" && !claude.KnownModel(req.Model):
+		writeError(w, http.StatusBadRequest, "model is not one of the models GET /settings lists")
+		return
+	case len(req.Prompt) > claude.MaxPromptBytes-promptReserve:
+		writeError(w, http.StatusBadRequest, "prompt is too long")
+		return
+	}
+	if strings.TrimSpace(req.Prompt) == "" {
+		req.Prompt = ""
+	}
+	// Without a Claude token the first message could not run: say so
+	// before paying for a sandbox.
+	var token claude.Token
+	if req.Prompt != "" {
+		var ok bool
+		if token, ok = s.loadClaudeToken(w, r); !ok {
+			return
+		}
+	}
+	model := req.Model
+	if model == "" {
+		s.mu.Lock()
+		model = s.defaultModel
+		s.mu.Unlock()
 	}
 	timeout := time.Duration(req.TimeoutSeconds) * time.Second
 	if timeout == 0 {
@@ -361,6 +398,7 @@ func (s *Server) createWorkspace(w http.ResponseWriter, r *http.Request) {
 		Base:         base,
 		Branch:       github.NewBranchName(),
 		Dir:          path.Join(claude.WorkDir, req.Repo[strings.IndexByte(req.Repo, '/')+1:]),
+		Model:        model,
 		Sandbox:      *sb,
 		ExpiresAt:    sb.ExpiresAt(),
 		CreatedAt:    time.Now().UTC(),
@@ -377,6 +415,11 @@ func (s *Server) createWorkspace(w http.ResponseWriter, r *http.Request) {
 		ws.Repo = req.Repo
 	}
 	ws.chat.persist = s.persister(ws)
+	firstIdx := -1
+	if req.Prompt != "" {
+		firstIdx = ws.chat.add(chatEntry{Type: "user", Text: req.Prompt}).ID
+		ws.queuedPrompt = true
+	}
 	// List the workspace as "creating" and hold it while cloning so nothing
 	// else runs in it. Destroy it if it does not come up.
 	s.mu.Lock()
@@ -486,6 +529,21 @@ func (s *Server) createWorkspace(w http.ResponseWriter, r *http.Request) {
 			log.Printf("workspace %s: %v", ws.Name, err)
 		}
 	}()
+	if req.Prompt != "" {
+		if _, ok := s.startTurn(ws, token, req.Prompt, nil, nil, firstIdx); ok {
+			s.mu.Lock()
+			snapshot = s.snapshotLocked(ws)
+			s.mu.Unlock()
+		} else {
+			// Only if another message got in first, which the web UI
+			// does not do.
+			s.mu.Lock()
+			ws.queuedPrompt = false
+			ws.chat.add(chatEntry{Type: "error", Text: "Your first message was not sent because another one was already running. Send it again."})
+			s.persistLocked(ws)
+			s.mu.Unlock()
+		}
+	}
 	writeJSON(w, http.StatusCreated, snapshot)
 }
 

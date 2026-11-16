@@ -11,6 +11,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/riggleg/mosso/internal/claude"
 	"github.com/riggleg/mosso/internal/github"
 )
 
@@ -149,6 +150,8 @@ type testWorkspace struct {
 	BaseSHA     string `json:"base_sha"`
 	Branch      string `json:"branch"`
 	Dir         string `json:"dir"`
+	Model       string `json:"model"`
+	Status      string `json:"status"`
 	PullRequest *struct {
 		Number int    `json:"number"`
 		URL    string `json:"url"`
@@ -173,7 +176,7 @@ func TestWorkspaceToPullRequest(t *testing.T) {
 		!strings.HasPrefix(ws.Branch, "mosso/") || ws.Dir != "/vercel/sandbox/widgets" || !strings.HasPrefix(ws.Name, "mosso-") {
 		t.Fatalf("unexpected workspace: %s", rec.Body)
 	}
-	clone, _ := json.Marshal(fake.cmds[0])
+	clone, _ := json.Marshal(fake.commands()[0])
 	if !strings.Contains(string(clone), "https://github.com/octo/widgets.git") ||
 		!strings.Contains(string(clone), "42+octo@users.noreply.github.com") {
 		t.Fatalf("unexpected clone command: %s", clone)
@@ -193,7 +196,7 @@ func TestWorkspaceToPullRequest(t *testing.T) {
 	}
 	// The Claude token reaches the worker through the command environment,
 	// never through command arguments.
-	for _, c := range fake.cmds {
+	for _, c := range fake.commands() {
 		if args, _ := json.Marshal(c["args"]); strings.Contains(string(args), testClaudeToken) {
 			t.Fatalf("Claude token in command arguments: %s", args)
 		}
@@ -243,7 +246,7 @@ func TestWorkspaceToPullRequest(t *testing.T) {
 	}
 
 	// The GitHub token never reaches the sandbox for a public repository.
-	for _, c := range fake.cmds {
+	for _, c := range fake.commands() {
 		if b, _ := json.Marshal(c); strings.Contains(string(b), testGitHubToken) {
 			t.Fatalf("GitHub token sent into the sandbox: %s", b)
 		}
@@ -283,7 +286,7 @@ func TestWorkspacePrivateRepoSendsTokenOnlyToClone(t *testing.T) {
 	do(t, h, http.MethodPost, "/workspaces/"+ws.Name+"/claude/messages", `{"prompt":"hi"}`)
 	do(t, h, http.MethodPost, "/workspaces/"+ws.Name+"/pull-request", `{"title":"t"}`)
 
-	for i, c := range fake.cmds {
+	for i, c := range fake.commands() {
 		env, _ := c["env"].(map[string]any)
 		args, _ := json.Marshal(c["args"])
 		if strings.Contains(string(args), testGitHubToken) {
@@ -392,4 +395,72 @@ func TestGitHubAuthStatus(t *testing.T) {
 	if !strings.Contains(rec.Body.String(), `"configured":false`) {
 		t.Fatalf("unexpected body: %s", rec.Body)
 	}
+}
+
+// TestCreateWorkspaceWithFirstMessage: a prompt given with the workspace
+// is in the chat from the start and Claude runs it, with the workspace's
+// model, as soon as the workspace is ready; the chat shows it once.
+func TestCreateWorkspaceWithFirstMessage(t *testing.T) {
+	srv, fake := newTestServer(t)
+	withToken(srv, testClaudeToken, nil)
+	withGitHub(t, srv, &fakeGitHubAPI{})
+	fake.stdoutFor = fakeRepoSandbox()
+	h := srv.Handler()
+
+	ws := createWorkspaceModel(t, h, `{"repo":"octo/widgets","model":"claude-sonnet-5-5","prompt":"fix the flaky test"}`)
+	waitFor(t, func() bool { return getWorkspace(t, h, ws.Name).Status == "ready" && fake.claude.count() == 1 })
+	if task := fake.claude.last(); task.Text != "fix the flaky test" || task.Model != "claude-sonnet-5-5" || task.Dir != ws.Dir || task.SessionID != "" {
+		t.Fatalf("first turn = %+v", task)
+	}
+	srv.mu.Lock()
+	entries := append([]chatEntry(nil), srv.workspaces[ws.Name].chat.entries...)
+	srv.mu.Unlock()
+	if got := entryTypes(entries); !strings.HasPrefix(got, "user ") || strings.Count(got, "user") != 1 || !strings.HasSuffix(got, " result") {
+		t.Fatalf("chat = %s", got)
+	}
+	if entries[0].Text != "fix the flaky test" || entries[0].Seq == 0 {
+		t.Fatalf("first entry = %+v", entries[0])
+	}
+	// The conversation continues from the first message's session.
+	if rec := do(t, h, http.MethodPost, "/workspaces/"+ws.Name+"/chat", `{"prompt":"and then?"}`); rec.Code != http.StatusAccepted {
+		t.Fatalf("follow-up status = %d: %s", rec.Code, rec.Body)
+	}
+	waitFor(t, func() bool { return fake.claude.count() == 2 })
+	if task := fake.claude.last(); task.SessionID != testSessionID || task.Model != "claude-sonnet-5-5" {
+		t.Fatalf("follow-up = %+v", task)
+	}
+}
+
+func TestCreateWorkspaceFirstMessageValidation(t *testing.T) {
+	srv, fake := newTestServer(t)
+	withToken(srv, "", claude.ErrNoToken)
+	withGitHub(t, srv, &fakeGitHubAPI{})
+	fake.stdoutFor = fakeRepoSandbox()
+	h := srv.Handler()
+	// Without a Claude token, a first message fails before a sandbox is made.
+	if rec := do(t, h, http.MethodPost, "/workspaces", `{"repo":"octo/widgets","prompt":"hi"}`); rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("no token: status = %d: %s", rec.Code, rec.Body)
+	}
+	long, _ := json.Marshal(map[string]string{"repo": "octo/widgets", "prompt": strings.Repeat("x", claude.MaxPromptBytes)})
+	if rec := do(t, h, http.MethodPost, "/workspaces", string(long)); rec.Code != http.StatusBadRequest {
+		t.Fatalf("long prompt: status = %d: %s", rec.Code, rec.Body)
+	}
+	fake.mu.Lock()
+	created := len(fake.created)
+	fake.mu.Unlock()
+	if created != 0 {
+		t.Fatalf("created %d sandboxes for rejected requests", created)
+	}
+	// Without a prompt, no Claude token is needed to create a workspace.
+	if ws := createWorkspaceModel(t, h, `{"repo":"octo/widgets","prompt":"  "}`); fake.claude.count() != 0 || ws.Name == "" {
+		t.Fatalf("a blank prompt ran Claude")
+	}
+}
+
+// commands returns the commands run so far. The workspace's follower runs
+// commands in the background, so read them under the lock.
+func (f *fakeVercel) commands() []map[string]any {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]map[string]any(nil), f.cmds...)
 }

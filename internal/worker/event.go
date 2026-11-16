@@ -119,6 +119,9 @@ type Message struct {
 	// Dir is the absolute working directory for Claude Code.
 	Dir          string `json:"dir"`
 	SystemPrompt string `json:"system_prompt,omitempty"`
+	// Model is the Claude model to run (claude --model); empty uses
+	// Claude Code's default.
+	Model string `json:"model,omitempty"`
 	// Token is the Claude Code OAuth token for this task. The worker
 	// holds it in memory for the task only and never writes it to disk.
 	Token string `json:"token"`

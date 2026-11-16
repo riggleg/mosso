@@ -230,6 +230,30 @@ func TestMessageRunsAsynchronouslyAndRecordsIncrementally(t *testing.T) {
 	}
 }
 
+// TestModelIsPassedOnEveryTurn: the model goes to Claude Code on the first
+// turn and on resumed ones; without one, Claude Code picks its default.
+func TestModelIsPassedOnEveryTurn(t *testing.T) {
+	_, ts, _, argsFile := newTestWorker(t)
+	dir := t.TempDir()
+	for _, m := range []Message{
+		{Text: "one", Prompt: "one", Dir: dir, Token: testToken, Model: "claude-sonnet-5-5"},
+		{Text: "two", Prompt: "two", Dir: dir, Token: testToken, Model: "claude-sonnet-5-5", SessionID: testSession},
+		{Text: "three", Prompt: "three", Dir: dir, Token: testToken},
+	} {
+		if resp := post(t, ts.URL+"/messages", m); resp.StatusCode != http.StatusAccepted {
+			t.Fatalf("status = %d", resp.StatusCode)
+		}
+		waitFor(t, func() bool { return getStatus(t, ts.URL).State == "idle" })
+	}
+	args, _ := os.ReadFile(argsFile)
+	runs := strings.Split(strings.TrimSpace(string(args)), "\n")
+	if len(runs) != 3 || !strings.Contains(runs[0], "--model claude-sonnet-5-5") ||
+		!strings.Contains(runs[1], "--resume "+testSession) || !strings.Contains(runs[1], "--model claude-sonnet-5-5") ||
+		strings.Contains(runs[2], "--model") {
+		t.Fatalf("claude runs = %q", runs)
+	}
+}
+
 func TestClaudeFailureIsRecordedAsError(t *testing.T) {
 	_, ts, _, _ := newTestWorker(t)
 	post(t, ts.URL+"/messages", Message{Text: "crash", Prompt: "crash please", Dir: t.TempDir(), Token: testToken})
@@ -296,6 +320,7 @@ func TestMessageValidation(t *testing.T) {
 		"no prompt":    {Text: "x", Dir: "/tmp", Token: testToken},
 		"relative dir": {Prompt: "x", Dir: "tmp", Token: testToken},
 		"bad session":  {Prompt: "x", Dir: "/tmp", Token: testToken, SessionID: "--model"},
+		"bad model":    {Prompt: "x", Dir: "/tmp", Token: testToken, Model: "--resume"},
 		"no token":     {Prompt: "x", Dir: "/tmp"},
 	} {
 		if resp := post(t, ts.URL+"/messages", m); resp.StatusCode != http.StatusBadRequest {

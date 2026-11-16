@@ -124,6 +124,7 @@ CREATE TABLE workspaces (
     repo        TEXT NOT NULL,    -- "owner/repo"
     base        TEXT NOT NULL,    -- the branch the pull request targets
     branch      TEXT NOT NULL,    -- the working branch
+    model       TEXT NOT NULL DEFAULT '', -- the Claude model (migration 2); '' before model selection
     sandbox_id  TEXT NOT NULL,    -- the Vercel sandbox's name
     status      TEXT NOT NULL,    -- running, stopped, gone or terminated
     state       TEXT NOT NULL,    -- JSON, see below
@@ -137,7 +138,15 @@ CREATE TABLE chat_entries (
     entry        TEXT NOT NULL        -- JSON, as the web UI shows it
 );
 CREATE INDEX chat_entries_workspace ON chat_entries (workspace_id, id);
+CREATE TABLE settings (           -- migration 2
+    key   TEXT PRIMARY KEY,       -- "default_model"
+    value TEXT NOT NULL
+);
 ```
+
+`model` is set when the workspace is created and never updated. `settings`
+holds what is configured in the web UI: the default model for new
+workspaces. See [models.md](models.md).
 
 A chat entry that cannot be read back is skipped with a log line; it never
 stops a workspace from being restored.

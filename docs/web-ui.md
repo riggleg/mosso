@@ -22,9 +22,17 @@ frontend build step, Node.js dependency or separate frontend server.
    token later. See [github.md](github.md#connect-github).
 3. Click **+ New** and pick or type a repository (`owner/repo`) and, optionally,
    a base branch. The suggestions list the repositories and branches your
-   GitHub token can access. Mosso provisions a sandbox, clones the base branch
-   onto a new `mosso/*` branch and installs Claude Code, which takes about a
-   minute. The workspace shows as *Setting up* in the sidebar until it is ready.
+   GitHub token can access. Choose the Claude model; the default model (set
+   with **Change** next to *Model* in the sidebar footer) is preselected, and
+   the workspace keeps its model for good. See [models.md](models.md).
+   Optionally type the **first message** (Cmd/Ctrl+Enter creates). Mosso
+   provisions a sandbox, clones the base branch onto a new `mosso/*` branch
+   and installs Claude Code, which takes about a minute. The dialog closes
+   and the workspace opens as soon as its sandbox exists, showing *Setting
+   up* with your first message in the chat; Claude starts on it the moment
+   the workspace is ready, even if you close the page, open another
+   workspace or restart Mosso meanwhile. If setup fails, a banner says why and the message is
+   kept in the dialog.
 4. Describe a task and press Enter (Shift+Enter for a new line). Claude's
    messages, tool calls and tool results appear as Claude produces them. Click
    a tool to see its input (commands, file edits as diffs) and its result.
@@ -123,7 +131,8 @@ browser ──POST /workspaces/{name}/chat──▶ Mosso ──POST /messages (
 These come in addition to the endpoints in [github.md](github.md) and
 [claude-code.md](claude-code.md), which the UI also uses (`POST /workspaces`,
 `POST …/pull-request`, `DELETE /workspaces/{name}`, `GET /claude/auth`,
-`GET /github/auth`, `POST /github/auth`).
+`GET /github/auth`, `POST /github/auth`) and [models.md](models.md)
+(`GET /settings`, `POST /settings`).
 
 | Method & path                              | Description |
 | ------------------------------------------ | ----------- |
