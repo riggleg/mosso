@@ -84,6 +84,9 @@ type workspace struct {
 	pushed string
 	// unsaved is set while the database is behind what is in memory.
 	unsaved bool
+	// queuedPrompt is set while the first message given with the workspace
+	// has not reached the worker; see workspaceState.QueuedPrompt.
+	queuedPrompt bool
 
 	// Sandbox worker state, guarded by Server.mu. lastSeq is the last
 	// worker event applied to the chat; taskRunning says a Claude task is
@@ -415,6 +418,7 @@ func (s *Server) createWorkspace(w http.ResponseWriter, r *http.Request) {
 	firstIdx := -1
 	if req.Prompt != "" {
 		firstIdx = ws.chat.add(chatEntry{Type: "user", Text: req.Prompt}).ID
+		ws.queuedPrompt = true
 	}
 	// List the workspace as "creating" and hold it while cloning so nothing
 	// else runs in it. Destroy it if it does not come up.
@@ -533,7 +537,11 @@ func (s *Server) createWorkspace(w http.ResponseWriter, r *http.Request) {
 		} else {
 			// Only if another message got in first, which the web UI
 			// does not do.
-			s.addEntry(ws.chat, chatEntry{Type: "error", Text: "Your first message was not sent because another one was already running. Send it again."})
+			s.mu.Lock()
+			ws.queuedPrompt = false
+			ws.chat.add(chatEntry{Type: "error", Text: "Your first message was not sent because another one was already running. Send it again."})
+			s.persistLocked(ws)
+			s.mu.Unlock()
 		}
 	}
 	writeJSON(w, http.StatusCreated, snapshot)

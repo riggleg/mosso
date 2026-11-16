@@ -1206,6 +1206,7 @@ async function openCreate() {
   if (!state.settings) state.settings = await api("GET", "/settings").catch(() => null);
   if (state.settings) modelOptions($("create-model"), state.settings.default_model);
   $("create-error").classList.add("hidden");
+  createSeq++; // a create still running no longer owns the dialog
   setCreating(false);
   $("create-dialog").showModal();
   repo.select();
@@ -1246,7 +1247,11 @@ function setCreating(on) {
   $("create-prompt").disabled = on;
 }
 
-let createSeq = 0; // the latest create request, so an older one does not reset the dialog
+// createSeq identifies the dialog's current use: each create request and
+// each opening of the dialog takes the next number. A create request only
+// touches the dialog while it is still the current one, so one that ends
+// late cannot close, clear or reset a dialog opened since.
+let createSeq = 0;
 
 async function submitCreate(ev) {
   ev.preventDefault();
@@ -1259,6 +1264,8 @@ async function submitCreate(ev) {
   err.classList.add("hidden");
   setCreating(true);
   const mine = ++createSeq;
+  const current = () => mine === createSeq;
+  const dialog = $("create-dialog");
   // As soon as the server lists the new workspace (provisioning takes a
   // few seconds; cloning and installing take the rest of the minute),
   // close the dialog and open it: the chat shows the first message and
@@ -1271,7 +1278,11 @@ async function submitCreate(ev) {
     const fresh = state.workspaces.find((w) => !before.has(w.name) && w.status === "creating" && w.repo.toLowerCase() === repo.toLowerCase());
     if (!fresh) return;
     opened = fresh.name;
-    if ($("create-dialog").open) $("create-dialog").close();
+    if (!current()) return; // the dialog was opened again meanwhile
+    // The server has the first message now; clear it so the next
+    // workspace starts empty (it is put back if this create fails).
+    $("create-prompt").value = "";
+    if (dialog.open) dialog.close();
     select(fresh.name);
   }, 1000);
   try {
@@ -1281,25 +1292,37 @@ async function submitCreate(ev) {
     if (prompt) body.prompt = prompt;
     const ws = await api("POST", "/workspaces", body);
     localStorage.setItem("mosso.lastRepo", repo);
+    if (!current()) {
+      await refreshList(); // listed; the dialog belongs to a newer use
+      return;
+    }
     $("create-prompt").value = "";
-    if ($("create-dialog").open) $("create-dialog").close();
+    if (dialog.open) dialog.close();
     await refreshList();
     // Open it, unless the user has moved on to another workspace since.
-    if (!opened || state.selected === opened) select(ws.name);
+    if (current() && (!opened || state.selected === opened)) select(ws.name);
   } catch (e) {
-    err.textContent = e.message;
-    err.classList.remove("hidden");
-    if (e.status === 503 && /GitHub is not connected/.test(e.message)) {
-      $("create-dialog").close();
-      openGitHub();
-    } else if (!$("create-dialog").open) {
-      // The dialog closed early; the first message is still in it.
-      await refreshList();
-      showBanner(`Could not create the ${repo} workspace: ${e.message}` + (prompt ? " Your first message is kept in the New workspace dialog." : ""));
+    if (current() && dialog.open) {
+      err.textContent = e.message;
+      err.classList.remove("hidden");
+      if (e.status === 503 && /GitHub is not connected/.test(e.message)) {
+        dialog.close();
+        openGitHub();
+      }
+      return;
     }
+    // The dialog closed early or was opened again: report it in a banner,
+    // and put the first message back unless the dialog is in use.
+    await refreshList();
+    let kept = false;
+    if (prompt && !dialog.open) {
+      if (!$("create-prompt").value) $("create-prompt").value = prompt;
+      kept = $("create-prompt").value === prompt;
+    }
+    showBanner(`Could not create the ${repo} workspace: ${e.message}` + (kept ? " Your first message is kept in the New workspace dialog." : ""));
   } finally {
     clearInterval(poll);
-    if (mine === createSeq) setCreating(false);
+    if (current()) setCreating(false);
   }
 }
 

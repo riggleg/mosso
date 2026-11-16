@@ -122,6 +122,15 @@ Mosso does not extend sessions or restart work by itself.
 | Checkout, uncommitted changes | yes | yes, after resume | no |
 | Attachments | yes | yes, after resume (not readable while stopped) | no |
 | Published branch and pull request | yes | yes | yes |
+| First message given with a new workspace, not yet sent | yes, sent after the restart (see below) | yes, after resume | no |
+
+**A queued first message.** A workspace created with a first message saves
+it, marked `queued_prompt` in its state, before Claude starts on it. If
+Mosso stops before the worker confirms it, the next start reconnects (resuming
+a stopped sandbox for it) and asks the worker: the worker runs nothing before
+the first message, so an empty event log means it never arrived and Mosso
+sends it now; otherwise the worker's copy is matched to the saved message, so
+it is neither run again nor shown twice.
 
 **Durability caveats (verify before relying on them).** Vercel documents that
 a persistent sandbox's filesystem is snapshotted automatically when a session

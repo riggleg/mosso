@@ -694,12 +694,16 @@ func newFakeVercel(t *testing.T) (*fakeVercel, *httptest.Server) {
 }
 
 // newServerOver returns a server for the fake, saving workspaces in a
-// database in dataDir.
-func newServerOver(t *testing.T, fake *fakeVercel, api *httptest.Server, dataDir string) *Server {
+// database in dataDir. setup runs before Restore, which may start
+// reconnecting (and sending messages) in the background.
+func newServerOver(t *testing.T, fake *fakeVercel, api *httptest.Server, dataDir string, setup ...func(*Server)) *Server {
 	t.Helper()
 	client := vercel.NewClient(vercel.Config{Token: "tok", TeamID: "team", ProjectID: "prj", BaseURL: api.URL})
 	srv := New(client)
 	srv.workerBinary = func(context.Context) ([]byte, error) { return fakeWorkerBinary, nil }
+	for _, f := range setup {
+		f(srv)
+	}
 	if err := srv.Restore(context.Background(), filepath.Join(dataDir, "mosso.db"), filepath.Join(dataDir, "workspaces")); err != nil {
 		t.Fatal(err)
 	}

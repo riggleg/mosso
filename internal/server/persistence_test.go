@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -42,9 +43,10 @@ func newPersistentHarness(t *testing.T) *persistentHarness {
 // start runs a new Mosso server over the saved state, like a restart.
 func (h *persistentHarness) start() {
 	h.t.Helper()
-	h.srv = newServerOver(h.t, h.fake, h.api, h.dataDir)
-	withToken(h.srv, testClaudeToken, nil)
-	withGitHub(h.t, h.srv, &fakeGitHubAPI{})
+	h.srv = newServerOver(h.t, h.fake, h.api, h.dataDir, func(srv *Server) {
+		withToken(srv, testClaudeToken, nil)
+		withGitHub(h.t, srv, &fakeGitHubAPI{})
+	})
 	h.ts = httptest.NewServer(h.srv.Handler())
 	h.t.Cleanup(h.ts.Close)
 	h.t.Cleanup(h.srv.CloseStreams)
@@ -682,5 +684,87 @@ func TestWorkerEventsAreNotDuplicatedOnReplay(t *testing.T) {
 	case <-run.done:
 	default:
 		t.Fatal("run.done not closed")
+	}
+}
+
+// queueFirstMessage rewrites the stopped harness's database as if Mosso
+// had saved the workspace with a queued first message and stopped before
+// the worker confirmed it: the chat is only that message (not matched to
+// any worker event), and the record says it is queued and running.
+func (h *persistentHarness) queueFirstMessage(prompt string) {
+	h.t.Helper()
+	st, err := openStore(filepath.Join(h.dataDir, "mosso.db"))
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	defer st.close()
+	records, err := st.load()
+	if err != nil || len(records) != 1 {
+		h.t.Fatalf("records = %+v, %v", records, err)
+	}
+	rec := records[0]
+	rec.QueuedPrompt, rec.TaskRunning, rec.LastSeq, rec.SessionID = true, true, 0, ""
+	if _, err := st.db.Exec(`DELETE FROM chat_entries WHERE workspace_id = ?`, rec.Name); err != nil {
+		h.t.Fatal(err)
+	}
+	if err := st.save(rec, chatEntry{Type: "user", Text: prompt}); err != nil {
+		h.t.Fatal(err)
+	}
+}
+
+// TestQueuedFirstMessageIsSentAfterRestart: Mosso saved the first message
+// but stopped before the worker got it; after a restart it is sent, once,
+// and not reported as interrupted.
+func TestQueuedFirstMessageIsSentAfterRestart(t *testing.T) {
+	h := newPersistentHarness(t) // the worker has run nothing
+	h.stop()
+	h.queueFirstMessage("first task")
+	h.start()
+	waitFor(t, func() bool { return h.fake.claude.count() == 1 })
+	h.waitStatus("ready")
+	if task := h.fake.claude.last(); task.Text != "first task" || task.SessionID != "" {
+		t.Fatalf("task = %+v", task)
+	}
+	entries := h.history()
+	if got := countTypes(entries); got["user"] != 1 || got["result"] != 1 || got["notice"] != 0 {
+		t.Fatalf("chat = %s", entryTypes(entries))
+	}
+	if entries[0].Type != "user" || entries[0].Seq == 0 {
+		t.Fatalf("first entry = %+v", entries[0])
+	}
+	if rec := h.record(); rec.QueuedPrompt {
+		t.Fatal("still queued after it was sent")
+	}
+}
+
+// TestQueuedFirstMessageTheWorkerHasIsNotRunAgain: the worker got and ran
+// the first message, but Mosso stopped before recording that; after a
+// restart the worker's copy is matched to the saved message instead of
+// running it again or showing it twice.
+func TestQueuedFirstMessageTheWorkerHasIsNotRunAgain(t *testing.T) {
+	h := newPersistentHarness(t)
+	if resp := h.chat("first task"); resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("chat status = %d", resp.StatusCode)
+	}
+	waitFor(t, func() bool { return h.fake.claude.count() == 1 })
+	h.waitStatus("ready")
+	h.stop()
+	h.queueFirstMessage("first task")
+	h.start()
+	h.waitStatus("ready")
+	waitFor(t, func() bool { return countTypes(h.history())["result"] == 1 })
+	time.Sleep(200 * time.Millisecond) // time for a wrong second run to start
+	if n := h.fake.claude.count(); n != 1 {
+		t.Fatalf("Claude ran %d times", n)
+	}
+	entries := h.history()
+	if got := countTypes(entries); got["user"] != 1 || got["notice"] != 0 {
+		t.Fatalf("chat = %s", entryTypes(entries))
+	}
+	if entries[0].Type != "user" || entries[0].Seq != 1 {
+		t.Fatalf("first entry = %+v", entries[0])
+	}
+	if rec := h.record(); rec.QueuedPrompt {
+		t.Fatal("still queued after the worker's copy was matched")
 	}
 }

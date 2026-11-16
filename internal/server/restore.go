@@ -140,6 +140,7 @@ func (s *Server) loadWorkspace(rec workspaceRecord) (*workspace, error) {
 		lastSeq:      rec.LastSeq,
 		sandboxState: rec.SandboxState,
 		pushed:       rec.Pushed,
+		queuedPrompt: rec.QueuedPrompt,
 	}
 	if ws.sandboxState == "" {
 		ws.sandboxState = sandboxStopped
@@ -243,12 +244,74 @@ func (s *Server) reconnect(ws *workspace, lastState string, taskRunning bool) {
 	}
 	s.sandboxes[ws.Name] = *sb
 	s.persistLocked(ws)
+	queued := ws.queuedPrompt
 	s.mu.Unlock()
-	if sb.Running() || taskRunning {
-		if err := s.connect(ctx, ws); err != nil && ctx.Err() == nil {
-			log.Printf("workspace %s: reconnect: %v", ws.Name, err)
+	// A queued first message is what the user is waiting for: resume a
+	// stopped sandbox for it too.
+	if sb.Running() || taskRunning || queued {
+		if err := s.connect(ctx, ws); err != nil {
+			if ctx.Err() == nil {
+				log.Printf("workspace %s: reconnect: %v", ws.Name, err)
+			}
+			return
 		}
 	}
+	if queued {
+		s.sendQueuedPrompt(ctx, ws)
+	}
+}
+
+// sendQueuedPrompt recovers a first message that Mosso saved but stopped
+// before the worker confirmed it. The worker runs nothing before the first
+// message, so its event log tells: empty, the message never reached it and
+// is sent now; otherwise the worker has it, and the follower matches the
+// worker's copy to the saved entry (see applyEvent) so it runs only once.
+func (s *Server) sendQueuedPrompt(ctx context.Context, ws *workspace) {
+	s.mu.Lock()
+	session := ws.Sandbox.SessionID
+	s.mu.Unlock()
+	st, err := s.workerStatus(ctx, session)
+	if err != nil {
+		log.Printf("workspace %s: check the worker for the first message: %v (tried again at the next start)", ws.Name, err)
+		return
+	}
+	s.mu.Lock()
+	idx := queuedEntry(ws.chat)
+	if !ws.queuedPrompt || st.Seq > 0 || idx < 0 || ws.chat.running != nil {
+		s.mu.Unlock()
+		return
+	}
+	prompt := ws.chat.entries[idx].Text
+	// Saved as running if Mosso stopped while submitting; nothing runs.
+	s.finishTurnLocked(ws, nil)
+	s.mu.Unlock()
+	token, _, err := s.claudeToken(ctx)
+	if err == nil {
+		log.Printf("workspace %s: sending the first message, which had not reached the worker before Mosso stopped", ws.Name)
+		if _, ok := s.startTurn(ws, token, prompt, nil, nil, idx); ok {
+			return
+		}
+		err = errors.New("another message is running")
+	}
+	s.mu.Lock()
+	ws.queuedPrompt = false
+	ws.chat.add(chatEntry{Type: "error", Text: "Your first message could not be sent after Mosso restarted (" + err.Error() + "). Send it again."})
+	s.persistLocked(ws)
+	s.mu.Unlock()
+}
+
+// queuedEntry returns the index of the queued first message: the first
+// user entry, while no worker event has been matched to it; -1 if none.
+func queuedEntry(c *chat) int {
+	for i, e := range c.entries {
+		if e.Type == "user" {
+			if e.Seq == 0 {
+				return i
+			}
+			return -1
+		}
+	}
+	return -1
 }
 
 // connect makes the workspace's sandbox usable: it resumes the sandbox if
@@ -403,6 +466,11 @@ func (s *Server) reconcile(ws *workspace, st worker.Status) {
 	// be running or have left a terminal event.
 	run := ws.chat.running
 	submitted := run == nil || run.taskID != ""
+	// A queued first message the worker never got is not interrupted: the
+	// reconnect sends it (sendQueuedPrompt).
+	if ws.queuedPrompt && st.Seq == 0 {
+		submitted = false
+	}
 	if ws.taskRunning && submitted && st.State == "idle" && st.Seq <= ws.lastSeq {
 		// Nothing more will come for the task Mosso was waiting on.
 		ws.chat.add(chatEntry{Type: "notice", Text: "Interrupted: Claude is no longer running in the sandbox and left no result for the last message. Send a follow-up to continue."})
@@ -509,6 +577,7 @@ func (s *Server) saveLocked(ws *workspace) error {
 		workspaceState: workspaceState{
 			BaseSHA: ws.BaseSHA, Dir: ws.Dir, Sandbox: ws.Sandbox, ExpiresAt: ws.ExpiresAt, PullRequest: ws.PullRequest,
 			Pushed: ws.pushed, SessionID: ws.chat.sessionID, LastSeq: ws.lastSeq, TaskRunning: ws.taskRunning,
+			QueuedPrompt: ws.queuedPrompt,
 		},
 	}
 	for _, a := range ws.attachments {

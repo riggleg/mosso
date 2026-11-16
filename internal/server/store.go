@@ -105,6 +105,10 @@ type workspaceState struct {
 	LastSeq     int64        `json:"last_seq"`
 	TaskRunning bool         `json:"task_running"`
 	Attachments []attachment `json:"attachments,omitempty"`
+	// QueuedPrompt says the first message given when the workspace was
+	// created (its first user entry) is not known to have reached the
+	// worker, so a restart must send it or match it to the worker's copy.
+	QueuedPrompt bool `json:"queued_prompt,omitempty"`
 }
 
 // store keeps workspaces and their chats in a SQLite database. It is the

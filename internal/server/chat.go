@@ -267,6 +267,7 @@ func (s *Server) submitTurn(ctx context.Context, ws *workspace, run *turnRun, to
 		return nil // terminated meanwhile; the sandbox is going away
 	}
 	run.taskID = acc.TaskID
+	ws.queuedPrompt = false // the worker has it
 	// The follower may already have delivered the worker's user event.
 	if acc.Seq > ws.lastSeq {
 		ws.lastSeq = acc.Seq
@@ -319,7 +320,18 @@ func (s *Server) applyEvent(ws *workspace, e worker.Event) {
 			if run.taskID == "" {
 				run.taskID = e.TaskID
 			}
+			ws.queuedPrompt = false
 			break
+		}
+		if ws.queuedPrompt {
+			// The worker got the first message before Mosso stopped and
+			// recorded it: this is its copy, not a new message.
+			ws.queuedPrompt = false
+			if i := queuedEntry(c); i >= 0 {
+				c.entries[i].Seq = e.Seq
+				s.persistLocked(ws)
+				break
+			}
 		}
 		var atts []attachment
 		_ = json.Unmarshal(e.Attachments, &atts)
