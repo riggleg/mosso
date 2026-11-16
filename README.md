@@ -8,6 +8,8 @@ The initial Minimum Usable Product (MUP) will run Pi in a Vercel Sandbox, offer 
 
 **Quick start:** configure Vercel, Claude Code and GitHub (see below), run `make run`, and open <http://127.0.0.1:8080>. Create a workspace from a GitHub repository, chat with Claude Code while its tool activity streams in, and publish the result as a pull request. See [docs/web-ui.md](docs/web-ui.md).
 
+**Toolchain:** [`.tool-versions`](.tool-versions) pins Go (build and tests) and Node.js (only for the web UI tests; Mosso itself has no Node.js dependency). With [asdf](https://asdf-vm.com), run `asdf plugin add golang && asdf plugin add nodejs && asdf install`; [mise](https://mise.jdx.dev) reads the same file with `mise install`.
+
 Claude Code runs under a small **Mosso worker inside the sandbox**, which records everything to a durable event log there. Stop Mosso or close the laptop while Claude is working: the worker keeps going until Claude finishes or the sandbox's 45-minute session ends. Start Mosso again and it reconnects to the workspace, fetches what it missed and shows the whole conversation. A sandbox whose session ended resumes from its snapshot on your next message. Only **Terminate** deletes a workspace. See [docs/worker.md](docs/worker.md) for the lifecycle, what survives what, the durability caveats and the live acceptance test.
 
 Mosso can already provision a Vercel Sandbox, run a shell command in it, and destroy it; see [docs/vercel-sandbox.md](docs/vercel-sandbox.md) for setup.
