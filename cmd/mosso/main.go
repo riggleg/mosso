@@ -69,7 +69,7 @@ func main() {
 		log.Printf("workspaces are not saved between runs: %v", dbErr)
 	} else if client == nil {
 		log.Printf("workspaces in %s are not restored: Vercel is not configured", *dbPath)
-	} else if err := srv.Restore(context.Background(), *dbPath); err != nil {
+	} else if err := srv.Restore(context.Background(), *dbPath, server.LegacyDir()); err != nil {
 		// Running without it would silently lose every new workspace's
 		// history, and the sandboxes Mosso should reconnect to.
 		log.Fatalf("open the database %s: %v", *dbPath, err)

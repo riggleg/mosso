@@ -58,10 +58,19 @@ func TestStoreRoundTrip(t *testing.T) {
 	if err := st.appendEntries(rec.Name, entries[1:]); err != nil {
 		t.Fatal(err)
 	}
-	// A position is written once, and only for a saved workspace.
-	if err := st.appendEntries(rec.Name, entries[1:]); err == nil {
-		t.Error("the same chat position was saved twice")
+	// Chats of other workspaces are kept apart, whatever the order of writes.
+	if err := st.appendEntries(older.Name, []chatEntry{{Type: "notice", Text: "other"}}); err != nil {
+		t.Fatal(err)
 	}
+	// An entry that cannot be read is skipped, not fatal: the workspace
+	// must still be restored and its sandbox reconnected.
+	if _, err := st.db.Exec(`INSERT INTO chat_entries (workspace_id, entry) VALUES (?, ?)`, rec.Name, `{"type":"us`); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.appendEntries(rec.Name, []chatEntry{{ID: 2, Type: "result", Result: &turnResult{Text: "done"}, Time: rec.CreatedAt}}); err != nil {
+		t.Fatal(err)
+	}
+	// Only a saved workspace has a chat.
 	if err := st.appendEntries("mosso-000000000000", entries[:1]); err == nil {
 		t.Error("saved a chat entry for a workspace that is not saved")
 	}
@@ -95,10 +104,11 @@ func TestStoreRoundTrip(t *testing.T) {
 		t.Fatalf("unarchived record has archived_at = %v", records[0].ArchivedAt)
 	}
 	loaded, err := st.loadEntries(rec.Name)
-	if err != nil || len(loaded) != 2 || loaded[0].Text != "hi" || loaded[0].Seq != 1 || loaded[1].ID != 1 || loaded[1].Type != "notice" {
+	if err != nil || len(loaded) != 3 || loaded[0].Text != "hi" || loaded[0].Seq != 1 || loaded[1].ID != 1 || loaded[1].Type != "notice" ||
+		loaded[2].ID != 2 || loaded[2].Result.Text != "done" {
 		t.Fatalf("entries = %+v, %v", loaded, err)
 	}
-	if other, err := st.loadEntries(older.Name); err != nil || len(other) != 0 {
+	if other, err := st.loadEntries(older.Name); err != nil || len(other) != 1 || other[0].Text != "other" || other[0].ID != 0 {
 		t.Fatalf("entries of another workspace = %+v, %v", other, err)
 	}
 	// The metadata is in columns of its own, for anyone reading the database.
@@ -228,9 +238,9 @@ func TestImportFiles(t *testing.T) {
 	}
 }
 
-// TestRestoreImportsFilesNextToTheDatabase: the import runs on startup and
-// the imported workspace is restored like any other.
-func TestRestoreImportsFilesNextToTheDatabase(t *testing.T) {
+// TestRestoreImportsFiles: the import runs on startup and the imported
+// workspace is restored like any other.
+func TestRestoreImportsFiles(t *testing.T) {
 	h := newPersistentHarness(t)
 	events := openEvents(t, h.ts.URL, h.ws.Name, "")
 	h.chat("hi")
@@ -277,6 +287,13 @@ func TestDataDirAndDBPath(t *testing.T) {
 	if d, err := DataDir(); err != nil || d != "/tmp/mosso-test-data" {
 		t.Fatalf("DataDir = %q, %v", d, err)
 	}
+	// The files of an earlier Mosso are in the data directory, wherever
+	// the database is.
+	t.Setenv(EnvDBPath, "/data/history.db")
+	if d := LegacyDir(); d != "/tmp/mosso-test-data/workspaces" {
+		t.Fatalf("LegacyDir = %q", d)
+	}
+	t.Setenv(EnvDBPath, "")
 	if p, err := DBPath(); err != nil || p != "/tmp/mosso-test-data/mosso.db" {
 		t.Fatalf("DBPath = %q, %v", p, err)
 	}

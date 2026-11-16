@@ -86,7 +86,7 @@ func TestReconnectEndToEnd(t *testing.T) {
 
 	start := func() (*Server, *httptest.Server) {
 		srv := New(vc)
-		if err := srv.Restore(context.Background(), dbPath); err != nil {
+		if err := srv.Restore(context.Background(), dbPath, ""); err != nil {
 			t.Fatal(err)
 		}
 		ts := httptest.NewServer(srv.Handler())

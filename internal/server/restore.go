@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"log"
 	"net/http"
-	"path/filepath"
 	"time"
 
 	"github.com/riggleg/mosso/internal/github"
@@ -58,16 +57,21 @@ const resumeTimeout = 3 * time.Minute
 // connect; one that no longer exists is marked gone. Terminated workspaces
 // have no sandbox and are listed as history. New workspaces are saved in
 // the database too.
-func (s *Server) Restore(ctx context.Context, dbPath string) error {
+//
+// legacyDir, if not empty, is the "workspaces" directory in which a Mosso
+// from before the database saved workspaces as files; any found there are
+// imported first (see importFiles).
+func (s *Server) Restore(ctx context.Context, dbPath, legacyDir string) error {
 	st, err := openStore(dbPath)
 	if err != nil {
 		return err
 	}
-	// Workspaces saved as files by a Mosso from before the database.
-	if n, err := st.importFiles(filepath.Join(filepath.Dir(dbPath), "workspaces")); err != nil {
-		log.Printf("import the workspaces saved by an earlier Mosso: %v (imported %d; the rest is tried again on the next start)", err, n)
-	} else if n > 0 {
-		log.Printf("imported %d workspaces saved by an earlier Mosso into the database", n)
+	if legacyDir != "" {
+		if n, err := st.importFiles(legacyDir); err != nil {
+			log.Printf("import the workspaces an earlier Mosso saved in %s: %v (imported %d; the rest is tried again on the next start)", legacyDir, err, n)
+		} else if n > 0 {
+			log.Printf("imported %d workspaces an earlier Mosso saved in %s into the database", n, legacyDir)
+		}
 	}
 	records, err := st.load()
 	if err != nil {

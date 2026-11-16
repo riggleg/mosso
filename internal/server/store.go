@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -34,6 +35,17 @@ func DataDir() (string, error) {
 		return "", fmt.Errorf("find the data directory: %w (set %s)", err, EnvDataDir)
 	}
 	return filepath.Join(base, "mosso"), nil
+}
+
+// LegacyDir is where a Mosso from before the database saved workspaces as
+// files: "workspaces" in the data directory, wherever the database is now.
+// It is "" if there is no data directory to look in.
+func LegacyDir() string {
+	dir, err := DataDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(dir, "workspaces")
 }
 
 // DBPath is the SQLite database Mosso saves workspaces and chats in:
@@ -223,8 +235,8 @@ func (st *store) exists(name string) (bool, error) {
 	return n > 0, err
 }
 
-// appendEntries adds chat entries to a saved workspace's conversation, at
-// the positions their IDs give.
+// appendEntries adds chat entries to the end of a saved workspace's
+// conversation, in the order given.
 func (st *store) appendEntries(name string, entries []chatEntry) error {
 	if len(entries) == 0 {
 		return nil
@@ -238,16 +250,18 @@ func insertEntries(tx *sql.Tx, name string, entries []chatEntry) error {
 		if err != nil {
 			return err
 		}
-		if _, err := tx.Exec(`INSERT INTO chat_entries (workspace_id, idx, entry) VALUES (?, ?, ?)`, name, e.ID, string(b)); err != nil {
+		if _, err := tx.Exec(`INSERT INTO chat_entries (workspace_id, entry) VALUES (?, ?)`, name, string(b)); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// loadEntries returns the workspace's conversation, in order.
+// loadEntries returns the workspace's conversation, in order, numbered
+// from 0. An entry that cannot be read is skipped: losing one entry must
+// not stop a workspace from being restored and its sandbox reconnected.
 func (st *store) loadEntries(name string) ([]chatEntry, error) {
-	rows, err := st.db.Query(`SELECT entry FROM chat_entries WHERE workspace_id = ? ORDER BY idx`, name)
+	rows, err := st.db.Query(`SELECT entry FROM chat_entries WHERE workspace_id = ? ORDER BY id`, name)
 	if err != nil {
 		return nil, err
 	}
@@ -260,7 +274,8 @@ func (st *store) loadEntries(name string) ([]chatEntry, error) {
 		}
 		var e chatEntry
 		if err := json.Unmarshal([]byte(b), &e); err != nil {
-			return nil, fmt.Errorf("read chat entry %d of %s: %w", len(out), name, err)
+			log.Printf("workspace %s: skipping a saved chat entry that cannot be read: %v", name, err)
+			continue
 		}
 		e.ID = len(out)
 		out = append(out, e)

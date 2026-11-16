@@ -88,12 +88,15 @@ CREATE TABLE workspaces (
     archived_at TEXT              -- set while the workspace is archived
 );
 CREATE TABLE chat_entries (
+    id           INTEGER PRIMARY KEY, -- grows with each entry: a conversation's order
     workspace_id TEXT NOT NULL REFERENCES workspaces (id) ON DELETE CASCADE,
-    idx          INTEGER NOT NULL, -- position in the conversation, from 0
-    entry        TEXT NOT NULL,    -- JSON, as the web UI shows it
-    PRIMARY KEY (workspace_id, idx)
-) WITHOUT ROWID;
+    entry        TEXT NOT NULL        -- JSON, as the web UI shows it
+);
+CREATE INDEX chat_entries_workspace ON chat_entries (workspace_id, id);
 ```
+
+A chat entry that cannot be read back is skipped with a log line; it never
+stops a workspace from being restored.
 
 `status` is the sandbox as Mosso last knew it:
 
@@ -135,12 +138,11 @@ workspace:
 
 Before the database, Mosso saved workspaces as files in
 `workspaces/<name>/` in the data directory. On start, Mosso imports any it
-finds **next to the database file** (each workspace and its chat in one
-transaction, skipping ones already imported), so their sandboxes are not
-forgotten and left to bill. It then renames the directory to
+finds there, wherever the database itself is (each workspace and its chat
+in one transaction, skipping ones already imported), so their sandboxes are
+not forgotten and left to bill. It then renames the directory to
 `workspaces.imported`, which it never reads again; delete it once you are
-happy. If you put the database somewhere other than the data directory,
-move the `workspaces` directory next to it for the first start.
+happy.
 
 ## Dependency
 

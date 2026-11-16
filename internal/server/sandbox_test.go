@@ -700,7 +700,7 @@ func newServerOver(t *testing.T, fake *fakeVercel, api *httptest.Server, dataDir
 	client := vercel.NewClient(vercel.Config{Token: "tok", TeamID: "team", ProjectID: "prj", BaseURL: api.URL})
 	srv := New(client)
 	srv.workerBinary = func(context.Context) ([]byte, error) { return fakeWorkerBinary, nil }
-	if err := srv.Restore(context.Background(), filepath.Join(dataDir, "mosso.db")); err != nil {
+	if err := srv.Restore(context.Background(), filepath.Join(dataDir, "mosso.db"), filepath.Join(dataDir, "workspaces")); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { srv.cancel() })

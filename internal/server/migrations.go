@@ -24,11 +24,11 @@ var migrations = []string{
 		archived_at TEXT              -- set while the workspace is archived
 	);
 	CREATE TABLE chat_entries (
+		id           INTEGER PRIMARY KEY, -- grows with each entry: a conversation's order
 		workspace_id TEXT NOT NULL REFERENCES workspaces (id) ON DELETE CASCADE,
-		idx          INTEGER NOT NULL, -- position in the conversation, from 0
-		entry        TEXT NOT NULL,    -- JSON, as the web UI shows it
-		PRIMARY KEY (workspace_id, idx)
-	) WITHOUT ROWID;`,
+		entry        TEXT NOT NULL        -- JSON, as the web UI shows it
+	);
+	CREATE INDEX chat_entries_workspace ON chat_entries (workspace_id, id);`,
 }
 
 // migrate applies the migrations the database has not seen yet, each in
