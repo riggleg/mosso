@@ -5,19 +5,16 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/riggleg/mosso/internal/github"
 	"github.com/riggleg/mosso/internal/worker"
 )
 
 // persistentHarness is a server over a fake Vercel whose state (sandboxes,
-// worker logs) and whose data directory outlive the server, so a second
-// server can be started over them like Mosso after a restart.
+// worker logs) and whose database outlive the server, so a second server
+// can be started over them like Mosso after a restart.
 type persistentHarness struct {
 	t       *testing.T
 	fake    *fakeVercel
@@ -100,6 +97,7 @@ func (h *persistentHarness) history() []chatEntry {
 	if ws == nil {
 		return nil
 	}
+	h.srv.loadChatLocked(ws)
 	return append([]chatEntry(nil), ws.chat.entries...)
 }
 
@@ -108,18 +106,38 @@ func (h *persistentHarness) chat(prompt string) *http.Response {
 	return postJSON(h.t, h.ts.URL+"/workspaces/"+h.ws.Name+"/chat", `{"prompt":"`+prompt+`"}`)
 }
 
-// record reads the saved workspace record from disk.
+// record reads the saved workspace record from the database.
 func (h *persistentHarness) record() workspaceRecord {
 	h.t.Helper()
-	b, err := os.ReadFile(filepath.Join(h.dataDir, "workspaces", h.ws.Name, "workspace.json"))
+	for _, rec := range h.records() {
+		if rec.Name == h.ws.Name {
+			return rec
+		}
+	}
+	h.t.Fatalf("workspace %s is not saved", h.ws.Name)
+	return workspaceRecord{}
+}
+
+// records reads every saved workspace record from the database.
+func (h *persistentHarness) records() []workspaceRecord {
+	h.t.Helper()
+	h.srv.mu.Lock()
+	defer h.srv.mu.Unlock()
+	records, err := h.srv.store.load()
 	if err != nil {
 		h.t.Fatal(err)
 	}
-	var rec workspaceRecord
-	if err := json.Unmarshal(b, &rec); err != nil {
-		h.t.Fatal(err)
+	return records
+}
+
+// terminate terminates the workspace through the API.
+func (h *persistentHarness) terminate() {
+	h.t.Helper()
+	req, _ := http.NewRequest(http.MethodDelete, h.ts.URL+"/workspaces/"+h.ws.Name, nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil || resp.StatusCode != http.StatusNoContent {
+		h.t.Fatalf("terminate: %v %v", resp, err)
 	}
-	return rec
 }
 
 // countTypes counts entries by type (claude entries by event type).
@@ -345,6 +363,9 @@ func TestRestartAfterSessionEndedMidTaskCatchesUp(t *testing.T) {
 	events := openEvents(t, h.ts.URL, h.ws.Name, "")
 	h.chat("long task")
 	<-started
+	// Both of Claude's events so far are recorded before Mosso stops, so
+	// the order of the history below does not depend on timing.
+	events.until("claude")
 	events.until("claude")
 	waitFor(t, func() bool { return h.record().TaskRunning })
 	h.stop()
@@ -375,41 +396,165 @@ func TestRestartAfterSessionEndedMidTaskCatchesUp(t *testing.T) {
 	}
 }
 
-// TestTerminateRemovesSandboxSnapshotsAndSavedState: Terminate is the only
-// thing that deletes a workspace.
-func TestTerminateRemovesSandboxSnapshotsAndSavedState(t *testing.T) {
+// TestTerminateDeletesTheSandboxAndKeepsTheHistory: Terminate deletes the
+// sandbox and its snapshots, but the workspace and its conversation stay,
+// read-only, also after a restart.
+func TestTerminateDeletesTheSandboxAndKeepsTheHistory(t *testing.T) {
 	h := newPersistentHarness(t)
 	events := openEvents(t, h.ts.URL, h.ws.Name, "")
 	h.chat("hi")
 	events.until("result")
-	if got := readDir(t, filepath.Join(h.dataDir, "workspaces")); len(got) != 1 {
-		t.Fatalf("saved workspaces = %v", got)
-	}
-	req, _ := http.NewRequest(http.MethodDelete, h.ts.URL+"/workspaces/"+h.ws.Name, nil)
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil || resp.StatusCode != http.StatusNoContent {
-		t.Fatalf("terminate: %v %v", resp, err)
-	}
+	h.terminate()
 	if len(h.fake.deleted) != 1 || !h.fake.orphanSnapshots[0] || len(h.fake.stopped) != 1 {
 		t.Fatalf("deleted=%v orphan=%v stopped=%v", h.fake.deleted, h.fake.orphanSnapshots, h.fake.stopped)
-	}
-	if got := readDir(t, filepath.Join(h.dataDir, "workspaces")); len(got) != 0 {
-		t.Fatalf("saved state left behind: %v", got)
 	}
 	if h.fake.worker(h.ws.Name).running() {
 		t.Fatal("the worker outlived its sandbox")
 	}
+	// The open stream says so, and stays open.
+	if last := events.until("notice"); !strings.HasPrefix(last[len(last)-1].Text, "Workspace terminated") {
+		t.Fatalf("entries after terminate = %+v", last)
+	}
+	terminated := func() {
+		t.Helper()
+		if st := h.status(); st.Status != "terminated" || st.Error != "" {
+			t.Fatalf("status = %+v, want terminated", st)
+		}
+		if rec := h.record(); rec.SandboxState != sandboxTerminated || rec.TaskRunning {
+			t.Fatalf("record = %+v", rec)
+		}
+		// Nothing can run in it any more.
+		for _, path := range []string{"/chat", "/connect", "/pull-request"} {
+			if resp := postJSON(t, h.ts.URL+"/workspaces/"+h.ws.Name+path, `{"prompt":"again","title":"t"}`); resp.StatusCode != http.StatusGone {
+				t.Fatalf("POST %s on a terminated workspace: status = %d", path, resp.StatusCode)
+			}
+		}
+		// The conversation is replayed to browsers.
+		replay := openEvents(t, h.ts.URL, h.ws.Name, "")
+		if got := entryTypes(replay.until("notice")); got != "user claude:tool_use claude:tool_result result notice" {
+			t.Fatalf("replay = %s", got)
+		}
+		// Terminating again has nothing left to delete.
+		h.terminate()
+		if len(h.fake.deleted) != 1 {
+			t.Fatalf("deleted = %v, want the sandbox deleted once", h.fake.deleted)
+		}
+	}
+	terminated()
+	// It does not hold a sandbox slot.
+	h.srv.mu.Lock()
+	tracked, active := len(h.srv.sandboxes), h.srv.activeSandboxesLocked()
+	h.srv.mu.Unlock()
+	if tracked != 0 || active != 0 {
+		t.Fatalf("sandboxes tracked = %d, active = %d after terminate", tracked, active)
+	}
+
 	h.stop()
 	h.start()
-	if rec := do(t, h.srv.Handler(), http.MethodGet, "/workspaces", ""); !strings.Contains(rec.Body.String(), `"workspaces":[]`) {
-		t.Fatalf("terminated workspace came back: %s", rec.Body)
+	// Listed at once, without asking Vercel about a sandbox that is gone.
+	if rec := do(t, h.srv.Handler(), http.MethodGet, "/workspaces", ""); !strings.Contains(rec.Body.String(), h.ws.Name) || !strings.Contains(rec.Body.String(), `"status":"terminated"`) {
+		t.Fatalf("workspaces after restart: %s", rec.Body)
+	}
+	// Its chat is only read from the database when it is opened.
+	h.srv.mu.Lock()
+	unloaded := h.srv.workspaces[h.ws.Name].chat.unloaded
+	h.srv.mu.Unlock()
+	if !unloaded {
+		t.Fatal("the terminated workspace's chat was loaded at startup")
+	}
+	terminated()
+	if got := entryTypes(h.history()); got != "user claude:tool_use claude:tool_result result notice" {
+		t.Fatalf("history after restart = %s", got)
 	}
 }
 
-// TestGoneSandboxKeepsHistoryUntilTerminated: the sandbox disappeared
-// (deleted elsewhere, or its snapshot expired). The chat stays readable, new
-// messages are refused with an explanation, and Terminate cleans up.
-func TestGoneSandboxKeepsHistoryUntilTerminated(t *testing.T) {
+// TestTerminateWhileClaudeWorksEndsTheTurn: the turn in progress ends with
+// the sandbox, and the workspace is free (not stuck "working") as history.
+func TestTerminateWhileClaudeWorksEndsTheTurn(t *testing.T) {
+	h := newPersistentHarness(t)
+	started, release := h.fake.claude.blockRuns()
+	defer close(release)
+	events := openEvents(t, h.ts.URL, h.ws.Name, "")
+	h.chat("long task")
+	<-started
+	events.until("claude")
+	h.terminate()
+	if st := h.status(); st.Status != "terminated" {
+		t.Fatalf("status = %+v", st)
+	}
+	hist := h.history()
+	if got := entryTypes(hist); !strings.HasPrefix(got, "user claude:tool_use") || strings.Contains(got, "result error") ||
+		!strings.HasPrefix(hist[len(hist)-1].Text, "Workspace terminated") {
+		t.Fatalf("history = %s", got)
+	}
+	// Nothing is added once the turn's goroutines notice.
+	time.Sleep(100 * time.Millisecond)
+	if after := h.history(); len(after) != len(hist) {
+		t.Fatalf("history grew after terminate: %s", entryTypes(after))
+	}
+	if rec := h.record(); rec.TaskRunning || rec.SandboxState != sandboxTerminated {
+		t.Fatalf("record = %+v", rec)
+	}
+}
+
+// TestArchiveWorkspace: only a terminated workspace can be archived; an
+// archived one stays listed and readable, marked as archived, across a
+// restart, and can be brought back.
+func TestArchiveWorkspace(t *testing.T) {
+	h := newPersistentHarness(t)
+	events := openEvents(t, h.ts.URL, h.ws.Name, "")
+	h.chat("hi")
+	events.until("result")
+	archive := func(action string) (int, workspace) {
+		t.Helper()
+		resp := postJSON(t, h.ts.URL+"/workspaces/"+h.ws.Name+"/"+action, `{}`)
+		var ws workspace
+		_ = json.NewDecoder(resp.Body).Decode(&ws)
+		return resp.StatusCode, ws
+	}
+	if code, _ := archive("archive"); code != http.StatusConflict {
+		t.Fatalf("archive with a live sandbox: status = %d, want 409", code)
+	}
+	if resp := postJSON(t, h.ts.URL+"/workspaces/mosso-000000000000/archive", `{}`); resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("archive of an unknown workspace: status = %d", resp.StatusCode)
+	}
+	h.terminate()
+	code, ws := archive("archive")
+	if code != http.StatusOK || ws.ArchivedAt.IsZero() || ws.Status != "terminated" {
+		t.Fatalf("archive: status = %d, workspace = %+v", code, ws)
+	}
+	at := ws.ArchivedAt
+	// Archiving again keeps the first date.
+	if code, ws := archive("archive"); code != http.StatusOK || !ws.ArchivedAt.Equal(at) {
+		t.Fatalf("second archive: status = %d, archived_at = %v, want %v", code, ws.ArchivedAt, at)
+	}
+
+	h.stop()
+	h.start()
+	var list struct {
+		Workspaces []workspace `json:"workspaces"`
+	}
+	_ = json.Unmarshal(do(t, h.srv.Handler(), http.MethodGet, "/workspaces", "").Body.Bytes(), &list)
+	if len(list.Workspaces) != 1 || list.Workspaces[0].ArchivedAt.IsZero() || list.Workspaces[0].Status != "terminated" {
+		t.Fatalf("workspaces after restart = %+v", list.Workspaces)
+	}
+	// Still readable.
+	replay := openEvents(t, h.ts.URL, h.ws.Name, "")
+	if got := entryTypes(replay.until("notice")); got != "user claude:tool_use claude:tool_result result notice" {
+		t.Fatalf("replay of an archived workspace = %s", got)
+	}
+	if code, ws := archive("unarchive"); code != http.StatusOK || !ws.ArchivedAt.IsZero() {
+		t.Fatalf("unarchive: status = %d, workspace = %+v", code, ws)
+	}
+	if rec := h.record(); !rec.ArchivedAt.IsZero() {
+		t.Fatalf("record after unarchive = %+v", rec)
+	}
+}
+
+// TestGoneSandboxKeepsHistory: the sandbox disappeared (deleted elsewhere,
+// or its snapshot expired). The chat stays readable, new messages are
+// refused with an explanation, and Terminate moves it to the history.
+func TestGoneSandboxKeepsHistory(t *testing.T) {
 	h := newPersistentHarness(t)
 	events := openEvents(t, h.ts.URL, h.ws.Name, "")
 	h.chat("hi")
@@ -432,12 +577,34 @@ func TestGoneSandboxKeepsHistoryUntilTerminated(t *testing.T) {
 	if resp := postJSON(t, h.ts.URL+"/workspaces/"+h.ws.Name+"/connect", `{}`); resp.StatusCode != http.StatusGone {
 		t.Fatalf("connect on a gone sandbox: status = %d", resp.StatusCode)
 	}
-	req, _ := http.NewRequest(http.MethodDelete, h.ts.URL+"/workspaces/"+h.ws.Name, nil)
-	if resp, err := http.DefaultClient.Do(req); err != nil || resp.StatusCode != http.StatusNoContent {
-		t.Fatalf("terminate: %v %v", resp, err)
+	if resp := postJSON(t, h.ts.URL+"/workspaces/"+h.ws.Name+"/archive", `{}`); resp.StatusCode != http.StatusConflict {
+		t.Fatalf("archive before terminate: status = %d", resp.StatusCode)
 	}
-	if got := readDir(t, filepath.Join(h.dataDir, "workspaces")); len(got) != 0 {
-		t.Fatalf("saved state left behind: %v", got)
+	h.terminate()
+	if st := h.status(); st.Status != "terminated" || st.Error != "" {
+		t.Fatalf("status after terminate = %+v", st)
+	}
+	hist := h.history()
+	if got := entryTypes(hist); got != "user claude:tool_use claude:tool_result result notice notice" || !strings.HasPrefix(hist[5].Text, "Workspace terminated") {
+		t.Fatalf("history = %s", got)
+	}
+}
+
+// TestFailedSetupSavesNothing: a workspace whose setup fails is destroyed
+// and leaves no history.
+func TestFailedSetupSavesNothing(t *testing.T) {
+	srv, fake := newTestServer(t)
+	withGitHub(t, srv, &fakeGitHubAPI{})
+	fake.stdoutFor = fakeRepoSandbox()
+	fake.exitFor = func(map[string]any) int { return 128 }
+	if rec := do(t, srv.Handler(), http.MethodPost, "/workspaces", `{"repo":"octo/widgets"}`); rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d: %s", rec.Code, rec.Body)
+	}
+	if records, err := srv.store.load(); err != nil || len(records) != 0 {
+		t.Fatalf("saved after a failed setup: %+v, %v", records, err)
+	}
+	if rec := do(t, srv.Handler(), http.MethodGet, "/workspaces", ""); !strings.Contains(rec.Body.String(), `"workspaces":[]`) {
+		t.Fatalf("workspaces after a failed setup: %s", rec.Body)
 	}
 }
 
@@ -461,6 +628,14 @@ func TestRestoredWorkspaceRemembersPublishedHead(t *testing.T) {
 	if opts.Pushed != testCommitSHA || pr == nil || pr.Number != 7 {
 		t.Fatalf("restored mirror options = %+v, pr = %+v", opts, pr)
 	}
+	// Saving the restored workspace again keeps it, for the restart after.
+	h.waitStatus("ready")
+	h.srv.mu.Lock()
+	h.srv.persistLocked(ws)
+	h.srv.mu.Unlock()
+	if rec := h.record(); rec.Pushed != testCommitSHA {
+		t.Fatalf("record after a restart and a save: pushed = %q", rec.Pushed)
+	}
 }
 
 // TestStoppedWorkspacesDoNotCountTowardsTheSandboxLimit.
@@ -472,73 +647,6 @@ func TestStoppedWorkspacesDoNotCountTowardsTheSandboxLimit(t *testing.T) {
 		if rec := do(t, h.srv.Handler(), http.MethodPost, "/sandboxes", ""); rec.Code != http.StatusCreated {
 			t.Fatalf("create %d: status = %d (a stopped workspace should not count)", i, rec.Code)
 		}
-	}
-}
-
-func TestStoreRoundTrip(t *testing.T) {
-	dir := t.TempDir()
-	st, err := openStore(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	rec := workspaceRecord{Name: "mosso-0123456789ab", Repo: "octo/widgets", Base: "main", Branch: "mosso/x", Dir: "/vercel/sandbox/widgets",
-		SandboxState: sandboxStopped, LastSeq: 7, SessionID: testSessionID, PullRequest: &github.PullRequest{Number: 3, URL: "https://github.com/octo/widgets/pull/3"},
-		Attachments: []attachment{{ID: "a1", Name: "x.png", Size: 3, Type: "image/png", Image: true}}, CreatedAt: time.Now().UTC()}
-	if err := st.save(rec); err != nil {
-		t.Fatal(err)
-	}
-	for _, bad := range []string{"../etc", "mosso-x", "", "other"} {
-		if err := st.save(workspaceRecord{Name: bad}); err == nil {
-			t.Errorf("saved record with name %q", bad)
-		}
-		if err := st.appendEntry(bad, chatEntry{}); err == nil {
-			t.Errorf("appended for name %q", bad)
-		}
-		if err := st.remove(bad); err == nil {
-			t.Errorf("removed name %q", bad)
-		}
-	}
-	_ = st.appendEntry(rec.Name, chatEntry{Type: "user", Text: "hi", Seq: 1})
-	_ = st.appendEntry(rec.Name, chatEntry{Type: "notice", Text: "n"})
-	// A truncated last line is skipped.
-	f, _ := os.OpenFile(filepath.Join(dir, "workspaces", rec.Name, "chat.jsonl"), os.O_APPEND|os.O_WRONLY, 0o600)
-	_, _ = f.WriteString(`{"type":"us`)
-	f.Close()
-
-	records, err := st.load()
-	if err != nil || len(records) != 1 {
-		t.Fatalf("load = %+v, %v", records, err)
-	}
-	got := records[0]
-	if got.Name != rec.Name || got.LastSeq != 7 || got.SessionID != testSessionID || got.PullRequest.Number != 3 || len(got.Attachments) != 1 || got.UpdatedAt.IsZero() {
-		t.Fatalf("record = %+v", got)
-	}
-	entries, err := st.loadEntries(rec.Name)
-	if err != nil || len(entries) != 2 || entries[0].Seq != 1 || entries[1].ID != 1 {
-		t.Fatalf("entries = %+v, %v", entries, err)
-	}
-	if err := st.remove(rec.Name); err != nil {
-		t.Fatal(err)
-	}
-	if records, _ := st.load(); len(records) != 0 {
-		t.Fatalf("records after remove = %+v", records)
-	}
-	// Unknown directories and files are ignored.
-	_ = os.MkdirAll(filepath.Join(dir, "workspaces", "junk"), 0o700)
-	if records, err := st.load(); err != nil || len(records) != 0 {
-		t.Fatalf("load with junk = %+v, %v", records, err)
-	}
-}
-
-func TestDataDir(t *testing.T) {
-	t.Setenv(EnvDataDir, "/tmp/mosso-test-data")
-	if d, err := DataDir(); err != nil || d != "/tmp/mosso-test-data" {
-		t.Fatalf("DataDir = %q, %v", d, err)
-	}
-	t.Setenv(EnvDataDir, "")
-	d, err := DataDir()
-	if err != nil || !strings.HasSuffix(d, "mosso") {
-		t.Fatalf("DataDir = %q, %v", d, err)
 	}
 }
 

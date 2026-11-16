@@ -30,9 +30,11 @@ data in public issues. Contact the repository owner privately before disclosure.
   and [docs/worker.md](docs/worker.md#security).
 - The worker's API in the sandbox listens on loopback only and is reached
   through Vercel's authenticated command API; no port is published.
-- Mosso's data directory (`MOSSO_DATA_DIR`, by default
-  `~/Library/Application Support/mosso`) holds workspace records and chat
-  history (prompts and Claude's output), never credentials.
+- Mosso's database (`mosso.db` in `MOSSO_DATA_DIR`, by default
+  `~/Library/Application Support/mosso`, or `MOSSO_DB_PATH`) holds workspace
+  records and chat history (prompts and Claude's output), never credentials.
+  It keeps a workspace's conversation after the workspace is terminated, and
+  is created readable by its owner only.
 - The GitHub token (a fine-grained personal access token limited to the target
   repositories, with Contents and Pull requests write access) is stored in the
   macOS Keychain, or in memory or `MOSSO_GITHUB_TOKEN` without one. It can be

@@ -289,8 +289,42 @@ func TestWorkspaceChatErrorsAreRecorded(t *testing.T) {
 	}
 }
 
-func TestWorkspaceEventsCloseWhenDestroyed(t *testing.T) {
+// TestWorkspaceEventsReportTermination: an open stream sees the workspace
+// become history and stays usable.
+func TestWorkspaceEventsReportTermination(t *testing.T) {
 	_, fake, ts, ws := newChatServer(t)
+	events := openEvents(t, ts.URL, ws.Name, "")
+	events.next() // workspace
+	req, _ := http.NewRequest(http.MethodDelete, ts.URL+"/workspaces/"+ws.Name, nil)
+	if resp, err := http.DefaultClient.Do(req); err != nil || resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("delete: %v %v", resp, err)
+	}
+	for {
+		ev := events.next()
+		if ev.Event == "closed" {
+			t.Fatal("the stream of a terminated workspace was closed")
+		}
+		if ev.Event == "workspace" && strings.Contains(ev.Data, `"status":"terminated"`) {
+			break
+		}
+	}
+	if len(fake.deleted) != 1 {
+		t.Fatalf("deleted = %v", fake.deleted)
+	}
+	resp, _ := http.Get(ts.URL + "/workspaces/" + ws.Name + "/events")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("events after terminate: status = %d", resp.StatusCode)
+	}
+	resp.Body.Close()
+}
+
+// TestWorkspaceEventsCloseWhenSetupIsDestroyed: a workspace destroyed while
+// it is being set up leaves no history, so its stream ends.
+func TestWorkspaceEventsCloseWhenSetupIsDestroyed(t *testing.T) {
+	srv, _, ts, ws := newChatServer(t)
+	srv.mu.Lock()
+	srv.workspaces[ws.Name].creating = true
+	srv.mu.Unlock()
 	events := openEvents(t, ts.URL, ws.Name, "")
 	events.next() // workspace
 	req, _ := http.NewRequest(http.MethodDelete, ts.URL+"/workspaces/"+ws.Name, nil)
@@ -301,9 +335,6 @@ func TestWorkspaceEventsCloseWhenDestroyed(t *testing.T) {
 		if ev := events.next(); ev.Event == "closed" {
 			break
 		}
-	}
-	if len(fake.deleted) != 1 {
-		t.Fatalf("deleted = %v", fake.deleted)
 	}
 	resp, _ := http.Get(ts.URL + "/workspaces/" + ws.Name + "/events")
 	if resp.StatusCode != http.StatusNotFound {

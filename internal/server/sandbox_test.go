@@ -10,7 +10,6 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"path"
 	"path/filepath"
 	"strconv"
@@ -694,13 +693,14 @@ func newFakeVercel(t *testing.T) (*fakeVercel, *httptest.Server) {
 	return fake, api
 }
 
-// newServerOver returns a server for the fake, saving workspaces in dataDir.
+// newServerOver returns a server for the fake, saving workspaces in a
+// database in dataDir.
 func newServerOver(t *testing.T, fake *fakeVercel, api *httptest.Server, dataDir string) *Server {
 	t.Helper()
 	client := vercel.NewClient(vercel.Config{Token: "tok", TeamID: "team", ProjectID: "prj", BaseURL: api.URL})
 	srv := New(client)
 	srv.workerBinary = func(context.Context) ([]byte, error) { return fakeWorkerBinary, nil }
-	if err := srv.Restore(context.Background(), dataDir); err != nil {
+	if err := srv.Restore(context.Background(), filepath.Join(dataDir, "mosso.db"), filepath.Join(dataDir, "workspaces")); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { srv.cancel() })
@@ -886,18 +886,4 @@ func TestSandboxLimitConcurrent(t *testing.T) {
 	if len(fake.created) > maxSandboxes {
 		t.Fatalf("Vercel saw %d creates, want at most %d", len(fake.created), maxSandboxes)
 	}
-}
-
-// readDir lists a directory's entries, for store assertions.
-func readDir(t *testing.T, dir string) []string {
-	t.Helper()
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return nil
-	}
-	var names []string
-	for _, e := range entries {
-		names = append(names, e.Name())
-	}
-	return names
 }

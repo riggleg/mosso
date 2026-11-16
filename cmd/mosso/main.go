@@ -31,6 +31,8 @@ func main() {
 		defaultAddr = v
 	}
 	addr := flag.String("listen", defaultAddr, "HTTP listen address")
+	defaultDB, dbErr := server.DBPath()
+	dbPath := flag.String("db", defaultDB, "SQLite database for workspaces and chats; set with $"+server.EnvDBPath+", or mosso.db in $"+server.EnvDataDir)
 	flag.Parse()
 	if err := server.CheckListenAddr(*addr); err != nil {
 		log.Fatal(err)
@@ -58,15 +60,22 @@ func main() {
 		log.Print("git is not installed on this machine: workspaces cannot fetch from or push to GitHub until it is (on macOS: xcode-select --install)")
 	}
 	srv := server.New(client)
-	// Workspaces are saved on disk and reconnected to after a restart.
-	if dataDir, err := server.DataDir(); err != nil {
-		log.Printf("workspaces are not saved between runs: %v", err)
+	// Workspaces and chats are saved in a SQLite database: their history
+	// outlives restarts and sandboxes, and live ones are reconnected to.
+	if *dbPath == "" {
+		if dbErr == nil {
+			dbErr = errors.New("no database path")
+		}
+		log.Printf("workspaces are not saved between runs: %v", dbErr)
+	} else if err := srv.Restore(context.Background(), *dbPath, server.LegacyDir()); err != nil {
+		// Running without it would silently lose every new workspace's
+		// history, and the sandboxes Mosso should reconnect to.
+		log.Fatalf("open the database %s: %v", *dbPath, err)
 	} else if client == nil {
-		log.Printf("workspaces in %s are not restored: Vercel is not configured", dataDir)
-	} else if err := srv.Restore(context.Background(), dataDir); err != nil {
-		log.Printf("restore workspaces from %s: %v", dataDir, err)
+		// The history only needs the database.
+		log.Printf("workspaces saved in %s: their history can be read, but nothing can run until Vercel is configured", *dbPath)
 	} else {
-		log.Printf("workspaces saved in %s", dataDir)
+		log.Printf("workspaces saved in %s", *dbPath)
 	}
 	httpSrv := &http.Server{Addr: *addr, Handler: srv.Handler(), ReadHeaderTimeout: 10 * time.Second}
 	// Browsers keep event streams open; end them so shutdown need not wait.

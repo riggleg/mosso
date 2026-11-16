@@ -19,8 +19,11 @@ const state = {
   sending: false,
   publishing: false,
   resuming: false,
+  archiving: false,
+  showArchived: false, // the sidebar's Archived section is open
   repos: null,
   github: null, // GET /github/auth: whether GitHub is connected (never the token)
+  vercel: null, // GET /vercel/auth: whether sandboxes can be used at all
 };
 
 // ---------- helpers ----------
@@ -98,6 +101,15 @@ function firstLine(text, max) {
   return line.length > max ? line.slice(0, max - 1) + "…" : line;
 }
 
+// noVercel reports that Mosso has no Vercel credentials: saved workspaces
+// and their conversations can be read (and archived), but nothing that
+// needs a sandbox works.
+function noVercel() {
+  return !!state.vercel && !state.vercel.configured;
+}
+
+const vercelHelp = "Vercel Sandbox is not configured: set VERCEL_TOKEN, VERCEL_TEAM_ID and VERCEL_PROJECT_ID and restart Mosso.";
+
 const authHint = /\b(401|403)\b|auth|log ?in|oauth|token|credential|unauthori[sz]ed/i;
 
 // ---------- configuration checks ----------
@@ -113,15 +125,20 @@ async function loadChecks() {
       h("span", { class: "check-detail", title: detail || "", text: detail || "" }),
       action || null,
     );
-  const [claude, github] = await Promise.all([api("GET", "/claude/auth").catch((e) => ({ error: e.message })), api("GET", "/github/auth").catch((e) => ({ error: e.message }))]);
+  const [claude, github, vercel] = await Promise.all([
+    api("GET", "/claude/auth").catch((e) => ({ error: e.message })),
+    api("GET", "/github/auth").catch((e) => ({ error: e.message })),
+    api("GET", "/vercel/auth").catch(() => null),
+  ]);
   state.github = github;
+  state.vercel = vercel;
   const ghOK = github.configured && !github.error;
   let ghDetail = !github.configured ? "not connected" : github.login ? "@" + github.login : "token problem";
   const days = github.expires_at ? Math.floor((new Date(github.expires_at).getTime() - Date.now()) / 86400000) : null;
   if (ghOK && days !== null && days < 14) ghDetail += days < 0 ? " · expired" : ` · expires in ${days}d`;
   const ghButton = h("button", { type: "button", class: "small check-action", text: github.configured ? "Replace" : "Connect", onclick: openGitHub });
   list.replaceChildren(
-    item("Vercel", !(state.listError && state.listError.status === 503), state.listError && state.listError.status === 503 ? "not configured" : ""),
+    item("Vercel", !noVercel(), noVercel() ? "not configured · read-only" : ""),
     item("Claude", claude.configured, claude.configured ? claude.source : "run mosso auth claude"),
     item("GitHub", ghOK, ghDetail, ghButton),
   );
@@ -206,9 +223,12 @@ async function refreshList() {
   if (state.selected && !state.workspaces.some((w) => w.name === state.selected) && !state.listError) {
     select(null);
   } else if (!state.selected && state.workspaces.length) {
+    // Open the workspace in the URL, else the newest one with a sandbox,
+    // else the newest in the history. Archived ones only open when asked.
     const fromHash = decodeURIComponent(location.hash.replace(/^#\/?/, ""));
-    const pick = state.workspaces.find((w) => w.name === fromHash) || state.workspaces[state.workspaces.length - 1];
-    select(pick.name);
+    const groups = groupWorkspaces(state.workspaces);
+    const pick = state.workspaces.find((w) => w.name === fromHash) || groups.active[groups.active.length - 1] || groups.history[0];
+    if (pick) select(pick.name);
   }
   const cur = state.workspaces.find((w) => w.name === state.selected);
   if (cur) state.ws = cur;
@@ -225,16 +245,52 @@ function renderSidebar() {
     nav.replaceChildren(h("div", { class: "list-empty", text: "No workspaces yet." }));
     return;
   }
-  nav.replaceChildren(
-    ...state.workspaces.map((w) =>
-      h(
-        "button",
-        { type: "button", class: "ws-item" + (w.name === state.selected ? " selected" : ""), title: `${w.repo} (${w.name})`, onclick: () => select(w.name) },
-        h("div", { class: "ws-item-top" }, h("span", { class: "dot " + w.status, title: w.status }), h("span", { class: "ws-item-repo", text: shortRepo(w.repo) })),
-        h("div", { class: "ws-item-sub", text: `${w.base} → ${w.branch.replace(/^mosso\//, "")}` }),
-      ),
-    ),
-  );
+  const item = (w) => {
+    const past = isTerminated(w);
+    const branch = w.branch.replace(/^mosso\//, "");
+    return h(
+      "button",
+      { type: "button", class: "ws-item" + (past ? " past" : "") + (w.name === state.selected ? " selected" : ""), title: `${w.repo} (${w.name})`, onclick: () => select(w.name) },
+      h("div", { class: "ws-item-top" }, h("span", { class: "dot " + w.status, title: statusLabel(w) }), h("span", { class: "ws-item-repo", text: shortRepo(w.repo) })),
+      h("div", { class: "ws-item-sub", text: past ? `${shortDate(w.created_at)} · ${branch}` : `${w.base} → ${branch}` }),
+    );
+  };
+  const groups = groupWorkspaces(state.workspaces);
+  const nodes = groups.active.map(item);
+  if (!groups.active.length) nodes.push(h("div", { class: "list-empty", text: "No running workspaces." }));
+  if (groups.history.length) nodes.push(h("div", { class: "list-heading", text: "History" }), ...groups.history.map(item));
+  if (groups.archived.length) {
+    // Archived workspaces stay out of the way until asked for.
+    const open = state.showArchived || groups.archived.some((w) => w.name === state.selected);
+    const details = h("details", { class: "archived", open }, h("summary", { class: "list-heading", text: `Archived (${groups.archived.length})` }), ...groups.archived.map(item));
+    details.addEventListener("toggle", () => (state.showArchived = details.open));
+    nodes.push(details);
+  }
+  nav.replaceChildren(...nodes);
+}
+
+// isTerminated reports whether the workspace is history: it was terminated,
+// so its sandbox is deleted and only the conversation is left.
+function isTerminated(ws) {
+  return !!ws && ws.sandbox_state === "terminated";
+}
+
+// groupWorkspaces splits the list for the sidebar: workspaces that still
+// have a sandbox (oldest first, as created), the history of terminated
+// ones, and the archived ones (both newest first).
+function groupWorkspaces(list) {
+  const groups = { active: [], history: [], archived: [] };
+  for (const w of list) (w.archived_at ? groups.archived : isTerminated(w) ? groups.history : groups.active).push(w);
+  groups.history.reverse();
+  groups.archived.reverse();
+  return groups;
+}
+
+function shortDate(iso) {
+  const d = new Date(iso);
+  const opts = { month: "short", day: "numeric" };
+  if (d.getFullYear() !== new Date().getFullYear()) opts.year = "numeric";
+  return d.toLocaleDateString(undefined, opts);
 }
 
 function statusLabel(ws) {
@@ -247,6 +303,8 @@ function statusLabel(ws) {
       return "Working";
     case "stopped":
       return "Stopped";
+    case "terminated":
+      return ws.archived_at ? "Archived" : "Terminated";
     case "error":
       return ws.sandbox_state === "gone" ? "Gone" : "Error";
     default:
@@ -254,9 +312,10 @@ function statusLabel(ws) {
   }
 }
 
-// sandboxGone reports whether the workspace's sandbox no longer exists.
+// sandboxGone reports whether the workspace has no sandbox any more: it was
+// deleted outside Mosso or expired ("gone"), or the workspace was terminated.
 function sandboxGone(ws) {
-  return !!ws && ws.sandbox_state === "gone";
+  return !!ws && (ws.sandbox_state === "gone" || isTerminated(ws));
 }
 
 function renderHeader() {
@@ -280,18 +339,38 @@ function renderHeader() {
     pr.classList.add("hidden");
   }
   const busy = ws.status === "working" || ws.status === "creating" || ws.status === "connecting";
+  // History is read-only: it can only be archived (or brought back).
+  const past = isTerminated(ws);
+  const archive = $("archive");
+  archive.classList.toggle("hidden", !past);
+  archive.disabled = state.archiving;
+  archive.textContent = ws.archived_at ? "Unarchive" : "Archive";
+  archive.title = ws.archived_at ? "Move this workspace back to the history" : "Move this workspace out of the history. It stays readable under Archived.";
+  // A terminated workspace only keeps the button to save the termination
+  // again, if the database write failed the first time.
+  $("terminate").classList.toggle("hidden", past && !ws.unsaved);
   const publish = $("publish");
+  publish.classList.toggle("hidden", past);
   publish.textContent = state.publishing ? "Publishing…" : ws.pull_request ? "Update PR" : "Create PR";
-  publish.disabled = busy || state.publishing || sandboxGone(ws);
-  publish.title = busy ? "Wait for the current task to finish" : "Commit and push the sandbox's changes as a pull request (a stopped sandbox is resumed first)";
+  publish.disabled = busy || state.publishing || sandboxGone(ws) || noVercel();
+  publish.title = noVercel() ? vercelHelp : busy ? "Wait for the current task to finish" : "Commit and push the sandbox's changes as a pull request (a stopped sandbox is resumed first)";
+  const terminateBtn = $("terminate");
+  if (noVercel()) terminateBtn.disabled = true; // deleting a sandbox needs Vercel
+  terminateBtn.title = noVercel() ? vercelHelp : past ? "The sandbox is deleted, but that could not be saved. Try saving it again." : "";
+  if (!terminateBtn.disabled) terminateBtn.textContent = past ? "Save again" : "Terminate";
   const resume = $("resume");
   resume.classList.toggle("hidden", ws.status !== "stopped");
-  resume.disabled = state.resuming;
+  resume.disabled = state.resuming || noVercel();
   resume.textContent = state.resuming ? "Resuming…" : "Resume sandbox";
 
   const err = $("ws-error");
   if (ws.error && ws.status === "error") {
     err.textContent = ws.error;
+    err.classList.remove("hidden");
+  } else if (ws.unsaved) {
+    err.textContent =
+      "Mosso could not save this workspace's latest changes to its database (the server log says why). They are kept in memory and saved with the next change; if Mosso restarts first, they are lost." +
+      (past ? " The sandbox is deleted either way." : "");
     err.classList.remove("hidden");
   } else {
     err.classList.add("hidden");
@@ -303,10 +382,22 @@ function renderExpiry() {
   const ws = state.ws;
   const el = $("ws-expiry");
   if (!ws) return;
+  if (isTerminated(ws)) {
+    el.textContent = ws.archived_at ? "Archived " + shortDate(ws.archived_at) : "Created " + shortDate(ws.created_at);
+    el.className = "muted";
+    el.title = "This workspace was terminated: its sandbox and snapshots are deleted. The conversation is kept as history.";
+    return;
+  }
+  if (noVercel()) {
+    el.textContent = "Not connected · as last saved";
+    el.className = "muted";
+    el.title = vercelHelp;
+    return;
+  }
   if (sandboxGone(ws)) {
     el.textContent = "Sandbox gone";
     el.className = "soon";
-    el.title = "The sandbox was deleted or its snapshot expired. The conversation is kept; terminate the workspace to remove it.";
+    el.title = "The sandbox was deleted or its snapshot expired. The conversation is kept; terminate the workspace to move it to the history.";
     return;
   }
   if (ws.status === "connecting") {
@@ -382,11 +473,18 @@ function renderWorking() {
   const pending = (state.selected && state.pending.get(state.selected)) || [];
   const uploading = pending.some((i) => i.status !== "done");
   const gone = sandboxGone(ws);
-  const blocked = busy || state.sending || !ws || uploading || gone;
+  // Without Vercel a workspace is shown as last saved and cannot be used.
+  const offline = noVercel() && !gone;
+  const blocked = busy || state.sending || !ws || uploading || gone || offline;
   send.disabled = blocked;
-  prompt.disabled = gone;
-  if (gone) {
-    prompt.placeholder = "The sandbox is gone. The conversation is kept; terminate the workspace to remove it.";
+  prompt.disabled = gone || offline;
+  // Nothing can be sent to a terminated workspace, so there is no composer.
+  $("composer").classList.toggle("hidden", isTerminated(ws));
+  if (offline) {
+    prompt.placeholder = "Read-only: this workspace is shown as Mosso last saved it. " + vercelHelp;
+    hint.textContent = "Vercel is not configured";
+  } else if (gone) {
+    prompt.placeholder = "The sandbox is gone. The conversation is kept; terminate the workspace to move it to the history.";
     hint.textContent = "";
   } else if (ws && ws.status === "creating") {
     prompt.placeholder = "The workspace is being set up…";
@@ -409,15 +507,16 @@ function render() {
   $("workspace").classList.toggle("hidden", !hasWs);
   $("empty").classList.toggle("hidden", hasWs);
   const emptyErr = $("empty-error");
-  if (state.listError) {
-    emptyErr.textContent = state.listError.message;
+  if (state.listError || noVercel()) {
+    emptyErr.textContent = state.listError ? state.listError.message : vercelHelp + " Saved workspaces can still be read.";
     emptyErr.classList.remove("hidden");
   } else {
     emptyErr.classList.add("hidden");
   }
-  $("empty-new").disabled = !!state.listError;
+  $("empty-new").disabled = !!state.listError || noVercel();
   $("empty-connect").classList.toggle("hidden", !state.github || !!state.github.configured);
-  $("new-workspace").disabled = !!state.listError;
+  $("new-workspace").disabled = !!state.listError || noVercel();
+  $("new-workspace").title = noVercel() ? vercelHelp : "Create a workspace";
   if (hasWs) {
     renderHeader();
     renderWorking();
@@ -444,7 +543,7 @@ function select(name) {
   hideBanner();
   if (name) {
     follow(name);
-    setTimeout(() => $("prompt").focus(), 0);
+    if (!isTerminated(state.ws)) setTimeout(() => $("prompt").focus(), 0);
   }
   render();
 }
@@ -799,6 +898,7 @@ function addFiles(files) {
     showBanner("The workspace is still being set up; attach files in a moment.");
     return;
   }
+  if (sandboxGone(state.ws) || noVercel()) return; // read-only: no sandbox to upload to
   const name = state.selected;
   const items = pendingFor(name);
   for (const file of files) {
@@ -941,23 +1041,46 @@ async function stopTurn() {
 async function terminate() {
   const ws = state.ws;
   if (!ws) return;
+  // Already terminated: this only saves it again, so there is nothing to confirm.
+  const retry = isTerminated(ws);
   const msg =
     `Terminate the workspace for ${ws.repo}?\n\n` +
-    "This permanently deletes the Vercel Sandbox with its files and snapshots, the Claude conversation and the history Mosso saved on this machine. Unpublished changes are lost. " +
-    (ws.pull_request ? `The branch and PR #${ws.pull_request.number} stay on GitHub.` : "Nothing has been published yet.");
-  if (!confirm(msg)) return;
+    "This permanently deletes the Vercel Sandbox with its files and snapshots. Unpublished changes are lost, and Claude cannot continue this conversation. " +
+    (ws.pull_request ? `The branch and PR #${ws.pull_request.number} stay on GitHub. ` : "Nothing has been published yet. ") +
+    "The conversation stays readable in Mosso's history.";
+  if (!retry && !confirm(msg)) return;
   const btn = $("terminate");
   btn.disabled = true;
-  btn.textContent = "Terminating…";
+  btn.textContent = retry ? "Saving…" : "Terminating…";
   try {
+    // The workspace stays selected: its event stream reports that it is
+    // now history.
     await api("DELETE", wsPath(ws.name));
     state.drafts.delete(ws.name);
-    if (state.selected === ws.name) select(null);
+    state.pending.delete(ws.name);
   } catch (e) {
     showBanner("Could not terminate the workspace: " + e.message + (e.status === 502 ? "\nCheck the Vercel dashboard for a leftover sandbox." : ""));
   } finally {
     btn.disabled = false;
-    btn.textContent = "Terminate";
+    refreshList(); // renders the button for the workspace's new state
+  }
+}
+
+// toggleArchive archives the selected terminated workspace, or brings an
+// archived one back into the history.
+async function toggleArchive() {
+  const ws = state.ws;
+  if (!ws || state.archiving) return;
+  state.archiving = true;
+  render();
+  try {
+    const updated = await api("POST", wsPath(ws.name) + (ws.archived_at ? "/unarchive" : "/archive"), {});
+    if (state.selected === updated.name) state.ws = updated;
+    hideBanner();
+  } catch (e) {
+    showBanner(`Could not ${ws.archived_at ? "unarchive" : "archive"} the workspace: ` + e.message);
+  } finally {
+    state.archiving = false;
     refreshList();
   }
 }
@@ -1106,6 +1229,7 @@ function init() {
   $("publish-form").addEventListener("submit", submitPublish);
   $("publish-cancel").addEventListener("click", () => $("publish-dialog").close());
   $("terminate").addEventListener("click", terminate);
+  $("archive").addEventListener("click", toggleArchive);
   $("resume").addEventListener("click", resumeSandbox);
   $("empty-connect").addEventListener("click", openGitHub);
   $("github-form").addEventListener("submit", submitGitHub);

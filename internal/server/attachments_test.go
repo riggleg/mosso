@@ -409,13 +409,18 @@ func TestAttachmentsGoWithTheWorkspace(t *testing.T) {
 	if len(fake.deleted) != 1 {
 		t.Fatalf("sandbox not deleted: %v", fake.deleted)
 	}
+	// The workspace stays as history, with the attachment's description;
+	// the file itself went with the sandbox.
 	srv.mu.Lock()
-	n := len(srv.workspaces)
+	n := len(srv.workspaces[ws.Name].attachments)
 	srv.mu.Unlock()
-	if n != 0 {
-		t.Fatal("workspace and its attachment records are still held")
+	if n != 1 {
+		t.Fatalf("attachment records after terminate = %d, want 1", n)
 	}
-	if resp, _ := get(t, ts.URL+"/workspaces/"+ws.Name+"/attachments/"+att.ID); resp.StatusCode != http.StatusNotFound {
+	if resp, _ := get(t, ts.URL+"/workspaces/"+ws.Name+"/attachments/"+att.ID); resp.StatusCode != http.StatusGone {
 		t.Fatalf("after terminate: status = %d", resp.StatusCode)
+	}
+	if resp := postUpload(t, ts.URL, ws.Name, upFile{"b.png", onePixelPNG}); resp.StatusCode != http.StatusGone {
+		t.Fatalf("upload after terminate: status = %d", resp.StatusCode)
 	}
 }

@@ -1,23 +1,29 @@
 package server
 
 import (
-	"bufio"
+	"database/sql"
 	"encoding/json"
-	"errors"
 	"fmt"
+	"log"
+	"net/url"
 	"os"
 	"path/filepath"
-	"regexp"
 	"time"
+
+	_ "modernc.org/sqlite" // the SQLite driver, in pure Go (no cgo)
 
 	"github.com/riggleg/mosso/internal/github"
 	"github.com/riggleg/mosso/internal/vercel"
 )
 
-// EnvDataDir names the directory Mosso keeps its state in; see DataDir.
-const EnvDataDir = "MOSSO_DATA_DIR"
+const (
+	// EnvDataDir names the directory Mosso keeps its state in; see DataDir.
+	EnvDataDir = "MOSSO_DATA_DIR"
+	// EnvDBPath names the SQLite database file; see DBPath.
+	EnvDBPath = "MOSSO_DB_PATH"
+)
 
-// DataDir is where Mosso saves workspaces: $MOSSO_DATA_DIR, or "mosso" in
+// DataDir is where Mosso keeps its state: $MOSSO_DATA_DIR, or "mosso" in
 // the user's configuration directory (~/Library/Application Support on
 // macOS, $XDG_CONFIG_HOME or ~/.config elsewhere).
 func DataDir() (string, error) {
@@ -31,21 +37,59 @@ func DataDir() (string, error) {
 	return filepath.Join(base, "mosso"), nil
 }
 
+// LegacyDir is where a Mosso from before the database saved workspaces as
+// files: "workspaces" in the data directory, wherever the database is now.
+// It is "" if there is no data directory to look in.
+func LegacyDir() string {
+	dir, err := DataDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(dir, "workspaces")
+}
+
+// DBPath is the SQLite database Mosso saves workspaces and chats in:
+// $MOSSO_DB_PATH, or mosso.db in the data directory. In a container, point
+// either at a mounted volume.
+func DBPath() (string, error) {
+	if v := os.Getenv(EnvDBPath); v != "" {
+		return v, nil
+	}
+	dir, err := DataDir()
+	if err != nil {
+		return "", fmt.Errorf("%w (or set %s)", err, EnvDBPath)
+	}
+	return filepath.Join(dir, "mosso.db"), nil
+}
+
 // workspaceRecord is what Mosso remembers about a workspace between runs:
-// enough to find its sandbox again and continue where it left off. The
-// chat is stored next to it, one JSON line per entry. No credentials.
+// a row of the workspaces table. The chat is stored next to it, one row
+// per entry. No credentials.
 type workspaceRecord struct {
-	Name    string         `json:"name"`
-	Repo    string         `json:"repo"`
-	Base    string         `json:"base"`
-	BaseSHA string         `json:"base_sha"`
-	Branch  string         `json:"branch"`
-	Dir     string         `json:"dir"`
-	Sandbox vercel.Sandbox `json:"sandbox"`
-	// SandboxState is "running", "stopped" or "gone", as last known.
-	SandboxState string              `json:"sandbox_state"`
-	ExpiresAt    time.Time           `json:"expires_at,omitzero"`
-	PullRequest  *github.PullRequest `json:"pull_request,omitempty"`
+	// Name is the workspace's ID; the Vercel sandbox has the same name.
+	Name   string `json:"name"`
+	Repo   string `json:"repo"`
+	Base   string `json:"base"`
+	Branch string `json:"branch"`
+	// SandboxState is "running", "stopped", "gone" or "terminated", as
+	// last known: the workspace's saved status.
+	SandboxState string    `json:"sandbox_state"`
+	CreatedAt    time.Time `json:"created_at"`
+	UpdatedAt    time.Time `json:"updated_at"`
+	// ArchivedAt is when the workspace was archived, if it is.
+	ArchivedAt time.Time `json:"archived_at,omitzero"`
+	workspaceState
+}
+
+// workspaceState is the rest of a record, kept as JSON in the state column:
+// what Mosso needs to find the sandbox again and continue where it left
+// off. Adding a field here needs no migration.
+type workspaceState struct {
+	BaseSHA     string              `json:"base_sha"`
+	Dir         string              `json:"dir"`
+	Sandbox     vercel.Sandbox      `json:"sandbox"`
+	ExpiresAt   time.Time           `json:"expires_at,omitzero"`
+	PullRequest *github.PullRequest `json:"pull_request,omitempty"`
 	// Pushed is the working branch head Mosso last pushed, so a rebased
 	// branch can still be force-pushed after a restart.
 	Pushed string `json:"pushed,omitempty"`
@@ -57,129 +101,190 @@ type workspaceRecord struct {
 	LastSeq     int64        `json:"last_seq"`
 	TaskRunning bool         `json:"task_running"`
 	Attachments []attachment `json:"attachments,omitempty"`
-	CreatedAt   time.Time    `json:"created_at"`
-	UpdatedAt   time.Time    `json:"updated_at"`
 }
 
-var workspaceNamePattern = regexp.MustCompile(`^mosso-[0-9a-f]{12}$`)
-
-// store keeps workspace records and chat logs under a directory:
-//
-//	<dir>/workspaces/<name>/workspace.json
-//	<dir>/workspaces/<name>/chat.jsonl
+// store keeps workspaces and their chats in a SQLite database. It is the
+// only code that talks SQL; its schema is in migrations.go.
 type store struct {
-	dir string
+	db *sql.DB
 }
 
-func openStore(dir string) (*store, error) {
-	if err := os.MkdirAll(filepath.Join(dir, "workspaces"), 0o700); err != nil {
+// openStore opens the database at path, creating it and its directory if
+// needed, and brings its schema up to date.
+func openStore(path string) (*store, error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, fmt.Errorf("create the data directory: %w", err)
 	}
-	return &store{dir: dir}, nil
+	// Chats are private: create the file readable by its owner only.
+	// SQLite gives its -wal and -shm files the same mode.
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("open the database: %w", err)
+	}
+	f.Close()
+	// WAL with synchronous=NORMAL makes saving a chat entry cheap (no fsync
+	// per entry) and cannot corrupt the database; after a power cut the
+	// last entries may be missing, and are fetched from the worker again.
+	// WAL needs a local filesystem, not a network one such as NFS.
+	dsn := "file:" + (&url.URL{Path: filepath.ToSlash(path)}).EscapedPath() +
+		"?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=foreign_keys(1)"
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return nil, fmt.Errorf("open the database: %w", err)
+	}
+	// One connection: Mosso is the database's only user and writes one
+	// thing at a time.
+	db.SetMaxOpenConns(1)
+	st := &store{db: db}
+	if err := st.migrate(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("open the database %s: %w", path, err)
+	}
+	return st, nil
 }
 
-func (st *store) workspaceDir(name string) string {
-	return filepath.Join(st.dir, "workspaces", name)
-}
+func (st *store) close() error { return st.db.Close() }
 
-// save writes the record atomically.
-func (st *store) save(rec workspaceRecord) error {
-	if !workspaceNamePattern.MatchString(rec.Name) {
-		return fmt.Errorf("store: invalid workspace name %q", rec.Name)
-	}
-	dir := st.workspaceDir(rec.Name)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return err
-	}
-	rec.UpdatedAt = time.Now().UTC()
-	b, err := json.MarshalIndent(rec, "", "  ")
+// tx runs fn in a transaction.
+func (st *store) tx(fn func(*sql.Tx) error) error {
+	tx, err := st.db.Begin()
 	if err != nil {
 		return err
 	}
-	tmp := filepath.Join(dir, "workspace.json.tmp")
-	if err := os.WriteFile(tmp, b, 0o600); err != nil {
+	if err := fn(tx); err != nil {
+		_ = tx.Rollback()
 		return err
 	}
-	return os.Rename(tmp, filepath.Join(dir, "workspace.json"))
+	return tx.Commit()
+}
+
+// Timestamps are stored as UTC text of a fixed width, so they sort.
+const timeLayout = "2006-01-02T15:04:05.000000Z"
+
+func formatTime(t time.Time) string { return t.UTC().Format(timeLayout) }
+
+func parseTime(s string) time.Time {
+	t, _ := time.Parse(timeLayout, s)
+	return t
+}
+
+// save inserts or updates the workspace's row and adds entries to the end
+// of its conversation, all or nothing.
+func (st *store) save(rec workspaceRecord, entries ...chatEntry) error {
+	return st.tx(func(tx *sql.Tx) error {
+		if err := saveRecord(tx, rec); err != nil {
+			return err
+		}
+		return insertEntries(tx, rec.Name, entries)
+	})
+}
+
+func saveRecord(tx *sql.Tx, rec workspaceRecord) error {
+	state, err := json.Marshal(rec.workspaceState)
+	if err != nil {
+		return err
+	}
+	var archived any
+	if !rec.ArchivedAt.IsZero() {
+		archived = formatTime(rec.ArchivedAt)
+	}
+	sandboxID := rec.Sandbox.Name
+	if sandboxID == "" {
+		sandboxID = rec.Name
+	}
+	_, err = tx.Exec(`
+		INSERT INTO workspaces (id, repo, base, branch, sandbox_id, status, state, created_at, updated_at, archived_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT (id) DO UPDATE SET
+			repo = excluded.repo, base = excluded.base, branch = excluded.branch,
+			sandbox_id = excluded.sandbox_id, status = excluded.status, state = excluded.state,
+			updated_at = excluded.updated_at, archived_at = excluded.archived_at`,
+		rec.Name, rec.Repo, rec.Base, rec.Branch, sandboxID, rec.SandboxState, string(state),
+		formatTime(rec.CreatedAt), formatTime(time.Now()), archived)
+	return err
 }
 
 // load returns every saved workspace, oldest first.
 func (st *store) load() ([]workspaceRecord, error) {
-	entries, err := os.ReadDir(filepath.Join(st.dir, "workspaces"))
+	rows, err := st.db.Query(`
+		SELECT id, repo, base, branch, sandbox_id, status, state, created_at, updated_at, archived_at
+		FROM workspaces ORDER BY created_at, id`)
 	if err != nil {
 		return nil, err
 	}
+	defer rows.Close()
 	var out []workspaceRecord
-	for _, e := range entries {
-		if !e.IsDir() || !workspaceNamePattern.MatchString(e.Name()) {
-			continue
-		}
-		b, err := os.ReadFile(filepath.Join(st.workspaceDir(e.Name()), "workspace.json"))
-		if errors.Is(err, os.ErrNotExist) {
-			continue
-		}
-		if err != nil {
+	for rows.Next() {
+		var rec workspaceRecord
+		var sandboxID, state, created, updated string
+		var archived sql.NullString
+		if err := rows.Scan(&rec.Name, &rec.Repo, &rec.Base, &rec.Branch, &sandboxID, &rec.SandboxState, &state, &created, &updated, &archived); err != nil {
 			return nil, err
 		}
-		var rec workspaceRecord
-		if err := json.Unmarshal(b, &rec); err != nil {
-			return nil, fmt.Errorf("read workspace %s: %w", e.Name(), err)
+		if err := json.Unmarshal([]byte(state), &rec.workspaceState); err != nil {
+			return nil, fmt.Errorf("read workspace %s: %w", rec.Name, err)
 		}
-		if rec.Name != e.Name() {
-			return nil, fmt.Errorf("read workspace %s: the record is for %q", e.Name(), rec.Name)
+		rec.Sandbox.Name = sandboxID
+		rec.CreatedAt, rec.UpdatedAt = parseTime(created), parseTime(updated)
+		if archived.Valid {
+			rec.ArchivedAt = parseTime(archived.String)
 		}
 		out = append(out, rec)
 	}
-	return out, nil
+	return out, rows.Err()
 }
 
-// appendEntry adds one chat entry to the workspace's log.
-func (st *store) appendEntry(name string, e chatEntry) error {
-	if !workspaceNamePattern.MatchString(name) {
-		return fmt.Errorf("store: invalid workspace name %q", name)
-	}
-	f, err := os.OpenFile(filepath.Join(st.workspaceDir(name), "chat.jsonl"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	b, err := json.Marshal(e)
-	if err != nil {
-		return err
-	}
-	_, err = f.Write(append(b, '\n'))
-	return err
+// exists reports whether the workspace is saved.
+func (st *store) exists(name string) (bool, error) {
+	var n int
+	err := st.db.QueryRow(`SELECT COUNT(*) FROM workspaces WHERE id = ?`, name).Scan(&n)
+	return n > 0, err
 }
 
-// loadEntries returns the workspace's chat log. A truncated last line is
-// skipped.
+// appendEntries adds chat entries to the end of a saved workspace's
+// conversation, in the order given.
+func (st *store) appendEntries(name string, entries []chatEntry) error {
+	if len(entries) == 0 {
+		return nil
+	}
+	return st.tx(func(tx *sql.Tx) error { return insertEntries(tx, name, entries) })
+}
+
+func insertEntries(tx *sql.Tx, name string, entries []chatEntry) error {
+	for _, e := range entries {
+		b, err := json.Marshal(e)
+		if err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`INSERT INTO chat_entries (workspace_id, entry) VALUES (?, ?)`, name, string(b)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// loadEntries returns the workspace's conversation, in order, numbered
+// from 0. An entry that cannot be read is skipped: losing one entry must
+// not stop a workspace from being restored and its sandbox reconnected.
 func (st *store) loadEntries(name string) ([]chatEntry, error) {
-	f, err := os.Open(filepath.Join(st.workspaceDir(name), "chat.jsonl"))
-	if errors.Is(err, os.ErrNotExist) {
-		return nil, nil
-	}
+	rows, err := st.db.Query(`SELECT entry FROM chat_entries WHERE workspace_id = ? ORDER BY id`, name)
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
+	defer rows.Close()
 	var out []chatEntry
-	sc := bufio.NewScanner(f)
-	sc.Buffer(nil, 64<<20)
-	for sc.Scan() {
+	for rows.Next() {
+		var b string
+		if err := rows.Scan(&b); err != nil {
+			return nil, err
+		}
 		var e chatEntry
-		if err := json.Unmarshal(sc.Bytes(), &e); err != nil {
+		if err := json.Unmarshal([]byte(b), &e); err != nil {
+			log.Printf("workspace %s: skipping a saved chat entry that cannot be read: %v", name, err)
 			continue
 		}
 		e.ID = len(out)
 		out = append(out, e)
 	}
-	return out, sc.Err()
-}
-
-// remove deletes everything saved about the workspace.
-func (st *store) remove(name string) error {
-	if !workspaceNamePattern.MatchString(name) {
-		return fmt.Errorf("store: invalid workspace name %q", name)
-	}
-	return os.RemoveAll(st.workspaceDir(name))
+	return out, rows.Err()
 }

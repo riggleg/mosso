@@ -39,9 +39,12 @@ frontend build step, Node.js dependency or separate frontend server.
    Claude to rebase onto `origin/<base>` when the pull request has conflicts;
    the rebased branch is pushed with `--force-with-lease`. See
    [github.md](github.md#rebasing-an-open-pull-request).
-8. Click **Terminate** and confirm to delete the workspace: the sandbox, its
-   snapshots and the history saved on this machine. The branch and pull
-   request stay on GitHub.
+8. Click **Terminate** and confirm to delete the workspace's sandbox and its
+   snapshots. The branch and pull request stay on GitHub, and the
+   conversation stays readable under **History** in the sidebar.
+9. Open a past workspace from **History** to read its conversation. Click
+   **Archive** to move it to the collapsed **Archived** section, and
+   **Unarchive** to bring it back. See [history.md](history.md).
 
 You can switch between workspaces, reload the page, open a second tab, quit
 Mosso or close the laptop at any time. Claude keeps working in the sandbox
@@ -66,7 +69,7 @@ ask it to continue.
   you is always kept locally.
 - Attachments are not fetched from a stopped sandbox (that would boot it for
   a thumbnail); resume it and reload the page.
-- Each chat log is capped at about 32 MiB in memory and on disk, and the
+- Each chat log is capped at about 32 MiB in memory and in the database, and the
   worker's event log at 64 MiB in the sandbox. Past that, new tool inputs
   and outputs are replaced with a placeholder (the chat says so); Claude's
   messages and progress are still shown.
@@ -82,7 +85,7 @@ ask it to continue.
 ```
 browser ──POST /workspaces/{name}/chat──▶ Mosso ──POST /messages (curl via Vercel cmd API)──▶ worker ── claude -p
         ◀─GET …/events (SSE)──────────── Mosso ◀─GET /events?after=N&follow=1 (streamed)──── worker ◀─ stream-json
-                                          │ saves workspace.json + chat.jsonl         │ fsyncs events.jsonl
+                                          │ saves to SQLite (mosso.db)                │ fsyncs events.jsonl
 ```
 
 - **The worker runs Claude.** Inside the sandbox, the Mosso worker starts
@@ -101,8 +104,9 @@ browser ──POST /workspaces/{name}/chat──▶ Mosso ──POST /messages (
   browser goes away while it is creating.
 - **Chat log.** Every workspace keeps a log of entries: your prompts,
   Claude's events, turn results, errors, notices and pull requests. It is
-  appended to `chat.jsonl` in Mosso's data directory as it grows, and
-  rebuilt from there on start. The server also keeps the Claude Code
+  saved in Mosso's SQLite database as it grows, and rebuilt from there on
+  start; it is kept after the workspace is terminated
+  (see [history.md](history.md)). The server also keeps the Claude Code
   session ID, so follow-ups resume the conversation even after a turn was
   stopped or interrupted. The UI never handles session IDs.
 - **Server-sent events.** `GET …/events` replays the log and then streams new
@@ -126,7 +130,9 @@ These come in addition to the endpoints in [github.md](github.md) and
 | `POST /workspaces/{name}/chat`             | Body: `{"prompt": "...", "attachments": ["<id>"]}` (`attachments` optional; `prompt` may then be empty). Starts a Claude Code turn that continues the workspace's conversation and returns `202 {"status":"working"}`. `409` if the workspace is busy, `503` if there is no Claude token. |
 | `POST /workspaces/{name}/attachments`      | Multipart upload into the sandbox; see [attachments.md](attachments.md). `GET /workspaces/{name}/attachments/{id}` reads one back. |
 | `POST /workspaces/{name}/chat/stop`        | Stops the running turn (`202`); `409` if Claude is not running. |
-| `POST /workspaces/{name}/connect`          | Resumes a stopped sandbox, restarts the worker and catches up on events; returns the workspace. `410` if the sandbox is gone. |
+| `POST /workspaces/{name}/connect`          | Resumes a stopped sandbox, restarts the worker and catches up on events; returns the workspace. `410` if the sandbox is gone or the workspace was terminated. |
+| `POST /workspaces/{name}/archive`, `POST /workspaces/{name}/unarchive` | Archives a terminated workspace, or brings it back; returns the workspace. `409` if the workspace still has a sandbox (terminate it first); `500` if the change could not be saved (it is then not made). |
+| `GET /vercel/auth`                         | `{"configured": true}` if Vercel Sandbox credentials are set. Without them, the endpoints that only read saved workspaces (`GET /workspaces`, `GET /workspaces/{name}`, `GET …/events`) and the archive endpoints still work; everything that needs a sandbox answers `503`. See [history.md](history.md#without-vercel-credentials). |
 | `GET /workspaces/{name}/events`            | Server-sent events, see below. |
 | `GET /github/repos`                        | `{"repos": [{"full_name", "default_branch", "private"}]}`: up to 100 repositories the GitHub token can access, most recently pushed first. |
 | `GET /github/repos/{owner}/{repo}/branches`| `{"branches": ["main", …]}`: up to 100 branches. |
@@ -145,10 +151,14 @@ These come in addition to the endpoints in [github.md](github.md) and
 
 `status` is `creating`, `connecting` (Mosso restarted and is checking the
 sandbox), `ready`, `working` (Claude or a publish is running), `stopped`
-(the sandbox session ended; the next message resumes it) or `error` (the
-last turn or publish failed, or the sandbox is gone; `error` says why).
-`sandbox_state` is `running`, `stopped` or `gone`; `expires_at`, the end of
-the current session, is omitted while the sandbox is stopped. Workspace
+(the sandbox session ended; the next message resumes it), `terminated`
+(history: the sandbox was deleted) or `error` (the last turn or publish
+failed, or the sandbox is gone; `error` says why).
+`sandbox_state` is `running`, `stopped`, `gone` or `terminated`;
+`expires_at`, the end of the current session, is omitted while the sandbox
+is stopped. `archived_at` is set while the workspace is archived, and
+`"unsaved": true` while Mosso's last attempt to save the workspace failed
+(see [history.md](history.md#if-the-database-cannot-be-written)). Workspace
 creation also installs Claude Code and starts the worker, so the first
 message starts straight away.
 

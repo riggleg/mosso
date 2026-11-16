@@ -34,7 +34,9 @@ implementations are acceptable for this first version.
       stopped; steering a turn while it runs is not supported.
 - [x] Commit, push and open a PR; show the PR URL (with Claude Code for now).
 - [x] Persist session metadata and chat events across UI reloads. Done
-      with Claude Code: workspaces and chats are saved on disk and in each
+      with Claude Code: workspaces and chats are saved in a SQLite database
+      (kept as history after a workspace is terminated; see
+      [history.md](history.md)) and in each
       persistent sandbox's worker log, so they survive reloads, Mosso
       restarts and sandbox session stops (see [worker.md](worker.md)).
 - [x] Show sessions and offer a terminate action (web UI).
@@ -76,5 +78,5 @@ tokens.
 binary), with streaming chat over server-sent events
 (see [web-ui.md](web-ui.md)).
 
-Workspaces and chats are saved in Mosso's data directory and in the
+Workspaces and chats are saved in Mosso's SQLite database and in the
 sandbox worker's event log; sandboxes are persistent and resume on demand.

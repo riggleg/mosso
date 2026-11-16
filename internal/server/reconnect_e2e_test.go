@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -25,7 +26,7 @@ import (
 //  2. Shut the Mosso server down while Claude is still working.
 //  3. Check, through the Vercel API, that the worker in the sandbox keeps
 //     going and finishes.
-//  4. Start a new Mosso server over the same data directory: it reconnects,
+//  4. Start a new Mosso server over the same database: it reconnects,
 //     fetches the missed events, and the whole conversation is there once.
 //  5. Send a follow-up, which continues the Claude session.
 //  6. Stop the sandbox session (as a timeout would), restart Mosso again,
@@ -61,7 +62,7 @@ func TestReconnectEndToEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 	vc := vercel.NewClient(cfg)
-	dataDir := t.TempDir()
+	dbPath := filepath.Join(t.TempDir(), "mosso.db")
 
 	var wsName string
 	t.Cleanup(func() {
@@ -85,7 +86,7 @@ func TestReconnectEndToEnd(t *testing.T) {
 
 	start := func() (*Server, *httptest.Server) {
 		srv := New(vc)
-		if err := srv.Restore(context.Background(), dataDir); err != nil {
+		if err := srv.Restore(context.Background(), dbPath, ""); err != nil {
 			t.Fatal(err)
 		}
 		ts := httptest.NewServer(srv.Handler())
@@ -268,7 +269,7 @@ func TestReconnectEndToEnd(t *testing.T) {
 	}
 	t.Log("the conversation continued after the sandbox resumed")
 
-	// Terminate: the sandbox, its snapshots and the saved state go away.
+	// Terminate: the sandbox and its snapshots go away (the history stays).
 	req, _ := http.NewRequest(http.MethodDelete, ts.URL+"/workspaces/"+wsName, nil)
 	if resp, err := http.DefaultClient.Do(req); err != nil || resp.StatusCode != http.StatusNoContent {
 		t.Fatalf("terminate: %v %v", resp, err)

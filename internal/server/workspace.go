@@ -31,7 +31,8 @@ const setupTimeout = 10 * time.Minute
 const publishTimeout = 5 * time.Minute
 
 // workspace is a GitHub repository checked out on a working branch in a
-// persistent sandbox. Its name is the sandbox's name.
+// persistent sandbox. Its name is the sandbox's name. It outlives the
+// sandbox: once terminated, it is kept with its conversation as history.
 type workspace struct {
 	Name    string         `json:"name"`
 	Repo    string         `json:"repo"`
@@ -40,21 +41,30 @@ type workspace struct {
 	Branch  string         `json:"branch"`
 	Dir     string         `json:"dir"`
 	Sandbox vercel.Sandbox `json:"sandbox"`
-	// SandboxState is "running", "stopped" (resumes on the next message)
-	// or "gone" (deleted or expired); computed by snapshotLocked.
+	// SandboxState is "running", "stopped" (resumes on the next message),
+	// "gone" (deleted elsewhere or expired) or "terminated" (deleted by
+	// terminating the workspace); computed by snapshotLocked.
 	SandboxState string `json:"sandbox_state"`
 	// ExpiresAt is when Vercel stops the current sandbox session; unset
 	// while the sandbox is stopped.
-	ExpiresAt   time.Time           `json:"expires_at,omitzero"`
-	CreatedAt   time.Time           `json:"created_at"`
+	ExpiresAt time.Time `json:"expires_at,omitzero"`
+	CreatedAt time.Time `json:"created_at"`
+	// ArchivedAt is set while the workspace is archived: still readable,
+	// but listed apart from the rest of the history.
+	ArchivedAt  time.Time           `json:"archived_at,omitzero"`
 	PullRequest *github.PullRequest `json:"pull_request,omitempty"`
 	// Status is "creating", "connecting" (checking the sandbox after a
 	// restart), "ready", "working" (Claude or a publish is running),
-	// "stopped" (the sandbox session ended; the next message resumes it)
-	// or "error" (the last turn or publish failed, or the sandbox is
-	// gone); Error says why. Both are computed by snapshotLocked.
+	// "stopped" (the sandbox session ended; the next message resumes it),
+	// "terminated" (history: the sandbox was deleted) or "error" (the last
+	// turn or publish failed, or the sandbox is gone); Error says why. Both
+	// are computed by snapshotLocked.
 	Status string `json:"status"`
 	Error  string `json:"error,omitempty"`
+	// Unsaved says the last attempt to save the workspace in the database
+	// failed, so what is shown may be lost if Mosso restarts before a
+	// later save succeeds; computed by snapshotLocked.
+	Unsaved bool `json:"unsaved,omitempty"`
 
 	creating   bool
 	connecting bool
@@ -68,6 +78,8 @@ type workspace struct {
 	git *github.Mirror
 	// pushed is the working branch head Mosso last pushed.
 	pushed string
+	// unsaved is set while the database is behind what is in memory.
+	unsaved bool
 
 	// Sandbox worker state, guarded by Server.mu. lastSeq is the last
 	// worker event applied to the chat; taskRunning says a Claude task is
@@ -86,12 +98,15 @@ type workspace struct {
 func (s *Server) snapshotLocked(ws *workspace) workspace {
 	c := *ws
 	c.SandboxState = ws.sandboxState
+	c.Unsaved = ws.unsaved
 	expired := !ws.ExpiresAt.IsZero() && time.Now().After(ws.ExpiresAt)
 	switch {
 	case ws.creating:
 		c.Status = "creating"
 	case ws.connecting:
 		c.Status = "connecting"
+	case ws.sandboxState == sandboxTerminated:
+		c.Status = "terminated"
 	case ws.sandboxState == sandboxGone:
 		c.Status, c.Error = "error", goneMessage
 	case s.busy[ws.Name]:
@@ -236,6 +251,10 @@ func (s *Server) githubConnect(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, s.authStatus(gh, source, user, nil))
 }
 
+// listWorkspaces lists every workspace, oldest first: the ones with a
+// sandbox, the terminated ones kept as history, and the archived ones
+// (archived_at is set). Like the other endpoints that only read saved
+// workspaces, it works without Vercel credentials.
 func (s *Server) listWorkspaces(w http.ResponseWriter, _ *http.Request) {
 	s.mu.Lock()
 	list := make([]workspace, 0, len(s.workspaces))
@@ -357,7 +376,7 @@ func (s *Server) createWorkspace(w http.ResponseWriter, r *http.Request) {
 	if !github.ValidRepo(ws.Repo) {
 		ws.Repo = req.Repo
 	}
-	ws.chat.persist = s.persister(ws.Name)
+	ws.chat.persist = s.persister(ws)
 	// List the workspace as "creating" and hold it while cloning so nothing
 	// else runs in it. Destroy it if it does not come up.
 	s.mu.Lock()
@@ -431,17 +450,29 @@ func (s *Server) createWorkspace(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	_, live := s.sandboxes[sb.Name]
 	var snapshot workspace
+	var saveErr error
 	if live && s.workspaces[sb.Name] == ws {
-		ws.git = mirror
 		ws.BaseSHA = baseSHA
-		ws.creating = false
-		delete(s.busy, sb.Name)
-		ws.chat.notify()
-		s.persistLocked(ws)
-		snapshot = s.snapshotLocked(ws)
-		ready = true
+		// The workspace exists once it is saved, with the chat so far. If
+		// it cannot be saved it is not created: Mosso would lose track of
+		// its sandbox at the next restart.
+		if saveErr = s.saveLocked(ws); saveErr == nil {
+			ws.git = mirror
+			ws.creating = false
+			delete(s.busy, sb.Name)
+			ws.chat.notify()
+			snapshot = s.snapshotLocked(ws)
+			ready = true
+		}
 	}
 	s.mu.Unlock()
+	if saveErr != nil {
+		// The deferred cleanup removes the workspace and destroys the sandbox.
+		_ = mirror.Close()
+		log.Printf("workspace %s: save: %v", sb.Name, saveErr)
+		writeError(w, http.StatusInternalServerError, "the workspace could not be saved, so it was not created and its sandbox is destroyed: "+saveErr.Error())
+		return
+	}
 	if !ready {
 		_ = mirror.Close()
 		writeError(w, http.StatusServiceUnavailable, "the sandbox was destroyed while the workspace was being set up")
@@ -456,6 +487,54 @@ func (s *Server) createWorkspace(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 	writeJSON(w, http.StatusCreated, snapshot)
+}
+
+// archiveWorkspace archives a terminated workspace (POST …/archive) or
+// brings it back (POST …/unarchive). An archived workspace keeps its
+// conversation and stays readable; the web UI lists it apart from the rest
+// of the history. A workspace that still has a sandbox cannot be archived:
+// out of sight, it would keep costing money. Archiving only touches the
+// database, so it works without Vercel credentials; it fails if the change
+// cannot be saved.
+func (s *Server) archiveWorkspace(archive bool) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		s.mu.Lock()
+		ws, ok := s.workspaces[r.PathValue("name")]
+		if !ok {
+			s.mu.Unlock()
+			writeError(w, http.StatusNotFound, "unknown workspace")
+			return
+		}
+		if archive && ws.sandboxState != sandboxTerminated {
+			s.mu.Unlock()
+			writeError(w, http.StatusConflict, "terminate the workspace before archiving it: its sandbox still exists")
+			return
+		}
+		if ws.creating {
+			s.mu.Unlock()
+			writeError(w, http.StatusConflict, "the workspace is still being set up")
+			return
+		}
+		before, unsaved := ws.ArchivedAt, ws.unsaved
+		switch {
+		case !archive:
+			ws.ArchivedAt = time.Time{}
+		case ws.ArchivedAt.IsZero():
+			ws.ArchivedAt = time.Now().UTC()
+		}
+		if err := s.saveLocked(ws); err != nil {
+			// Not saved is not archived: it would come back after a restart.
+			ws.ArchivedAt, ws.unsaved = before, unsaved
+			s.mu.Unlock()
+			log.Printf("workspace %s: save: %v", ws.Name, err)
+			writeError(w, http.StatusInternalServerError, "the change could not be saved: "+err.Error())
+			return
+		}
+		ws.chat.notify()
+		snapshot := s.snapshotLocked(ws)
+		s.mu.Unlock()
+		writeJSON(w, http.StatusOK, snapshot)
+	}
 }
 
 // workspacePullRequest commits the workspace's changes, pushes them to its
@@ -489,14 +568,14 @@ func (s *Server) workspacePullRequest(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.mu.Lock()
-	git, gone := ws.git, ws.sandboxState == sandboxGone
+	git, gone := ws.git, noSandbox(ws.sandboxState)
 	s.mu.Unlock()
-	if git == nil {
-		writeError(w, http.StatusConflict, "the workspace is still being set up")
+	if gone != "" {
+		writeError(w, http.StatusGone, gone)
 		return
 	}
-	if gone {
-		writeError(w, http.StatusGone, goneMessage)
+	if git == nil {
+		writeError(w, http.StatusConflict, "the workspace is still being set up")
 		return
 	}
 	gh, ok := s.gitHub(w, r)

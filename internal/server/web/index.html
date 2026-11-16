@@ -19,7 +19,7 @@
     <nav id="workspace-list" aria-label="Workspaces"></nav>
     <footer id="sidebar-footer">
       <ul id="checks" aria-label="Configuration"></ul>
-      <p class="limitation">Workspaces and chats are saved on this machine and in each persistent sandbox. Claude keeps working in the sandbox when Mosso stops; Mosso catches up when it starts again. Sandbox sessions last up to 45 minutes and resume on your next message. Terminate deletes a workspace for good; branches and pull requests stay on GitHub.</p>
+      <p class="limitation">Workspaces and chats are saved on this machine and in each persistent sandbox. Claude keeps working in the sandbox when Mosso stops; Mosso catches up when it starts again. Sandbox sessions last up to 45 minutes and resume on your next message. Terminate deletes a workspace's sandbox; its conversation stays in the history and can be archived. Branches and pull requests stay on GitHub.</p>
     </footer>
   </aside>
 
@@ -50,6 +50,7 @@
           <button id="resume" class="hidden" type="button" title="Start a new sandbox session from the saved snapshot and fetch what Claude did meanwhile">Resume sandbox</button>
           <button id="publish" type="button">Create PR</button>
           <button id="terminate" class="danger" type="button">Terminate</button>
+          <button id="archive" class="hidden" type="button">Archive</button>
         </div>
       </header>
       <div id="ws-error" class="ws-error hidden"></div>
