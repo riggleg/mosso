@@ -258,8 +258,12 @@ func TestWorkspaceToPullRequest(t *testing.T) {
 	if len(fake.deleted) != 1 || fake.deleted[0] != ws.Name {
 		t.Fatalf("deleted = %v", fake.deleted)
 	}
-	if rec := do(t, h, http.MethodGet, "/workspaces", ""); !strings.Contains(rec.Body.String(), `"workspaces":[]`) {
-		t.Fatalf("workspace not forgotten: %s", rec.Body)
+	// The workspace stays, as history; its sandbox is no longer tracked.
+	if rec := do(t, h, http.MethodGet, "/workspaces", ""); !strings.Contains(rec.Body.String(), `"status":"terminated"`) {
+		t.Fatalf("terminated workspace not kept as history: %s", rec.Body)
+	}
+	if rec := do(t, h, http.MethodGet, "/sandboxes", ""); !strings.Contains(rec.Body.String(), `"sandboxes":[]`) {
+		t.Fatalf("sandbox still tracked: %s", rec.Body)
 	}
 }
 

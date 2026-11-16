@@ -56,8 +56,8 @@ A pasted image is named `Pasted image <date>.png`.
    filesystem (so they survive a session stop and resume), mode 0644 (never
    executable), and a random `<id>` per file so equal names never collide.
    Mosso never runs, commits or adds them to Git. Their descriptions are
-   saved with the workspace; the files are deleted with the sandbox when the
-   workspace is terminated.
+   saved with the workspace (and stay in its history); the files are deleted
+   with the sandbox when the workspace is terminated.
 3. `POST /workspaces/{name}/chat` accepts `"attachments": ["<id>", …]` next to
    `prompt` (which may then be empty). The ids must belong to that workspace.
    The user's entry in the chat log carries the attachments, so every browser

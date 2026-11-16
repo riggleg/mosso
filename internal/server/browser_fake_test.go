@@ -18,7 +18,9 @@ import (
 //
 // With MOSSO_FAKE_SCENARIO=stopped it also creates a workspace with one
 // finished turn whose sandbox session has ended, to look at the stopped
-// state and the Resume button.
+// state and the Resume button. With MOSSO_FAKE_SCENARIO=history it creates
+// a running workspace, a terminated one and an archived one, to look at
+// the sidebar's History and Archived sections.
 func TestServeFakeForBrowser(t *testing.T) {
 	addr := os.Getenv("MOSSO_FAKE_ADDR")
 	if addr == "" {
@@ -35,6 +37,21 @@ func TestServeFakeForBrowser(t *testing.T) {
 		do(t, srv.Handler(), http.MethodPost, "/workspaces/"+ws.Name+"/claude/messages", `{"prompt":"Add a README badge"}`)
 		fake.timeout(ws.Name)
 		t.Logf("workspace %s: sandbox session stopped", ws.Name)
+	}
+	if os.Getenv("MOSSO_FAKE_SCENARIO") == "history" {
+		for i, prompt := range []string{"Fix the flaky test", "Add a README badge", "Tidy the Makefile"} {
+			rec := do(t, srv.Handler(), http.MethodPost, "/workspaces", `{"repo":"octo/widgets"}`)
+			var ws testWorkspace
+			_ = json.Unmarshal(rec.Body.Bytes(), &ws)
+			do(t, srv.Handler(), http.MethodPost, "/workspaces/"+ws.Name+"/claude/messages", `{"prompt":"`+prompt+`"}`)
+			if i < 2 {
+				do(t, srv.Handler(), http.MethodDelete, "/workspaces/"+ws.Name, "")
+			}
+			if i == 0 {
+				do(t, srv.Handler(), http.MethodPost, "/workspaces/"+ws.Name+"/archive", `{}`)
+			}
+			t.Logf("workspace %s: %q", ws.Name, prompt)
+		}
 	}
 	l, err := net.Listen("tcp", addr)
 	if err != nil {

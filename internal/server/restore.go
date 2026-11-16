@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"path/filepath"
 	"time"
 
 	"github.com/riggleg/mosso/internal/github"
@@ -20,30 +21,57 @@ const (
 	// sandboxStopped: the session ended (timeout or stop); the persistent
 	// sandbox resumes from its snapshot on the next message or connect.
 	sandboxStopped = "stopped"
-	// sandboxGone: the sandbox was deleted or can no longer resume. Its
-	// chat history is still kept here until the workspace is terminated.
+	// sandboxGone: the sandbox was deleted outside Mosso or can no longer
+	// resume. The workspace stays, read-only, until it is terminated.
 	sandboxGone = "gone"
+	// sandboxTerminated: the user terminated the workspace and Mosso
+	// deleted its sandbox. The workspace and its chat are kept as history.
+	sandboxTerminated = "terminated"
 )
 
-const goneMessage = "The sandbox no longer exists: it was deleted, or its snapshot expired. The conversation is kept here; terminate this workspace to remove it."
+const (
+	goneMessage       = "The sandbox no longer exists: it was deleted, or its snapshot expired. The conversation is kept; terminate the workspace to move it to the history."
+	terminatedMessage = "This workspace was terminated and its sandbox deleted. The conversation is kept as history."
+)
+
+// noSandbox says why a workspace in the given sandbox state has no sandbox
+// to work in any more, or "" if it has one.
+func noSandbox(state string) string {
+	switch state {
+	case sandboxGone:
+		return goneMessage
+	case sandboxTerminated:
+		return terminatedMessage
+	}
+	return ""
+}
 
 // resumeTimeout bounds resuming a sandbox and starting its worker.
 const resumeTimeout = 3 * time.Minute
 
-// Restore opens Mosso's data directory, loads the workspaces saved there
-// and reconnects to their sandboxes in the background: a running sandbox
-// is followed again from the last event Mosso saw; a stopped one whose
-// Claude task was still running when Mosso last saw it is resumed to fetch
-// what happened meanwhile; other stopped sandboxes are left stopped (and
-// unbilled) until the next message or connect. New workspaces are saved
-// there too.
-func (s *Server) Restore(ctx context.Context, dataDir string) error {
-	st, err := openStore(dataDir)
+// Restore opens Mosso's database at dbPath (creating it if needed), loads
+// the workspaces saved there and reconciles them with their sandboxes in
+// the background: a running sandbox is followed again from the last event
+// Mosso saw; a stopped one whose Claude task was still running when Mosso
+// last saw it is resumed to fetch what happened meanwhile; other stopped
+// sandboxes are left stopped (and unbilled) until the next message or
+// connect; one that no longer exists is marked gone. Terminated workspaces
+// have no sandbox and are listed as history. New workspaces are saved in
+// the database too.
+func (s *Server) Restore(ctx context.Context, dbPath string) error {
+	st, err := openStore(dbPath)
 	if err != nil {
 		return err
 	}
+	// Workspaces saved as files by a Mosso from before the database.
+	if n, err := st.importFiles(filepath.Join(filepath.Dir(dbPath), "workspaces")); err != nil {
+		log.Printf("import the workspaces saved by an earlier Mosso: %v (imported %d; the rest is tried again on the next start)", err, n)
+	} else if n > 0 {
+		log.Printf("imported %d workspaces saved by an earlier Mosso into the database", n)
+	}
 	records, err := st.load()
 	if err != nil {
+		st.close()
 		return fmt.Errorf("load workspaces: %w", err)
 	}
 	s.mu.Lock()
@@ -54,6 +82,9 @@ func (s *Server) Restore(ctx context.Context, dataDir string) error {
 		if err != nil {
 			log.Printf("workspace %s: not restored: %v", rec.Name, err)
 			continue
+		}
+		if rec.SandboxState == sandboxTerminated {
+			continue // history: no sandbox to reconnect to
 		}
 		log.Printf("workspace %s: restored (%s, %d chat entries, sandbox %s)", ws.Name, ws.Repo, len(ws.chat.entries), rec.SandboxState)
 		go s.reconnect(ws, rec.SandboxState, rec.TaskRunning)
@@ -66,18 +97,15 @@ func (s *Server) restoreWorkspace(rec workspaceRecord) (*workspace, error) {
 	if s.vercel == nil {
 		return nil, errors.New("Vercel is not configured")
 	}
-	entries, err := s.store.loadEntries(rec.Name)
-	if err != nil {
-		return nil, err
-	}
 	ws := &workspace{
 		Name: rec.Name, Repo: rec.Repo, Base: rec.Base, BaseSHA: rec.BaseSHA, Branch: rec.Branch, Dir: rec.Dir,
 		Sandbox: rec.Sandbox, ExpiresAt: rec.ExpiresAt, PullRequest: rec.PullRequest, CreatedAt: rec.CreatedAt,
+		ArchivedAt:   rec.ArchivedAt,
 		chat:         newChat(),
 		attachments:  map[string]attachment{},
 		lastSeq:      rec.LastSeq,
 		sandboxState: rec.SandboxState,
-		connecting:   true,
+		pushed:       rec.Pushed,
 	}
 	if ws.sandboxState == "" {
 		ws.sandboxState = sandboxStopped
@@ -86,14 +114,31 @@ func (s *Server) restoreWorkspace(rec workspaceRecord) (*workspace, error) {
 		ws.attachments[a.ID] = a
 		ws.attachBytes += a.Size
 	}
-	ws.chat.load(entries)
 	ws.chat.sessionID = rec.SessionID
+	ws.chat.persist = s.persister(ws.Name)
+	if ws.sandboxState == sandboxTerminated {
+		// History: nothing more happens in it, so its chat stays in the
+		// database until someone opens it (see loadChatLocked).
+		ws.chat.unloaded = true
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if _, exists := s.workspaces[rec.Name]; exists {
+			return nil, errors.New("already loaded")
+		}
+		s.workspaces[rec.Name] = ws
+		return ws, nil
+	}
+	entries, err := s.store.loadEntries(rec.Name)
+	if err != nil {
+		return nil, err
+	}
+	ws.connecting = true
+	ws.chat.load(entries)
 	for _, e := range entries {
 		if e.Seq > ws.lastSeq {
 			ws.lastSeq = e.Seq
 		}
 	}
-	ws.chat.persist = s.persister(ws.Name)
 	if rec.BaseSHA != "" {
 		mirror, err := github.NewMirror(s.vercel, rec.Sandbox.SessionID, github.MirrorOptions{
 			Repo: rec.Repo, Base: rec.Base, BaseSHA: rec.BaseSHA, Branch: rec.Branch, Dir: rec.Dir, Pushed: rec.Pushed,
@@ -144,6 +189,10 @@ func (s *Server) reconnect(ws *workspace, lastState string, taskRunning bool) {
 		return
 	}
 	s.mu.Lock()
+	if ws.sandboxState == sandboxTerminated {
+		s.mu.Unlock()
+		return // terminated while Mosso was checking
+	}
 	ws.Sandbox = *sb
 	if sb.Running() {
 		ws.sandboxState = sandboxRunning
@@ -170,8 +219,8 @@ func (s *Server) connect(ctx context.Context, ws *workspace) error {
 	state := ws.sandboxState
 	expired := !ws.ExpiresAt.IsZero() && time.Now().After(ws.ExpiresAt)
 	s.mu.Unlock()
-	if state == sandboxGone {
-		return errors.New(goneMessage)
+	if msg := noSandbox(state); msg != "" {
+		return errors.New(msg)
 	}
 	if state != sandboxRunning || expired {
 		if err := s.resume(ctx, ws); err != nil {
@@ -225,6 +274,10 @@ func (s *Server) resume(ctx context.Context, ws *workspace) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if ws.sandboxState == sandboxTerminated {
+		// Terminated while resuming: the sandbox is being deleted.
+		return errors.New(terminatedMessage)
+	}
 	resumed := sb.SessionID != ws.Sandbox.SessionID
 	ws.Sandbox = *sb
 	ws.sandboxState = sandboxRunning
@@ -333,8 +386,8 @@ func (s *Server) sessionEnded(ws *workspace, session string) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if ws.Sandbox.SessionID != session {
-		return // already resumed into a new session
+	if ws.Sandbox.SessionID != session || ws.sandboxState == sandboxTerminated {
+		return // already resumed into a new session, or terminated
 	}
 	if gone {
 		s.markGoneLocked(ws)
@@ -364,7 +417,7 @@ func (s *Server) markGone(ws *workspace) {
 }
 
 func (s *Server) markGoneLocked(ws *workspace) {
-	if ws.sandboxState == sandboxGone {
+	if noSandbox(ws.sandboxState) != "" {
 		return
 	}
 	log.Printf("workspace %s: the sandbox is gone", ws.Name)
@@ -388,10 +441,25 @@ func (s *Server) persister(name string) func(chatEntry) {
 		if s.store == nil {
 			return
 		}
-		if err := s.store.appendEntry(name, e); err != nil {
+		if err := s.store.appendEntries(name, []chatEntry{e}); err != nil {
 			log.Printf("workspace %s: save chat entry: %v", name, err)
 		}
 	}
+}
+
+// saveNewLocked saves a workspace that has just been set up: its record,
+// the chat so far and, from now on, every new chat entry. Nothing is saved
+// of a workspace before that, so a failed setup leaves nothing behind.
+// Call with s.mu held.
+func (s *Server) saveNewLocked(ws *workspace) {
+	if s.store == nil {
+		return
+	}
+	s.persistLocked(ws)
+	if err := s.store.appendEntries(ws.Name, ws.chat.entries); err != nil {
+		log.Printf("workspace %s: save the chat: %v", ws.Name, err)
+	}
+	ws.chat.persist = s.persister(ws.Name)
 }
 
 // persistLocked saves the workspace's record. Call with s.mu held.
@@ -400,10 +468,12 @@ func (s *Server) persistLocked(ws *workspace) {
 		return
 	}
 	rec := workspaceRecord{
-		Name: ws.Name, Repo: ws.Repo, Base: ws.Base, BaseSHA: ws.BaseSHA, Branch: ws.Branch, Dir: ws.Dir,
-		Sandbox: ws.Sandbox, SandboxState: ws.sandboxState, ExpiresAt: ws.ExpiresAt, PullRequest: ws.PullRequest,
-		Pushed: ws.pushed, SessionID: ws.chat.sessionID, LastSeq: ws.lastSeq, TaskRunning: ws.taskRunning,
-		CreatedAt: ws.CreatedAt,
+		Name: ws.Name, Repo: ws.Repo, Base: ws.Base, Branch: ws.Branch, SandboxState: ws.sandboxState,
+		CreatedAt: ws.CreatedAt, ArchivedAt: ws.ArchivedAt,
+		workspaceState: workspaceState{
+			BaseSHA: ws.BaseSHA, Dir: ws.Dir, Sandbox: ws.Sandbox, ExpiresAt: ws.ExpiresAt, PullRequest: ws.PullRequest,
+			Pushed: ws.pushed, SessionID: ws.chat.sessionID, LastSeq: ws.lastSeq, TaskRunning: ws.taskRunning,
+		},
 	}
 	for _, a := range ws.attachments {
 		rec.Attachments = append(rec.Attachments, a)
@@ -423,11 +493,11 @@ func (s *Server) workspaceConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.mu.Lock()
-	gone, creating := ws.sandboxState == sandboxGone, ws.creating
+	gone, creating := noSandbox(ws.sandboxState), ws.creating
 	s.mu.Unlock()
 	switch {
-	case gone:
-		writeError(w, http.StatusGone, goneMessage)
+	case gone != "":
+		writeError(w, http.StatusGone, gone)
 		return
 	case creating:
 		writeError(w, http.StatusConflict, "the workspace is still being set up")

@@ -149,14 +149,14 @@ func (s *Server) uploadAttachments(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.mu.Lock()
-	ready, gone := !ws.creating, ws.sandboxState == sandboxGone
+	ready, gone := !ws.creating, noSandbox(ws.sandboxState)
 	s.mu.Unlock()
 	if !ready {
 		writeError(w, http.StatusConflict, "the workspace is still being set up")
 		return
 	}
-	if gone {
-		writeError(w, http.StatusGone, goneMessage)
+	if gone != "" {
+		writeError(w, http.StatusGone, gone)
 		return
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, maxMessageBytes+uploadOverhead)
@@ -349,7 +349,7 @@ func (s *Server) downloadAttachment(w http.ResponseWriter, r *http.Request) {
 	// Reading a file does not resume a stopped sandbox: thumbnails load
 	// with the page, and booting a sandbox for them would be a surprise.
 	switch {
-	case state == sandboxGone:
+	case noSandbox(state) != "":
 		writeError(w, http.StatusGone, "this attachment is no longer available: the sandbox is gone")
 		return
 	case state != sandboxRunning || expired:

@@ -29,8 +29,8 @@ const omitted = "[mosso: not kept, the chat log is full]"
 
 // chat is a workspace's conversation with Claude Code: a log of prompts,
 // Claude's activity and pull request results that every browser tab
-// replays. Entries are appended to the workspace's chat.jsonl on disk as
-// they are added, so the log survives a Mosso restart; Claude's activity
+// replays. Entries are saved in Mosso's database as they are added, so the
+// log survives a Mosso restart and the workspace's sandbox; Claude's activity
 // arrives from the sandbox worker's event log (see remote.go), so what
 // happened while Mosso was away is caught up from there. All fields are
 // guarded by Server.mu.
@@ -47,6 +47,9 @@ type chat struct {
 	full    bool     // size reached maxChatBytes
 	// persist, if set, is called with each appended entry.
 	persist func(chatEntry)
+	// unloaded says entries has not been read from the database yet: the
+	// chat of a terminated workspace is only loaded when it is opened.
+	unloaded bool
 }
 
 func newChat() *chat { return &chat{changed: make(chan struct{})} }
@@ -56,7 +59,7 @@ func (c *chat) notify() {
 	c.changed = make(chan struct{})
 }
 
-// load replaces the entries with ones read from disk.
+// load replaces the entries with ones read from the database.
 func (c *chat) load(entries []chatEntry) {
 	c.entries = entries
 	c.size, c.full = 0, false
@@ -188,6 +191,9 @@ func (s *Server) startTurn(ws *workspace, token claude.Token, prompt string, att
 		if err := s.submitTurn(ctx, ws, run, token, prompt, atts, sid); err != nil {
 			s.mu.Lock()
 			defer s.mu.Unlock()
+			if ws.sandboxState == sandboxTerminated {
+				return // terminating the workspace ended the turn
+			}
 			if run.stopped {
 				c.add(chatEntry{Type: "notice", Text: "Stopped. Send a message to continue the conversation."})
 			} else {
@@ -247,6 +253,9 @@ func (s *Server) submitTurn(ctx context.Context, ws *workspace, run *turnRun, to
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if ws.sandboxState == sandboxTerminated {
+		return nil // terminated meanwhile; the sandbox is going away
+	}
 	run.taskID = acc.TaskID
 	// The follower may already have delivered the worker's user event.
 	if acc.Seq > ws.lastSeq {
@@ -278,7 +287,7 @@ func (s *Server) stopTask(sessionID string) {
 func (s *Server) applyEvent(ws *workspace, e worker.Event) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if e.Seq <= ws.lastSeq {
+	if e.Seq <= ws.lastSeq || ws.sandboxState == sandboxTerminated {
 		return
 	}
 	ws.lastSeq = e.Seq
@@ -422,11 +431,11 @@ func (s *Server) startTurnWithAttachments(w http.ResponseWriter, name string, to
 		return nil, false
 	}
 	s.mu.Lock()
-	gone := live.sandboxState == sandboxGone
+	gone := noSandbox(live.sandboxState)
 	creating := live.creating
 	s.mu.Unlock()
-	if gone {
-		writeError(w, http.StatusGone, goneMessage)
+	if gone != "" {
+		writeError(w, http.StatusGone, gone)
 		return nil, false
 	}
 	if creating {
@@ -555,9 +564,11 @@ func (s *Server) workspaceStop(w http.ResponseWriter, r *http.Request) {
 //
 //	id: <n>, event: entry      a chatEntry
 //	event: workspace           the workspace, whenever its status changes
-//	event: closed              the workspace was destroyed; the stream ends
+//	event: closed              the workspace was removed; the stream ends
 //
-// Disconnecting does not affect a running turn.
+// A terminated workspace's stream replays its saved chat and then only
+// reports status changes (archiving). Disconnecting does not affect a
+// running turn.
 func (s *Server) workspaceEvents(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	s.mu.Lock()
@@ -585,6 +596,7 @@ func (s *Server) workspaceEvents(w http.ResponseWriter, r *http.Request) {
 		s.mu.Lock()
 		cur, live := s.workspaces[name]
 		live = live && cur == ws
+		s.loadChatLocked(ws)
 		var entries []chatEntry
 		if next < len(ws.chat.entries) {
 			entries = slices.Clone(ws.chat.entries[next:])
@@ -636,3 +648,18 @@ func (s *Server) workspaceEvents(w http.ResponseWriter, r *http.Request) {
 // CloseStreams ends every open event stream so an HTTP server shutdown does
 // not wait for them. Browsers reconnect on their own.
 func (s *Server) CloseStreams() { s.closeStreams.Do(func() { close(s.streamsDone) }) }
+
+// loadChatLocked reads a terminated workspace's chat from the database the
+// first time it is opened after a start. Call with s.mu held.
+func (s *Server) loadChatLocked(ws *workspace) {
+	if !ws.chat.unloaded || s.store == nil {
+		return
+	}
+	entries, err := s.store.loadEntries(ws.Name)
+	if err != nil {
+		log.Printf("workspace %s: load the chat: %v", ws.Name, err)
+		return
+	}
+	ws.chat.load(entries)
+	ws.chat.unloaded = false
+}

@@ -91,9 +91,9 @@ Sandboxes are billed while running, so Mosso layers several safeguards:
   you can retry `DELETE`, and is reported in the shutdown log. Workspace
   sandboxes are **not** destroyed on shutdown: Claude may still be working
   in them, and they stop by themselves at the session timeout. They are
-  saved in Mosso's data directory and reconnected to on the next start;
+  saved in Mosso's database and reconnected to on the next start;
   only `DELETE /workspaces/{name}` (Terminate) deletes them, together with
-  their snapshots.
+  their snapshots (the workspace's conversation is kept as history).
 
 Plain sandboxes are tracked in memory only. If the process is killed with
 `SIGKILL`, check the Vercel dashboard (or wait for the timeout) for any

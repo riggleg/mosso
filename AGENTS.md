@@ -15,12 +15,12 @@ Mosso is an experimental, self-hosted Go coding-agent orchestrator. The goal is 
 - `cmd/mosso/` — main server entry point.
 - `cmd/mosso-worker/` — the worker that runs inside each workspace's sandbox (currently running Claude Code; Pi later); only modify when the task requires it.
 - `internal/worker/` — worker implementation shared with the server: event log, HTTP API, Claude Code runner, embedded worker binary (`make worker`).
-- `internal/server/` — HTTP API and server-side coordination; `internal/server/web/` is the embedded browser UI (plain HTML/CSS/JS, no build step).
+- `internal/server/` — HTTP API and server-side coordination, including the SQLite store for workspaces and chats (`store.go`, `migrations.go`); `internal/server/web/` is the embedded browser UI (plain HTML/CSS/JS, no build step).
 - `internal/vercel/` — Vercel Sandbox integration.
 - `internal/claude/` — Claude Code CLI integration (headless runs in a sandbox, subscription token handling).
 - `internal/github/` — GitHub integration (clone into a sandbox, publish changes as a pull request via the REST API, token handling).
 - `internal/keychain/` — macOS Keychain storage for Mosso's tokens.
-- `docs/` — architecture notes, MUP scope, and setup instructions.
+- `docs/` — architecture notes, MUP scope, and setup instructions (`docs/history.md` covers the database and workspace history).
 
 Follow existing conventions and avoid creating unrelated packages or reorganizing the repository without a concrete need.
 

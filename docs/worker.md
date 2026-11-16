@@ -13,14 +13,14 @@ The code lives in `internal/worker` (shared types, the event log, the
 worker's HTTP API and its Claude Code runner), `cmd/mosso-worker` (the
 binary that runs in the sandbox), `internal/server/remote.go` (how the server
 talks to the worker), `internal/server/restore.go` (saving, restoring,
-resuming, following) and `internal/server/store.go` (the local data
-directory).
+resuming, following) and `internal/server/store.go` (the local SQLite
+database; see [history.md](history.md)).
 
 ## Who does what
 
 | Local Mosso server (your machine) | Remote worker (in the sandbox) |
 | --- | --- |
-| Creates and terminates workspaces; saves them in its data directory | Runs Claude Code as its child process and owns its lifetime |
+| Creates and terminates workspaces; saves them in its database | Runs Claude Code as its child process and owns its lifetime |
 | GitHub: token, fetch, push, pull requests (unchanged) | Records every event to an append-only, fsync'd log on the sandbox's filesystem |
 | Claude: token (Keychain), sent with each message | Holds the token in memory for one task only |
 | Submits messages, follows events, stops tasks | Keeps running when the server disconnects or stops |
@@ -60,9 +60,10 @@ timeout. Only plain sandboxes made with `POST /sandboxes` are destroyed on
 shutdown, as before. Server-side Git mirrors (temporary directories) are
 removed and recreated on demand.
 
-**Mosso starts.** It loads every saved workspace from the data directory
+**Mosso starts.** It loads every saved workspace from its database
 (the chat shows immediately, from the local copy) and checks each sandbox
-with the Vercel API:
+with the Vercel API (terminated workspaces have none and are simply listed
+as history):
 
 - *running*: the worker is still there; Mosso follows its events from the
   last sequence number it had seen, so whatever happened meanwhile is added
@@ -73,7 +74,7 @@ with the Vercel API:
 - *stopped*, idle: left stopped (a stopped sandbox costs nothing). Your next
   message, **Resume sandbox** in the header, or `POST …/connect` resumes it.
 - *gone* (deleted, or its snapshot expired): the chat stays readable; new
-  messages are refused; **Terminate** removes the saved state.
+  messages are refused; **Terminate** moves it to the history.
 
 **Resume.** `GET /v2/sandboxes/{name}?resume=true` boots a new session from
 the last snapshot: the checkout, Claude Code's transcripts (so follow-ups
@@ -83,10 +84,11 @@ worker reads its log, continues the sequence numbers, and, if the last task
 had no terminal event, records `interrupted` for it. The server's Git mirror
 is pointed at the new session.
 
-**Terminate.** `DELETE /workspaces/{name}` stops the session, deletes the
-sandbox and the snapshots no other sandbox uses, and removes the workspace
-from the data directory. The branch and pull request stay on GitHub. This is
-the only way a workspace is deleted.
+**Terminate.** `DELETE /workspaces/{name}` stops the session and deletes the
+sandbox and the snapshots no other sandbox uses. The workspace and its
+conversation stay in the database as read-only history, which can be
+archived (see [history.md](history.md)). The branch and pull request stay on
+GitHub. This is the only way a workspace's sandbox is deleted.
 
 ## The 45-minute session
 
@@ -112,9 +114,9 @@ Mosso does not extend sessions or restart work by itself.
 
 ## What survives what
 
-| | Local Mosso restart | Sandbox session stop (timeout) | Sandbox gone |
+| | Local Mosso restart | Sandbox session stop (timeout) | Sandbox gone or terminated |
 | --- | --- | --- | --- |
-| Chat history Mosso had already seen | yes (data directory) | yes | yes |
+| Chat history Mosso had already seen | yes (database) | yes | yes |
 | Events while Mosso was away | yes, fetched from the worker's log | yes, after resume | no |
 | Claude Code session (follow-ups resume it) | yes | yes, after resume | no |
 | Checkout, uncommitted changes | yes | yes, after resume | no |
@@ -145,19 +147,13 @@ workspaces you are done with.
 
 ## Data directory
 
-Mosso saves workspaces under `MOSSO_DATA_DIR`, or `~/Library/Application
-Support/mosso` on macOS (`$XDG_CONFIG_HOME/mosso` or `~/.config/mosso`
-elsewhere):
-
-```
-workspaces/<name>/workspace.json   repository, branch, sandbox, Claude session ID,
-                                   last worker event applied, pull request, attachments
-workspaces/<name>/chat.jsonl       one chat entry per line, as the web UI shows them
-```
-
-No credentials are stored there. The files are plain JSON; delete a
-workspace's directory to forget it without touching Vercel (Terminate does
-both).
+Mosso saves workspaces and chats in a SQLite database, `mosso.db`, under
+`MOSSO_DATA_DIR`, or `~/Library/Application Support/mosso` on macOS
+(`$XDG_CONFIG_HOME/mosso` or `~/.config/mosso` elsewhere); `MOSSO_DB_PATH`
+or `-db` puts the database elsewhere. No credentials are stored there.
+[history.md](history.md) describes the schema, migrations, the history and
+archive, and the import of the `workspaces/<name>/` files that earlier
+versions wrote.
 
 ## Worker API
 
@@ -222,8 +218,10 @@ last sequence number it applied, so a reconnect never duplicates an entry.
   trust level as the sandbox's own files.
 - **GitHub credentials never enter the sandbox** (unchanged); pushes still
   run on your machine.
-- **The data directory** holds your prompts and Claude's output, like the
-  web UI did in memory. It holds no credentials.
+- **The database** in the data directory holds your prompts and Claude's
+  output, like the web UI did in memory, and keeps them after a workspace is
+  terminated. It holds no credentials and is created readable by its owner
+  only.
 
 ## Tests
 
@@ -238,13 +236,15 @@ last sequence number it applied, so a reconnect never duplicates an entry.
   resume into a new session, delete, loss) hosting a real in-process worker
   per sandbox with a scripted Claude. It covers: Claude continuing after
   Mosso shuts down and the events being recovered once on restart; restart
-  after the session stopped (history from disk, resume on the next message,
+  after the session stopped (history from the database, resume on the next message,
   worker restarted over its log, attachments and publishing afterwards); the
   connect endpoint; a session ending mid-task (interrupted once, follow-up
   continues); restart after a mid-task session end (automatic resume and
-  catch-up); terminate removing sandbox, snapshots and saved state; a gone
-  sandbox keeping its history; restored publish state (`--force-with-lease`
-  still works); replay without duplicates; the store.
+  catch-up); terminate removing the sandbox and snapshots and keeping the
+  history; archiving; a gone sandbox keeping its history; restored publish
+  state (`--force-with-lease` still works); replay without duplicates; the
+  store, its migrations and the import of the earlier files
+  (see [history.md](history.md#tests)).
 
 The live acceptance test, opt-in, with your accounts (one persistent
 sandbox, destroyed at the end; nothing pushed to GitHub):
@@ -259,7 +259,7 @@ MOSSO_E2E=1 MOSSO_E2E_GITHUB_REPO=you/some-repo \
 
 It starts a 45-second Claude task, shuts the server down mid-task, confirms
 through the Vercel API that the worker finishes alone, restarts over the same
-data directory and checks the history is complete and not duplicated, sends
+database and checks the history is complete and not duplicated, sends
 a follow-up, then stops the sandbox session with the API, restarts, resumes
 and sends another follow-up. It needs Go on the machine (it cross-compiles
 the worker) and runs from the repository. **It was not run by the author of
@@ -288,12 +288,14 @@ To watch the UI over a fake sandbox instead:
   `go run ./cmd/mosso` from the source tree builds it on first use with the
   Go toolchain. A `mosso` binary moved elsewhere without an embedded worker
   cannot create or resume workspaces; the error says to run `make worker`.
-- **The Mosso server crashes (SIGKILL) mid-write.** The workspace record is
-  written atomically; a half-written last chat line is skipped on load. At
-  most the last entry is lost locally, and it is re-fetched from the worker
-  if it was a worker event.
+- **The Mosso server crashes (SIGKILL) mid-write.** Every write to the
+  database is a transaction, so nothing is half-written. After a power cut
+  the last few entries may be missing locally (the write-ahead log is not
+  fsync'd per entry); worker events among them are fetched from the worker
+  again.
 - **Vercel API errors while following.** The follower retries with backoff
   (1 s to 30 s). Chat entries resume where they left off.
 - **Snapshot storage and retention** limits (Hobby: 15 GB lifetime; 30-day
   snapshot expiry; 14-day removal of unresumable sandboxes) can make a
-  dormant workspace gone. Terminate workspaces you no longer need.
+  dormant workspace gone. Terminate workspaces you no longer need; their
+  conversations stay in the history.

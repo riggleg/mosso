@@ -198,11 +198,11 @@ restart. It needs `git` on the machine running Mosso (on macOS:
 | `GET /github/auth`                           | `{"configured": true, "source": "keychain"\|"env"\|"memory", "login": "...", "expires_at": "...", "create_url": "https://github.com/settings/personal-access-tokens/new?...", "storage": "keychain"\|"memory"}`, plus `error` if GitHub rejects the token. Never returns the token. |
 | `POST /github/auth`                          | Body: `{"token": "github_pat_..."}`. Checks the token with GitHub, then stores it (Keychain, or memory without one) for all workspaces. `200` with the status above; `400` malformed; `422` GitHub rejected it; `500` the Keychain refused. |
 | `POST /workspaces`                           | Body: `{"repo": "owner/repo", "base": "main", "timeout_seconds": 1800}`. `base` defaults to the repository's default branch; `timeout_seconds` defaults to 1800 (max 2700). Clones, installs Claude Code and returns `201` with the workspace. Setup continues if the client disconnects. |
-| `GET /workspaces`, `GET /workspaces/{name}`  | Workspaces of this Mosso process with their `status`, including ones still being created and `pull_request` once one exists. |
+| `GET /workspaces`, `GET /workspaces/{name}`  | Every saved workspace with its `status`, including ones still being created, terminated ones kept as history (`"status": "terminated"`) and archived ones (`archived_at` is set), and `pull_request` once one exists. |
 | `POST /workspaces/{name}/claude/messages`    | Same body and response as `POST /sandboxes/{name}/claude/messages`, run in the checkout after syncing `origin/*`. The turn is also recorded in the workspace's chat. |
 | `POST /workspaces/{name}/chat`, `GET /workspaces/{name}/events` | Asynchronous chat with streamed progress, used by the web UI; see [web-ui.md](web-ui.md#api-used-by-the-ui). |
 | `POST /workspaces/{name}/pull-request`       | Body (all optional): `{"title": "...", "body": "...", "draft": false}`. `201` when it opened the pull request, `200` when it already existed. |
-| `DELETE /workspaces/{name}`                  | Terminate: delete the sandbox with its snapshots, the server-side mirror and the saved history. The branch and pull request stay on GitHub. |
+| `DELETE /workspaces/{name}`                  | Terminate: delete the sandbox with its snapshots and the server-side mirror. The workspace and its conversation are kept as history ([history.md](history.md)). The branch and pull request stay on GitHub. |
 
 Workspace:
 
@@ -382,7 +382,7 @@ MOSSO_E2E=1 MOSSO_E2E_GITHUB_REPO=you/mosso-playground \
   `.gitignore`. Review the pull request before merging, as for any
   contributor.
 - Commits are authored with your GitHub account's name and noreply address.
-- Workspaces are saved in Mosso's data directory and their sandboxes
+- Workspaces are saved in Mosso's database and their sandboxes
   persist across restarts (see [worker.md](worker.md)); mirrors are
   temporary directories recreated as needed. If Mosso is killed without
   shutting down, `$TMPDIR/mosso-git-*` directories may be left behind; they
