@@ -507,7 +507,11 @@ function renderWorking() {
     const running = claudeRunning();
     let text = "Working…";
     let since = null;
-    if (ws.status === "creating") text = "Setting up the workspace: provisioning the sandbox, cloning and installing Claude Code…";
+    if (ws.status === "creating") {
+      text = "Setting up the workspace: provisioning the sandbox, cloning and installing Claude Code…";
+      // A first message given with the workspace waits for the setup.
+      if (lastEntryOf(["user"])) text += " Claude starts on your message when it is ready.";
+    }
     else if (ws.status === "connecting") text = "Reconnecting to the sandbox after a restart…";
     else if (running) {
       text = "Claude is working…";
@@ -518,7 +522,8 @@ function renderWorking() {
     }
     $("working-text").textContent = text;
     $("working-time").textContent = since ? fmtDuration(Date.now() - new Date(since.time).getTime()) : "";
-    $("stop").classList.toggle("hidden", !running);
+    // Nothing runs until the workspace is set up, so there is nothing to stop.
+    $("stop").classList.toggle("hidden", !running || ws.status === "creating");
   }
 
   const prompt = $("prompt");
@@ -1238,38 +1243,63 @@ function setCreating(on) {
   $("create-repo").disabled = on;
   $("create-base").disabled = on;
   $("create-model").disabled = on;
+  $("create-prompt").disabled = on;
 }
+
+let createSeq = 0; // the latest create request, so an older one does not reset the dialog
 
 async function submitCreate(ev) {
   ev.preventDefault();
   const repo = $("create-repo").value.trim().replace(/^https:\/\/github\.com\//, "").replace(/\.git$/, "").replace(/\/$/, "");
   const base = $("create-base").value.trim();
   const model = $("create-model").value;
+  const prompt = $("create-prompt").value.trim();
   if (!repo) return;
   const err = $("create-error");
   err.classList.add("hidden");
   setCreating(true);
-  // Show the workspace in the sidebar as soon as the server lists it.
-  const poll = setInterval(refreshList, 2000);
+  const mine = ++createSeq;
+  // As soon as the server lists the new workspace (provisioning takes a
+  // few seconds; cloning and installing take the rest of the minute),
+  // close the dialog and open it: the chat shows the first message and
+  // "Setting up" until Claude starts.
+  const before = new Set(state.workspaces.map((w) => w.name));
+  let opened = null;
+  const poll = setInterval(async () => {
+    await refreshList();
+    if (opened) return;
+    const fresh = state.workspaces.find((w) => !before.has(w.name) && w.status === "creating" && w.repo.toLowerCase() === repo.toLowerCase());
+    if (!fresh) return;
+    opened = fresh.name;
+    if ($("create-dialog").open) $("create-dialog").close();
+    select(fresh.name);
+  }, 1000);
   try {
     const body = { repo };
     if (base) body.base = base;
     if (model) body.model = model;
+    if (prompt) body.prompt = prompt;
     const ws = await api("POST", "/workspaces", body);
     localStorage.setItem("mosso.lastRepo", repo);
-    $("create-dialog").close();
+    $("create-prompt").value = "";
+    if ($("create-dialog").open) $("create-dialog").close();
     await refreshList();
-    select(ws.name);
+    // Open it, unless the user has moved on to another workspace since.
+    if (!opened || state.selected === opened) select(ws.name);
   } catch (e) {
     err.textContent = e.message;
     err.classList.remove("hidden");
     if (e.status === 503 && /GitHub is not connected/.test(e.message)) {
       $("create-dialog").close();
       openGitHub();
+    } else if (!$("create-dialog").open) {
+      // The dialog closed early; the first message is still in it.
+      await refreshList();
+      showBanner(`Could not create the ${repo} workspace: ${e.message}` + (prompt ? " Your first message is kept in the New workspace dialog." : ""));
     }
   } finally {
     clearInterval(poll);
-    setCreating(false);
+    if (mine === createSeq) setCreating(false);
   }
 }
 
@@ -1280,6 +1310,12 @@ function init() {
   $("empty-new").addEventListener("click", openCreate);
   $("create-form").addEventListener("submit", submitCreate);
   $("create-cancel").addEventListener("click", () => $("create-dialog").close());
+  $("create-prompt").addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+      e.preventDefault();
+      $("create-form").requestSubmit();
+    }
+  });
   $("create-repo").addEventListener("change", (e) => loadBranches(e.target.value));
   $("create-repo").addEventListener("input", (e) => {
     if ((state.repos || []).some((r) => r.full_name === e.target.value)) loadBranches(e.target.value);

@@ -24,9 +24,15 @@ frontend build step, Node.js dependency or separate frontend server.
    a base branch. The suggestions list the repositories and branches your
    GitHub token can access. Choose the Claude model; the default model (set
    with **Change** next to *Model* in the sidebar footer) is preselected, and
-   the workspace keeps its model for good. See [models.md](models.md). Mosso provisions a sandbox, clones the base branch
-   onto a new `mosso/*` branch and installs Claude Code, which takes about a
-   minute. The workspace shows as *Setting up* in the sidebar until it is ready.
+   the workspace keeps its model for good. See [models.md](models.md).
+   Optionally type the **first message** (Cmd/Ctrl+Enter creates). Mosso
+   provisions a sandbox, clones the base branch onto a new `mosso/*` branch
+   and installs Claude Code, which takes about a minute. The dialog closes
+   and the workspace opens as soon as its sandbox exists, showing *Setting
+   up* with your first message in the chat; Claude starts on it the moment
+   the workspace is ready, even if you close the page or open another
+   workspace meanwhile. If setup fails, a banner says why and the message is
+   kept in the dialog.
 4. Describe a task and press Enter (Shift+Enter for a new line). Claude's
    messages, tool calls and tool results appear as Claude produces them. Click
    a tool to see its input (commands, file edits as diffs) and its result.

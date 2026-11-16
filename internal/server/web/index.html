@@ -106,7 +106,10 @@
       <label>Model
         <select id="create-model"></select>
       </label>
-      <p class="muted small-text">Mosso provisions a persistent sandbox (sessions of up to 45 minutes, resumed as needed), clones the base branch onto a new working branch and installs Claude Code and the Mosso worker. This takes about a minute. The workspace keeps its model for its whole life.</p>
+      <label>First message <span class="muted">(optional)</span>
+        <textarea id="create-prompt" rows="4" placeholder="What should Claude work on? It starts as soon as the workspace is ready."></textarea>
+      </label>
+      <p class="muted small-text">Mosso provisions a persistent sandbox (sessions of up to 45 minutes, resumed as needed), clones the base branch onto a new working branch and installs Claude Code and the Mosso worker. This takes about a minute; the workspace opens while it is set up, and Claude starts on your first message when it is ready, even if you close Mosso's page. The workspace keeps its model for its whole life.</p>
       <p id="create-error" class="error-text hidden"></p>
       <div class="dialog-actions">
         <button id="create-cancel" type="button">Cancel</button>
