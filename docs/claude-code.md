@@ -32,7 +32,7 @@ pull request, use a workspace; see [github.md](github.md).
    the repository checkout, for a workspace):
 
    ```
-   claude -p --output-format stream-json --verbose --permission-mode bypassPermissions [--resume <session_id>]
+   claude -p --output-format stream-json --verbose --permission-mode bypassPermissions [--resume <session_id>] [--model <id>]
    ```
 
    The prompt is fed on stdin. The token and prompt are passed as environment
@@ -52,7 +52,8 @@ pull request, use a workspace; see [github.md](github.md).
 
 In **workspaces**, steps 4 and 5 happen inside the sandbox: the Mosso worker
 (see [worker.md](worker.md)) starts the same `claude -p` command as its
-child, with the prompt on stdin and the token in the process environment,
+child, with the prompt on stdin, the token in the process environment and
+the workspace's model in `--model` on every turn (see [models.md](models.md)),
 parses the output line by line, redacts the token and records the events to
 a log in the sandbox, from which Mosso reads them. Claude therefore keeps
 running when Mosso is not. The `POST /sandboxes/{name}/claude/messages`

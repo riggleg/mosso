@@ -3,6 +3,7 @@ package server
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/url"
@@ -71,6 +72,9 @@ type workspaceRecord struct {
 	Repo   string `json:"repo"`
 	Base   string `json:"base"`
 	Branch string `json:"branch"`
+	// Model is the Claude model the workspace runs; empty for workspaces
+	// from before models could be chosen.
+	Model string `json:"model,omitempty"`
 	// SandboxState is "running", "stopped", "gone" or "terminated", as
 	// last known: the workspace's saved status.
 	SandboxState string    `json:"sandbox_state"`
@@ -193,13 +197,13 @@ func saveRecord(tx *sql.Tx, rec workspaceRecord) error {
 		sandboxID = rec.Name
 	}
 	_, err = tx.Exec(`
-		INSERT INTO workspaces (id, repo, base, branch, sandbox_id, status, state, created_at, updated_at, archived_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO workspaces (id, repo, base, branch, model, sandbox_id, status, state, created_at, updated_at, archived_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT (id) DO UPDATE SET
 			repo = excluded.repo, base = excluded.base, branch = excluded.branch,
 			sandbox_id = excluded.sandbox_id, status = excluded.status, state = excluded.state,
 			updated_at = excluded.updated_at, archived_at = excluded.archived_at`,
-		rec.Name, rec.Repo, rec.Base, rec.Branch, sandboxID, rec.SandboxState, string(state),
+		rec.Name, rec.Repo, rec.Base, rec.Branch, rec.Model, sandboxID, rec.SandboxState, string(state),
 		formatTime(rec.CreatedAt), formatTime(time.Now()), archived)
 	return err
 }
@@ -207,7 +211,7 @@ func saveRecord(tx *sql.Tx, rec workspaceRecord) error {
 // load returns every saved workspace, oldest first.
 func (st *store) load() ([]workspaceRecord, error) {
 	rows, err := st.db.Query(`
-		SELECT id, repo, base, branch, sandbox_id, status, state, created_at, updated_at, archived_at
+		SELECT id, repo, base, branch, model, sandbox_id, status, state, created_at, updated_at, archived_at
 		FROM workspaces ORDER BY created_at, id`)
 	if err != nil {
 		return nil, err
@@ -218,7 +222,7 @@ func (st *store) load() ([]workspaceRecord, error) {
 		var rec workspaceRecord
 		var sandboxID, state, created, updated string
 		var archived sql.NullString
-		if err := rows.Scan(&rec.Name, &rec.Repo, &rec.Base, &rec.Branch, &sandboxID, &rec.SandboxState, &state, &created, &updated, &archived); err != nil {
+		if err := rows.Scan(&rec.Name, &rec.Repo, &rec.Base, &rec.Branch, &rec.Model, &sandboxID, &rec.SandboxState, &state, &created, &updated, &archived); err != nil {
 			return nil, err
 		}
 		if err := json.Unmarshal([]byte(state), &rec.workspaceState); err != nil {
@@ -232,6 +236,25 @@ func (st *store) load() ([]workspaceRecord, error) {
 		out = append(out, rec)
 	}
 	return out, rows.Err()
+}
+
+// Setting keys.
+const settingDefaultModel = "default_model"
+
+// setting returns a saved setting, or "" if it is not set.
+func (st *store) setting(key string) (string, error) {
+	var v string
+	err := st.db.QueryRow(`SELECT value FROM settings WHERE key = ?`, key).Scan(&v)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	return v, err
+}
+
+// setSetting saves a setting, replacing its previous value.
+func (st *store) setSetting(key, value string) error {
+	_, err := st.db.Exec(`INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value`, key, value)
+	return err
 }
 
 // exists reports whether the workspace is saved.

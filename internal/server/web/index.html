@@ -42,6 +42,7 @@
         <div class="ws-title">
           <a id="ws-repo" target="_blank" rel="noopener noreferrer"></a>
           <span id="ws-branch" class="branch"></span>
+          <span id="ws-model" class="model hidden"></span>
           <span id="ws-status" class="status"></span>
         </div>
         <div class="ws-meta">
@@ -102,7 +103,10 @@
         <input id="create-base" list="branch-options" placeholder="default branch" spellcheck="false" autocapitalize="off">
         <datalist id="branch-options"></datalist>
       </label>
-      <p class="muted small-text">Mosso provisions a persistent sandbox (sessions of up to 45 minutes, resumed as needed), clones the base branch onto a new working branch and installs Claude Code and the Mosso worker. This takes about a minute.</p>
+      <label>Model
+        <select id="create-model"></select>
+      </label>
+      <p class="muted small-text">Mosso provisions a persistent sandbox (sessions of up to 45 minutes, resumed as needed), clones the base branch onto a new working branch and installs Claude Code and the Mosso worker. This takes about a minute. The workspace keeps its model for its whole life.</p>
       <p id="create-error" class="error-text hidden"></p>
       <div class="dialog-actions">
         <button id="create-cancel" type="button">Cancel</button>
@@ -126,6 +130,21 @@
       <div class="dialog-actions">
         <button id="publish-cancel" type="button">Cancel</button>
         <button id="publish-submit" class="primary" type="submit">Publish</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="model-dialog">
+    <form id="model-form">
+      <h2>Default model</h2>
+      <label>Claude model for new workspaces
+        <select id="model-default"></select>
+      </label>
+      <p class="muted small-text">Preselected when you create a workspace; you can still pick another there. Existing workspaces keep the model they were created with. Mosso saves this setting in its database.</p>
+      <p id="model-error" class="error-text hidden"></p>
+      <div class="dialog-actions">
+        <button id="model-cancel" type="button">Cancel</button>
+        <button id="model-submit" class="primary" type="submit">Save</button>
       </div>
     </form>
   </dialog>

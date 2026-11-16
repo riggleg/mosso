@@ -166,7 +166,7 @@ token) travel in the command's environment, never in its arguments.
 | --- | --- |
 | `GET /status` | `{"state":"idle"\|"running","seq":N,"session_id":"…","task_id":"…","started_at":"…","version":"1","pid":…}` |
 | `GET /events?after=N[&follow=1]` | The events with a sequence number greater than N, one JSON object per line. With `follow`, the stream stays open, sends new events as they are recorded and a `{"type":"ping"}` line every 15 s. |
-| `POST /messages` | `{"text","attachments","prompt","session_id","dir","system_prompt","token"}`. Records the `user` event and starts Claude Code. `202 {"task_id","seq"}`; `409` if a task is running. |
+| `POST /messages` | `{"text","attachments","prompt","session_id","dir","system_prompt","model","token"}`. `model`, if set, is passed to `claude --model`. Records the `user` event and starts Claude Code. `202 {"task_id","seq"}`; `409` if a task is running. |
 | `POST /stop` | Interrupts the running task (`202`); `409` if idle. |
 
 Events: `{"seq","time","type","task_id",…}` with `type` one of `user`

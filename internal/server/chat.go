@@ -250,6 +250,7 @@ func (s *Server) submitTurn(ctx context.Context, ws *workspace, run *turnRun, to
 		SessionID:    sid,
 		Dir:          ws.Dir,
 		SystemPrompt: workspacePrompt(ws),
+		Model:        ws.Model,
 		Token:        token.Reveal(),
 	})
 	if err != nil {

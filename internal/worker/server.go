@@ -170,6 +170,9 @@ func (s *Server) message(w http.ResponseWriter, r *http.Request) {
 	case msg.SessionID != "" && !claude.ValidSessionID(msg.SessionID):
 		writeError(w, http.StatusBadRequest, "invalid session_id")
 		return
+	case msg.Model != "" && !claude.ValidModelID(msg.Model):
+		writeError(w, http.StatusBadRequest, "invalid model")
+		return
 	case msg.Token == "":
 		writeError(w, http.StatusBadRequest, "token is required")
 		return

@@ -76,6 +76,9 @@ type Server struct {
 	busy            map[string]bool // a Claude turn, clone or publish is running
 	// workspaces includes the terminated ones, kept as history.
 	workspaces map[string]*workspace
+	// defaultModel is the Claude model new workspaces run unless the
+	// request names one; saved in the database (see settings.go).
+	defaultModel string
 	// memoryToken is a GitHub token pasted into the web UI on a system
 	// without a Keychain. It lasts until Mosso stops and takes precedence
 	// over MOSSO_GITHUB_TOKEN.
@@ -104,6 +107,7 @@ func New(client *vercel.Client) *Server {
 		claudeInstalled: map[string]bool{},
 		busy:            map[string]bool{},
 		workspaces:      map[string]*workspace{},
+		defaultModel:    claude.DefaultModel,
 	}
 	s.githubClient = s.loadGitHubClient
 	return s
@@ -128,6 +132,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /sandboxes/{name}/claude/messages", s.requireVercel(s.claudeMessage))
 	mux.HandleFunc("GET /github/auth", s.githubAuthStatus)
 	mux.HandleFunc("POST /github/auth", s.githubConnect)
+	mux.HandleFunc("GET /settings", s.getSettings)
+	mux.HandleFunc("POST /settings", s.updateSettings)
 	// Reading saved workspaces and their conversations, and archiving,
 	// only need the database, so they work without Vercel credentials.
 	// Everything that touches a sandbox requires them.

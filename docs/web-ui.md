@@ -22,7 +22,9 @@ frontend build step, Node.js dependency or separate frontend server.
    token later. See [github.md](github.md#connect-github).
 3. Click **+ New** and pick or type a repository (`owner/repo`) and, optionally,
    a base branch. The suggestions list the repositories and branches your
-   GitHub token can access. Mosso provisions a sandbox, clones the base branch
+   GitHub token can access. Choose the Claude model; the default model (set
+   with **Change** next to *Model* in the sidebar footer) is preselected, and
+   the workspace keeps its model for good. See [models.md](models.md). Mosso provisions a sandbox, clones the base branch
    onto a new `mosso/*` branch and installs Claude Code, which takes about a
    minute. The workspace shows as *Setting up* in the sidebar until it is ready.
 4. Describe a task and press Enter (Shift+Enter for a new line). Claude's
@@ -123,7 +125,8 @@ browser ──POST /workspaces/{name}/chat──▶ Mosso ──POST /messages (
 These come in addition to the endpoints in [github.md](github.md) and
 [claude-code.md](claude-code.md), which the UI also uses (`POST /workspaces`,
 `POST …/pull-request`, `DELETE /workspaces/{name}`, `GET /claude/auth`,
-`GET /github/auth`, `POST /github/auth`).
+`GET /github/auth`, `POST /github/auth`) and [models.md](models.md)
+(`GET /settings`, `POST /settings`).
 
 | Method & path                              | Description |
 | ------------------------------------------ | ----------- |

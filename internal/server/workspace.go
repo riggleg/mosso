@@ -41,6 +41,10 @@ type workspace struct {
 	Branch  string         `json:"branch"`
 	Dir     string         `json:"dir"`
 	Sandbox vercel.Sandbox `json:"sandbox"`
+	// Model is the Claude model every turn runs with, chosen when the
+	// workspace is created and never changed; empty (Claude Code's
+	// default) for workspaces from before models could be chosen.
+	Model string `json:"model,omitempty"`
 	// SandboxState is "running", "stopped" (resumes on the next message),
 	// "gone" (deleted elsewhere or expired) or "terminated" (deleted by
 	// terminating the workspace); computed by snapshotLocked.
@@ -288,12 +292,13 @@ func (s *Server) getWorkspace(w http.ResponseWriter, r *http.Request) {
 
 // createWorkspace provisions a persistent sandbox, clones the repository's
 // base branch into it, checks out a new working branch, installs Claude
-// Code and starts the Mosso worker. The sandbox is destroyed if any step
-// fails.
+// Code and starts the Mosso worker. The workspace runs the requested Claude
+// model, or the default model. The sandbox is destroyed if any step fails.
 func (s *Server) createWorkspace(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Repo           string `json:"repo"`
 		Base           string `json:"base"`
+		Model          string `json:"model"`
 		TimeoutSeconds int    `json:"timeout_seconds"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&req); err != nil {
@@ -310,6 +315,15 @@ func (s *Server) createWorkspace(w http.ResponseWriter, r *http.Request) {
 	case req.TimeoutSeconds < 0 || req.TimeoutSeconds > maxSeconds:
 		writeError(w, http.StatusBadRequest, fmt.Sprintf("timeout_seconds must be between 0 and %d", maxSeconds))
 		return
+	case req.Model != "" && !claude.KnownModel(req.Model):
+		writeError(w, http.StatusBadRequest, "model is not one of the models GET /settings lists")
+		return
+	}
+	model := req.Model
+	if model == "" {
+		s.mu.Lock()
+		model = s.defaultModel
+		s.mu.Unlock()
 	}
 	timeout := time.Duration(req.TimeoutSeconds) * time.Second
 	if timeout == 0 {
@@ -361,6 +375,7 @@ func (s *Server) createWorkspace(w http.ResponseWriter, r *http.Request) {
 		Base:         base,
 		Branch:       github.NewBranchName(),
 		Dir:          path.Join(claude.WorkDir, req.Repo[strings.IndexByte(req.Repo, '/')+1:]),
+		Model:        model,
 		Sandbox:      *sb,
 		ExpiresAt:    sb.ExpiresAt(),
 		CreatedAt:    time.Now().UTC(),

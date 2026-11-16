@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/riggleg/mosso/internal/claude"
 	"github.com/riggleg/mosso/internal/github"
 	"github.com/riggleg/mosso/internal/vercel"
 	"github.com/riggleg/mosso/internal/worker"
@@ -81,8 +82,19 @@ func (s *Server) Restore(ctx context.Context, dbPath, legacyDir string) error {
 		st.close()
 		return fmt.Errorf("load workspaces: %w", err)
 	}
+	model, err := st.setting(settingDefaultModel)
+	if err != nil {
+		st.close()
+		return fmt.Errorf("load settings: %w", err)
+	}
 	s.mu.Lock()
 	s.store = st
+	switch {
+	case claude.KnownModel(model):
+		s.defaultModel = model
+	case model != "":
+		log.Printf("the saved default model %q is no longer offered; using %s until another is chosen", model, s.defaultModel)
+	}
 	s.mu.Unlock()
 
 	// Load: every workspace, from the database alone.
@@ -120,7 +132,7 @@ func (s *Server) Restore(ctx context.Context, dbPath, legacyDir string) error {
 // lists it. It does not contact the sandbox; reconnect does.
 func (s *Server) loadWorkspace(rec workspaceRecord) (*workspace, error) {
 	ws := &workspace{
-		Name: rec.Name, Repo: rec.Repo, Base: rec.Base, BaseSHA: rec.BaseSHA, Branch: rec.Branch, Dir: rec.Dir,
+		Name: rec.Name, Repo: rec.Repo, Base: rec.Base, BaseSHA: rec.BaseSHA, Branch: rec.Branch, Dir: rec.Dir, Model: rec.Model,
 		Sandbox: rec.Sandbox, ExpiresAt: rec.ExpiresAt, PullRequest: rec.PullRequest, CreatedAt: rec.CreatedAt,
 		ArchivedAt:   rec.ArchivedAt,
 		chat:         newChat(),
@@ -492,7 +504,7 @@ func (s *Server) saveLocked(ws *workspace) error {
 		return nil // no database: workspaces live in memory only
 	}
 	rec := workspaceRecord{
-		Name: ws.Name, Repo: ws.Repo, Base: ws.Base, Branch: ws.Branch, SandboxState: ws.sandboxState,
+		Name: ws.Name, Repo: ws.Repo, Base: ws.Base, Branch: ws.Branch, Model: ws.Model, SandboxState: ws.sandboxState,
 		CreatedAt: ws.CreatedAt, ArchivedAt: ws.ArchivedAt,
 		workspaceState: workspaceState{
 			BaseSHA: ws.BaseSHA, Dir: ws.Dir, Sandbox: ws.Sandbox, ExpiresAt: ws.ExpiresAt, PullRequest: ws.PullRequest,

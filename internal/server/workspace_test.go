@@ -149,6 +149,7 @@ type testWorkspace struct {
 	BaseSHA     string `json:"base_sha"`
 	Branch      string `json:"branch"`
 	Dir         string `json:"dir"`
+	Model       string `json:"model"`
 	PullRequest *struct {
 		Number int    `json:"number"`
 		URL    string `json:"url"`

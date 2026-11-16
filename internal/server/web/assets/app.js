@@ -24,6 +24,7 @@ const state = {
   repos: null,
   github: null, // GET /github/auth: whether GitHub is connected (never the token)
   vercel: null, // GET /vercel/auth: whether sandboxes can be used at all
+  settings: null, // GET /settings: the default model and the models to choose from
 };
 
 // ---------- helpers ----------
@@ -104,6 +105,21 @@ function firstLine(text, max) {
 // noVercel reports that Mosso has no Vercel credentials: saved workspaces
 // and their conversations can be read (and archived), but nothing that
 // needs a sandbox works.
+// modelName returns a model's display name, or its ID if it is no longer
+// offered. Workspaces from before models could be chosen have none.
+function modelName(id) {
+  if (!id) return "Claude Code default";
+  const m = ((state.settings && state.settings.models) || []).find((m) => m.id === id);
+  return m ? m.name : id;
+}
+
+// modelOptions fills a <select> with the models, selecting one.
+function modelOptions(select, selected) {
+  const models = (state.settings && state.settings.models) || [];
+  select.replaceChildren(...models.map((m) => h("option", { value: m.id, text: m.name })));
+  select.value = selected;
+}
+
 function noVercel() {
   return !!state.vercel && !state.vercel.configured;
 }
@@ -125,13 +141,15 @@ async function loadChecks() {
       h("span", { class: "check-detail", title: detail || "", text: detail || "" }),
       action || null,
     );
-  const [claude, github, vercel] = await Promise.all([
+  const [claude, github, vercel, settings] = await Promise.all([
     api("GET", "/claude/auth").catch((e) => ({ error: e.message })),
     api("GET", "/github/auth").catch((e) => ({ error: e.message })),
     api("GET", "/vercel/auth").catch(() => null),
+    api("GET", "/settings").catch(() => null),
   ]);
   state.github = github;
   state.vercel = vercel;
+  state.settings = settings;
   const ghOK = github.configured && !github.error;
   let ghDetail = !github.configured ? "not connected" : github.login ? "@" + github.login : "token problem";
   const days = github.expires_at ? Math.floor((new Date(github.expires_at).getTime() - Date.now()) / 86400000) : null;
@@ -143,6 +161,11 @@ async function loadChecks() {
     item("GitHub", ghOK, ghDetail, ghButton),
   );
   const ghItem = list.lastChild;
+  if (settings) {
+    const modelButton = h("button", { type: "button", class: "small check-action", text: "Change", onclick: openModelSettings });
+    list.append(item("Model", true, modelName(settings.default_model), modelButton));
+    list.lastChild.title = "Default model for new workspaces";
+  }
   ghItem.title = github.error || (github.expires_at ? "Token expires " + new Date(github.expires_at).toLocaleDateString() : "");
   if (ghOK && days !== null && days < 14) ghItem.querySelector(".check-detail").classList.add("soon");
   render();
@@ -204,6 +227,33 @@ async function submitGitHub(ev) {
     $("github-submit").disabled = false;
     $("github-submit").textContent = "Try again";
     input.focus();
+  }
+}
+
+// ---------- default model ----------
+
+function openModelSettings() {
+  if (!state.settings) return;
+  modelOptions($("model-default"), state.settings.default_model);
+  $("model-error").classList.add("hidden");
+  $("model-submit").disabled = false;
+  $("model-dialog").showModal();
+  $("model-default").focus();
+}
+
+async function submitModelSettings(ev) {
+  ev.preventDefault();
+  const err = $("model-error");
+  err.classList.add("hidden");
+  $("model-submit").disabled = true;
+  try {
+    state.settings = await api("POST", "/settings", { default_model: $("model-default").value });
+    $("model-dialog").close();
+    await loadChecks();
+  } catch (e) {
+    err.textContent = e.message;
+    err.classList.remove("hidden");
+    $("model-submit").disabled = false;
   }
 }
 
@@ -326,6 +376,10 @@ function renderHeader() {
   repo.href = "https://github.com/" + ws.repo;
   $("ws-branch").textContent = `${ws.base} → ${ws.branch}`;
   $("ws-branch").title = "Base branch → working branch";
+  const model = $("ws-model");
+  model.textContent = modelName(ws.model);
+  model.title = ws.model ? `Claude Code runs ${ws.model} in this workspace` : "This workspace predates model selection: Claude Code uses its default model";
+  model.classList.remove("hidden");
   const status = $("ws-status");
   status.textContent = statusLabel(ws);
   status.className = "status " + ws.status;
@@ -1144,6 +1198,8 @@ async function openCreate() {
   const repo = $("create-repo");
   repo.value = localStorage.getItem("mosso.lastRepo") || "";
   $("create-base").value = "";
+  if (!state.settings) state.settings = await api("GET", "/settings").catch(() => null);
+  if (state.settings) modelOptions($("create-model"), state.settings.default_model);
   $("create-error").classList.add("hidden");
   setCreating(false);
   $("create-dialog").showModal();
@@ -1181,12 +1237,14 @@ function setCreating(on) {
   $("create-submit").textContent = on ? "Creating… (about a minute)" : "Create";
   $("create-repo").disabled = on;
   $("create-base").disabled = on;
+  $("create-model").disabled = on;
 }
 
 async function submitCreate(ev) {
   ev.preventDefault();
   const repo = $("create-repo").value.trim().replace(/^https:\/\/github\.com\//, "").replace(/\.git$/, "").replace(/\/$/, "");
   const base = $("create-base").value.trim();
+  const model = $("create-model").value;
   if (!repo) return;
   const err = $("create-error");
   err.classList.add("hidden");
@@ -1194,7 +1252,10 @@ async function submitCreate(ev) {
   // Show the workspace in the sidebar as soon as the server lists it.
   const poll = setInterval(refreshList, 2000);
   try {
-    const ws = await api("POST", "/workspaces", base ? { repo, base } : { repo });
+    const body = { repo };
+    if (base) body.base = base;
+    if (model) body.model = model;
+    const ws = await api("POST", "/workspaces", body);
     localStorage.setItem("mosso.lastRepo", repo);
     $("create-dialog").close();
     await refreshList();
@@ -1233,6 +1294,8 @@ function init() {
   $("resume").addEventListener("click", resumeSandbox);
   $("empty-connect").addEventListener("click", openGitHub);
   $("github-form").addEventListener("submit", submitGitHub);
+  $("model-form").addEventListener("submit", submitModelSettings);
+  $("model-cancel").addEventListener("click", () => $("model-dialog").close());
   $("github-cancel").addEventListener("click", closeGitHub);
   $("github-dialog").addEventListener("close", () => ($("github-token").value = ""));
   $("stop").addEventListener("click", stopTurn);
