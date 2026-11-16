@@ -405,7 +405,9 @@ func TestSetupRunsOncePerWorkspace(t *testing.T) {
 	if resp := postJSON(t, ts.URL+"/workspaces/"+ws.Name+"/chat", `{"prompt":"after resume"}`); resp.StatusCode != http.StatusAccepted {
 		t.Fatalf("chat status = %d", resp.StatusCode)
 	}
-	waitFor(t, func() bool { return fake.claude.count() == 1 && getWorkspace(t, srv.Handler(), ws.Name).Status == "ready" })
+	waitFor(t, func() bool {
+		return fake.claude.count() == 1 && getWorkspace(t, srv.Handler(), ws.Name).Status == "ready"
+	})
 
 	// Mosso restarts and reconnects.
 	srv.CloseStreams()
