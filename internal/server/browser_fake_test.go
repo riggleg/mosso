@@ -26,6 +26,9 @@ import (
 // credentials: history is readable, nothing else works.
 // MOSSO_FAKE_SCENARIO=unsaved creates the same and makes the database
 // refuse updates, to look at a termination that cannot be saved.
+// MOSSO_FAKE_SCENARIO=setup configures a default image and setup script
+// whose output new workspaces show; with MOSSO_FAKE_SETUP_FAIL=1 the
+// script fails, to look at how that is reported.
 func TestServeFakeForBrowser(t *testing.T) {
 	addr := os.Getenv("MOSSO_FAKE_ADDR")
 	if addr == "" {
@@ -35,6 +38,31 @@ func TestServeFakeForBrowser(t *testing.T) {
 	withToken(srv, testClaudeToken, nil)
 	withGitHub(t, srv, &fakeGitHubAPI{})
 	fake.stdoutFor = fakeRepoSandbox()
+	if os.Getenv("MOSSO_FAKE_SCENARIO") == "setup" {
+		body, _ := json.Marshal(map[string]string{
+			"default_image":        "my-team/my-project/dev-image:v1",
+			"default_setup_script": "curl https://mise.run | sh\nmise trust && mise install\necho 'export GOFLAGS=-mod=mod' >> \"$MOSSO_ENV\"\n",
+		})
+		do(t, srv.Handler(), http.MethodPost, "/settings", string(body))
+		const output = "mise: installing mise...\nmise: installed successfully to ~/.local/bin/mise\n" +
+			"mise ✓ trusted /vercel/sandbox/widgets/mise.toml\nmise go@1.27.4 ✓ installed\nmise node@24.11.0 ✓ installed\n"
+		fail := os.Getenv("MOSSO_FAKE_SETUP_FAIL") == "1"
+		fake.stdoutFor = func(cmd map[string]any) string {
+			if isSetup(cmd) {
+				if fail {
+					return output + "mise ERROR Failed to install go@1.99: no such version\n"
+				}
+				return output
+			}
+			return fakeRepoSandbox()(cmd)
+		}
+		fake.exitFor = func(cmd map[string]any) int {
+			if fail && isSetup(cmd) {
+				return 1
+			}
+			return 0
+		}
+	}
 	if os.Getenv("MOSSO_FAKE_SCENARIO") == "stopped" {
 		rec := do(t, srv.Handler(), http.MethodPost, "/workspaces", `{"repo":"octo/widgets"}`)
 		var ws testWorkspace

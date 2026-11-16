@@ -36,6 +36,10 @@ var migrations = []string{
 		key   TEXT PRIMARY KEY, -- for example "default_model"
 		value TEXT NOT NULL
 	);`,
+	// 3: each workspace's sandbox image and setup script, for reference.
+	// Workspaces from before ran the built-in runtime with no setup script.
+	`ALTER TABLE workspaces ADD COLUMN image TEXT NOT NULL DEFAULT '';        -- Vercel Container Registry image; '' for the built-in runtime
+	ALTER TABLE workspaces ADD COLUMN setup_script TEXT NOT NULL DEFAULT ''; -- the Bash script run once after the clone; '' for none`,
 }
 
 // migrate applies the migrations the database has not seen yet, each in

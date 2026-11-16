@@ -24,7 +24,7 @@ const state = {
   repos: null,
   github: null, // GET /github/auth: whether GitHub is connected (never the token)
   vercel: null, // GET /vercel/auth: whether sandboxes can be used at all
-  settings: null, // GET /settings: the default model and the models to choose from
+  settings: null, // GET /settings: the defaults for new workspaces and the models to choose from
 };
 
 // ---------- helpers ----------
@@ -120,6 +120,11 @@ function modelOptions(select, selected) {
   select.value = selected;
 }
 
+// imageName describes a sandbox image; "" is Mosso's built-in runtime.
+function imageName(image) {
+  return image || ((state.settings && state.settings.built_in_runtime) || "node22") + " (built-in)";
+}
+
 function noVercel() {
   return !!state.vercel && !state.vercel.configured;
 }
@@ -162,9 +167,12 @@ async function loadChecks() {
   );
   const ghItem = list.lastChild;
   if (settings) {
-    const modelButton = h("button", { type: "button", class: "small check-action", text: "Change", onclick: openModelSettings });
+    const modelButton = h("button", { type: "button", class: "small check-action", text: "Change", onclick: openSettings });
     list.append(item("Model", true, modelName(settings.default_model), modelButton));
     list.lastChild.title = "Default model for new workspaces";
+    const envButton = h("button", { type: "button", class: "small check-action", text: "Change", onclick: openSettings });
+    list.append(item("Sandbox", true, imageName(settings.default_image) + (settings.default_setup_script ? " · setup script" : ""), envButton));
+    list.lastChild.title = "Default image and setup script for new workspaces";
   }
   ghItem.title = github.error || (github.expires_at ? "Token expires " + new Date(github.expires_at).toLocaleDateString() : "");
   if (ghOK && days !== null && days < 14) ghItem.querySelector(".check-detail").classList.add("soon");
@@ -230,30 +238,38 @@ async function submitGitHub(ev) {
   }
 }
 
-// ---------- default model ----------
+// ---------- settings for new workspaces ----------
 
-function openModelSettings() {
-  if (!state.settings) return;
-  modelOptions($("model-default"), state.settings.default_model);
-  $("model-error").classList.add("hidden");
-  $("model-submit").disabled = false;
-  $("model-dialog").showModal();
-  $("model-default").focus();
+function openSettings() {
+  const s = state.settings;
+  if (!s) return;
+  modelOptions($("settings-model"), s.default_model);
+  $("settings-image").value = s.default_image || "";
+  $("settings-image-help").textContent = `Empty uses Mosso's built-in ${imageName("")} runtime. Otherwise a Vercel Container Registry reference: a repository in Mosso's Vercel project ("my-image:v1"), one shared with your team ("team/project/my-image"), or a Vercel managed image ("vercel/sandbox/universal"). It needs bash, curl and git.`;
+  $("settings-setup").value = s.default_setup_script || "";
+  $("settings-error").classList.add("hidden");
+  $("settings-submit").disabled = false;
+  $("settings-dialog").showModal();
+  $("settings-model").focus();
 }
 
-async function submitModelSettings(ev) {
+async function submitSettings(ev) {
   ev.preventDefault();
-  const err = $("model-error");
+  const err = $("settings-error");
   err.classList.add("hidden");
-  $("model-submit").disabled = true;
+  $("settings-submit").disabled = true;
   try {
-    state.settings = await api("POST", "/settings", { default_model: $("model-default").value });
-    $("model-dialog").close();
+    state.settings = await api("POST", "/settings", {
+      default_model: $("settings-model").value,
+      default_image: $("settings-image").value.trim(),
+      default_setup_script: $("settings-setup").value,
+    });
+    $("settings-dialog").close();
     await loadChecks();
   } catch (e) {
     err.textContent = e.message;
     err.classList.remove("hidden");
-    $("model-submit").disabled = false;
+    $("settings-submit").disabled = false;
   }
 }
 
@@ -380,6 +396,13 @@ function renderHeader() {
   model.textContent = modelName(ws.model);
   model.title = ws.model ? `Claude Code runs ${ws.model} in this workspace` : "This workspace predates model selection: Claude Code uses its default model";
   model.classList.remove("hidden");
+  // The sandbox environment, if the workspace has a custom one.
+  const env = $("ws-env");
+  env.classList.toggle("hidden", !ws.image && !ws.setup_script);
+  env.textContent = imageName(ws.image) + (ws.setup_script ? " · setup" : "");
+  env.title =
+    (ws.image ? `The sandbox was created from the image ${ws.image}.` : "The sandbox runs Mosso's built-in runtime.") +
+    (ws.setup_script ? "\n\nSetup script, run once after the clone:\n\n" + ws.setup_script : "");
   const status = $("ws-status");
   status.textContent = statusLabel(ws);
   status.className = "status " + ws.status;
@@ -508,7 +531,13 @@ function renderWorking() {
     let text = "Working…";
     let since = null;
     if (ws.status === "creating") {
-      text = "Setting up the workspace: provisioning the sandbox, cloning and installing Claude Code…";
+      text =
+        {
+          cloning: "Setting up the workspace: cloning the repository…",
+          setup: "Running the setup script…",
+          installing: "Setting up the workspace: installing Claude Code and starting the worker…",
+        }[ws.step] || "Setting up the workspace: provisioning the sandbox, cloning and installing Claude Code…";
+      if (ws.step === "setup") since = lastEntryOf(["notice"]);
       // A first message given with the workspace waits for the setup.
       if (lastEntryOf(["user"])) text += " Claude starts on your message when it is ready.";
     }
@@ -683,6 +712,19 @@ function renderEntry(e) {
       box.appendChild(h("div", { class: "entry turn-end", text: "Stopped with an error" }));
       markPendingTools();
       break;
+    case "setup": {
+      // Consecutive pieces of setup output share one log.
+      let log = box.lastElementChild;
+      if (!log || !log.classList.contains("setup-log")) {
+        log = h("details", { class: "entry setup-log", open: state.ws && state.ws.status === "creating" }, h("summary", { text: "Setup script output" }), h("pre"));
+        box.appendChild(log);
+      }
+      const pre = log.querySelector("pre");
+      const atEnd = pre.scrollHeight - pre.scrollTop - pre.clientHeight < 20;
+      pre.textContent += e.text;
+      if (atEnd) pre.scrollTop = pre.scrollHeight;
+      break;
+    }
     case "notice":
       box.appendChild(h("div", { class: "entry notice", text: e.text }));
       if (e.text.startsWith("Stopped")) markPendingTools();
@@ -1204,7 +1246,14 @@ async function openCreate() {
   repo.value = localStorage.getItem("mosso.lastRepo") || "";
   $("create-base").value = "";
   if (!state.settings) state.settings = await api("GET", "/settings").catch(() => null);
-  if (state.settings) modelOptions($("create-model"), state.settings.default_model);
+  if (state.settings) {
+    modelOptions($("create-model"), state.settings.default_model);
+    $("create-image").value = state.settings.default_image || "";
+    $("create-setup").value = state.settings.default_setup_script || "";
+  }
+  $("create-image").placeholder = imageName("");
+  $("create-env").open = false;
+  updateEnvSummary();
   $("create-error").classList.add("hidden");
   createSeq++; // a create still running no longer owns the dialog
   setCreating(false);
@@ -1238,6 +1287,14 @@ async function loadBranches(repo) {
   }
 }
 
+// updateEnvSummary says what the New workspace dialog's sandbox
+// environment is while it is collapsed.
+function updateEnvSummary() {
+  const image = $("create-image").value.trim();
+  const setup = $("create-setup").value.trim();
+  $("create-env-summary").textContent = "· " + imageName(image) + (setup ? " · setup script" : " · no setup script");
+}
+
 function setCreating(on) {
   $("create-submit").disabled = on;
   $("create-submit").textContent = on ? "Creating… (about a minute)" : "Create";
@@ -1245,6 +1302,8 @@ function setCreating(on) {
   $("create-base").disabled = on;
   $("create-model").disabled = on;
   $("create-prompt").disabled = on;
+  $("create-image").disabled = on;
+  $("create-setup").disabled = on;
 }
 
 // createSeq identifies the dialog's current use: each create request and
@@ -1259,6 +1318,8 @@ async function submitCreate(ev) {
   const base = $("create-base").value.trim();
   const model = $("create-model").value;
   const prompt = $("create-prompt").value.trim();
+  const image = $("create-image").value.trim();
+  const setupScript = $("create-setup").value;
   if (!repo) return;
   const err = $("create-error");
   err.classList.add("hidden");
@@ -1290,6 +1351,13 @@ async function submitCreate(ev) {
     if (base) body.base = base;
     if (model) body.model = model;
     if (prompt) body.prompt = prompt;
+    // What the dialog shows, defaults included: empty means none. Without
+    // the settings the fields were not prefilled, so the server's
+    // defaults apply.
+    if (state.settings) {
+      body.image = image;
+      body.setup_script = setupScript;
+    }
     const ws = await api("POST", "/workspaces", body);
     localStorage.setItem("mosso.lastRepo", repo);
     if (!current()) {
@@ -1305,6 +1373,7 @@ async function submitCreate(ev) {
     if (current() && dialog.open) {
       err.textContent = e.message;
       err.classList.remove("hidden");
+      err.scrollIntoView({ block: "nearest" });
       if (e.status === 503 && /GitHub is not connected/.test(e.message)) {
         dialog.close();
         openGitHub();
@@ -1353,8 +1422,10 @@ function init() {
   $("resume").addEventListener("click", resumeSandbox);
   $("empty-connect").addEventListener("click", openGitHub);
   $("github-form").addEventListener("submit", submitGitHub);
-  $("model-form").addEventListener("submit", submitModelSettings);
-  $("model-cancel").addEventListener("click", () => $("model-dialog").close());
+  $("settings-form").addEventListener("submit", submitSettings);
+  $("settings-cancel").addEventListener("click", () => $("settings-dialog").close());
+  $("create-image").addEventListener("input", updateEnvSummary);
+  $("create-setup").addEventListener("input", updateEnvSummary);
   $("github-cancel").addEventListener("click", closeGitHub);
   $("github-dialog").addEventListener("close", () => ($("github-token").value = ""));
   $("stop").addEventListener("click", stopTurn);

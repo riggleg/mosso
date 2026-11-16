@@ -22,6 +22,8 @@ It can work on a GitHub repository. **Connect GitHub once** from the web UI: Mos
 
 Each workspace runs Claude Code with the Claude model you pick when creating it (Fable, Opus, Sonnet or Haiku); the default model is set in the web UI and saved in the database. See [docs/models.md](docs/models.md).
 
+New workspaces can get a **custom sandbox environment**: a Bash **setup script** that runs once after the clone (install system packages, mise, languages and tools), and/or a **custom image** from Vercel Container Registry to boot the sandbox from. Both have defaults in the web UI's settings and can be changed per workspace. See [docs/sandbox-environment.md](docs/sandbox-environment.md).
+
 Chat messages can carry screenshots and files: paste with Cmd+V, drag them in or use the paperclip; Claude sees images visually. See [docs/attachments.md](docs/attachments.md) for how it works and the browser clipboard limitations.
 
 See [docs/mup.md](docs/mup.md) for the first milestone and [SECURITY.md](SECURITY.md) for credential handling rules. Pull requests are reviewed automatically by Claude Code; see [docs/claude-review.md](docs/claude-review.md) for setup.

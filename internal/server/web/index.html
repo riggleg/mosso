@@ -43,6 +43,7 @@
           <a id="ws-repo" target="_blank" rel="noopener noreferrer"></a>
           <span id="ws-branch" class="branch"></span>
           <span id="ws-model" class="model hidden"></span>
+          <span id="ws-env" class="model hidden"></span>
           <span id="ws-status" class="status"></span>
         </div>
         <div class="ws-meta">
@@ -109,7 +110,17 @@
       <label>First message <span class="muted">(optional)</span>
         <textarea id="create-prompt" rows="4" placeholder="What should Claude work on? It starts as soon as the workspace is ready."></textarea>
       </label>
-      <p class="muted small-text">Mosso provisions a persistent sandbox (sessions of up to 45 minutes, resumed as needed), clones the base branch onto a new working branch and installs Claude Code and the Mosso worker. This takes about a minute; the workspace opens while it is set up, and Claude starts on your first message when it is ready, even if you close Mosso's page. The workspace keeps its model for its whole life.</p>
+      <details id="create-env" class="env-section">
+        <summary>Sandbox environment <span id="create-env-summary" class="muted"></span></summary>
+        <label>Image <span class="muted">(Vercel Container Registry)</span>
+          <input id="create-image" spellcheck="false" autocapitalize="off" autocomplete="off">
+        </label>
+        <label>Setup script <span class="muted">(Bash, runs once after the clone)</span>
+          <textarea id="create-setup" class="code-input" rows="6" spellcheck="false" autocapitalize="off" placeholder="# For example:&#10;curl https://mise.run | sh&#10;mise trust &amp;&amp; mise install"></textarea>
+        </label>
+        <p class="muted small-text">Prefilled with the defaults from Settings; changes apply to this workspace only. A failing setup script stops the creation and destroys the sandbox.</p>
+      </details>
+      <p class="muted small-text">Mosso provisions a persistent sandbox (sessions of up to 45 minutes, resumed as needed), clones the base branch onto a new working branch, runs the setup script if there is one, and installs Claude Code and the Mosso worker. This takes about a minute plus the setup script; the workspace opens while it is set up, and Claude starts on your first message when it is ready, even if you close Mosso's page. The workspace keeps its model, image and setup script for its whole life.</p>
       <p id="create-error" class="error-text hidden"></p>
       <div class="dialog-actions">
         <button id="create-cancel" type="button">Cancel</button>
@@ -137,17 +148,24 @@
     </form>
   </dialog>
 
-  <dialog id="model-dialog">
-    <form id="model-form">
-      <h2>Default model</h2>
-      <label>Claude model for new workspaces
-        <select id="model-default"></select>
+  <dialog id="settings-dialog" class="wide">
+    <form id="settings-form">
+      <h2>Settings for new workspaces</h2>
+      <label>Claude model
+        <select id="settings-model"></select>
       </label>
-      <p class="muted small-text">Preselected when you create a workspace; you can still pick another there. Existing workspaces keep the model they were created with. Mosso saves this setting in its database.</p>
-      <p id="model-error" class="error-text hidden"></p>
+      <label>Sandbox image <span class="muted">(optional)</span>
+        <input id="settings-image" spellcheck="false" autocapitalize="off" autocomplete="off" placeholder="my-image:latest  ·  team/project/my-image@sha256:…  ·  vercel/sandbox/universal">
+      </label>
+      <p id="settings-image-help" class="muted small-text"></p>
+      <label>Setup script <span class="muted">(optional)</span>
+        <textarea id="settings-setup" class="code-input" rows="10" spellcheck="false" autocapitalize="off" placeholder="# Runs once in each new workspace, in the repository checkout, after the clone.&#10;# For example, install mise and the tools the repository pins:&#10;curl https://mise.run | sh&#10;mise trust &amp;&amp; mise install"></textarea>
+      </label>
+      <p class="muted small-text">The setup script runs with <code>bash -e -o pipefail</code> in the checkout, before Claude starts, and never gets your Claude or GitHub tokens. <code>~/.local/bin</code> and mise's shims are on Claude's PATH; for anything else, append <code>export</code> lines to <code>$MOSSO_ENV</code>. If it fails, the workspace is not created. All of these are preselected in the New workspace dialog, where you can change them; existing workspaces keep theirs. Mosso saves them in its database.</p>
+      <p id="settings-error" class="error-text hidden"></p>
       <div class="dialog-actions">
-        <button id="model-cancel" type="button">Cancel</button>
-        <button id="model-submit" class="primary" type="submit">Save</button>
+        <button id="settings-cancel" type="button">Cancel</button>
+        <button id="settings-submit" class="primary" type="submit">Save</button>
       </div>
     </form>
   </dialog>

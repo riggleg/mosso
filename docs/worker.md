@@ -30,10 +30,14 @@ database; see [history.md](history.md)).
 ## Lifecycle
 
 **Create.** `POST /workspaces` provisions a *persistent* sandbox
-(`persistent: true`, one kept snapshot), clones the repository, installs
-Claude Code, uploads the worker binary to
+(`persistent: true`, one kept snapshot), clones the repository, runs the
+setup script if the workspace has one (see
+[sandbox-environment.md](sandbox-environment.md)), installs Claude Code,
+uploads the worker binary to
 `/vercel/sandbox/.mosso/bin/mosso-worker-<build>` with Vercel's write-files
-API and starts it detached (`setsid nohup … &`). The worker listens on
+API and starts it detached (`setsid nohup … &`), with the environment from
+`/vercel/sandbox/.mosso/env` if the setup script made one; every later
+start loads it too. The worker listens on
 `127.0.0.1:7777` inside the sandbox and keeps its state in
 `/vercel/sandbox/.mosso/`: `events.jsonl` (the event log), `worker.log`,
 and `attachments/`. The server saves the workspace record and starts

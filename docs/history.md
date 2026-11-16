@@ -125,6 +125,8 @@ CREATE TABLE workspaces (
     base        TEXT NOT NULL,    -- the branch the pull request targets
     branch      TEXT NOT NULL,    -- the working branch
     model       TEXT NOT NULL DEFAULT '', -- the Claude model (migration 2); '' before model selection
+    image       TEXT NOT NULL DEFAULT '', -- the sandbox's Vercel Container Registry image (migration 3); '' for the built-in runtime
+    setup_script TEXT NOT NULL DEFAULT '', -- the setup script run once after the clone (migration 3); '' for none
     sandbox_id  TEXT NOT NULL,    -- the Vercel sandbox's name
     status      TEXT NOT NULL,    -- running, stopped, gone or terminated
     state       TEXT NOT NULL,    -- JSON, see below
@@ -139,14 +141,15 @@ CREATE TABLE chat_entries (
 );
 CREATE INDEX chat_entries_workspace ON chat_entries (workspace_id, id);
 CREATE TABLE settings (           -- migration 2
-    key   TEXT PRIMARY KEY,       -- "default_model"
+    key   TEXT PRIMARY KEY,       -- "default_model", "default_image", "default_setup_script"
     value TEXT NOT NULL
 );
 ```
 
-`model` is set when the workspace is created and never updated. `settings`
-holds what is configured in the web UI: the default model for new
-workspaces. See [models.md](models.md).
+`model`, `image` and `setup_script` are set when the workspace is created
+and never updated. `settings` holds what is configured in the web UI: the
+default model, sandbox image and setup script for new workspaces. See
+[models.md](models.md) and [sandbox-environment.md](sandbox-environment.md).
 
 A chat entry that cannot be read back is skipped with a log line; it never
 stops a workspace from being restored.

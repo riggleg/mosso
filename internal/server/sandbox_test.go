@@ -33,9 +33,13 @@ type fakeVercel struct {
 	mu      sync.Mutex
 	tmp     string   // root of per-sandbox worker state directories
 	created []string // sandbox names
-	deleted []string
-	stopped []string // session ids
-	failCmd bool
+	// images and runtimes record what each sandbox was created from, in
+	// the order of created ("" when not given).
+	images   []string
+	runtimes []string
+	deleted  []string
+	stopped  []string // session ids
+	failCmd  bool
 	// cmds records each command request body; stdoutFor, if set, scripts
 	// the stdout of a command from its request body.
 	cmds      []map[string]any
@@ -89,7 +93,7 @@ func (f *fakeVercel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	p := r.URL.Path
 	parts := strings.Split(p, "/")
 	switch {
-	case r.Method == http.MethodPost && p == "/v2/sandboxes":
+	case r.Method == http.MethodPost && (p == "/v2/sandboxes" || p == "/v3/sandboxes"):
 		f.createSandbox(w, r)
 	case r.Method == http.MethodGet && strings.HasPrefix(p, "/v2/sandboxes/") && len(parts) == 4:
 		f.getSandbox(w, r, parts[3])
@@ -138,11 +142,21 @@ func (f *fakeVercel) createSandbox(w http.ResponseWriter, r *http.Request) {
 		Name       string `json:"name"`
 		Persistent bool   `json:"persistent"`
 		Timeout    int64  `json:"timeout"`
+		Runtime    string `json:"runtime"`
+		Image      string `json:"image"`
 	}
 	_ = json.NewDecoder(r.Body).Decode(&body)
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	// Like Vercel: v2 boots runtimes, v3 boots images.
+	if (r.URL.Path == "/v3/sandboxes") != (body.Image != "") || (body.Image != "" && body.Runtime != "") {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = io.WriteString(w, `{"error":{"code":"bad_request","message":"runtime on v2, image on v3"}}`)
+		return
+	}
 	f.created = append(f.created, body.Name)
+	f.images = append(f.images, body.Image)
+	f.runtimes = append(f.runtimes, body.Runtime)
 	sb := &fakeSandbox{name: body.Name, session: "sbx_" + body.Name, state: "running", sessions: 1,
 		persistent: body.Persistent, timeout: body.Timeout, started: time.Now()}
 	if f.sandboxes == nil {

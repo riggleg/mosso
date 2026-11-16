@@ -138,6 +138,74 @@ func TestCreate(t *testing.T) {
 	}
 }
 
+// TestCreateFromImage: an image is sent to the v3 endpoint, which boots
+// container images, without a runtime; a failure names the image and still
+// cleans up.
+func TestCreateFromImage(t *testing.T) {
+	f, c := newFakeAPI(t)
+	f.handle("POST /v3/sandboxes", reply(200, `{
+		"sandbox": {"name": "mosso-abc", "persistent": true, "currentSessionId": "sbx_1", "status": "running"},
+		"session": {"id": "sbx_1", "status": "running"},
+		"routes": []
+	}`))
+	const image = "my-team/my-project/dev-image:v3"
+	sb, err := c.Create(context.Background(), "mosso-abc", CreateOptions{Image: image, Persistent: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sb.SessionID != "sbx_1" {
+		t.Fatalf("unexpected sandbox: %+v", sb)
+	}
+	body := f.requests[0].Body
+	if _, hasRuntime := body["runtime"]; hasRuntime || body["image"] != image || body["projectId"] != "prj_1" || body["persistent"] != true {
+		t.Fatalf("unexpected create body: %v", body)
+	}
+
+	f.handle("POST /v3/sandboxes", reply(400, `{"error":{"code":"image_not_ready","message":"The image is still being prepared"}}`))
+	f.handle("DELETE /v2/sandboxes/mosso-def", reply(404, `{"error":{"code":"not_found"}}`))
+	_, err = c.Create(context.Background(), "mosso-def", CreateOptions{Image: image})
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) || apiErr.Code != "image_not_ready" || !strings.Contains(err.Error(), image) || !strings.Contains(err.Error(), "still being prepared") {
+		t.Fatalf("err = %v", err)
+	}
+	if got := f.calls(); got[len(got)-1] != "DELETE /v2/sandboxes/mosso-def" {
+		t.Fatalf("calls = %v, want the failed create cleaned up", got)
+	}
+
+	// Invalid options never reach Vercel.
+	n := len(f.calls())
+	for _, opts := range []CreateOptions{{Image: image, Runtime: "node22"}, {Image: "not an image"}} {
+		if _, err := c.Create(context.Background(), "mosso-ghi", opts); err == nil {
+			t.Errorf("%+v: no error", opts)
+		}
+	}
+	if len(f.calls()) != n {
+		t.Fatalf("invalid options were sent: %v", f.calls()[n:])
+	}
+}
+
+func TestValidImage(t *testing.T) {
+	digest := "@sha256:" + strings.Repeat("ab", 32)
+	for _, ref := range []string{
+		"my-image", "my-image:latest", "my-image:v1.2_rc-1", "my-image" + digest, "my-image:v1" + digest,
+		"team-slug/project-slug/my-image:v1", "vcr.vercel.com/team/project/repo" + digest,
+		"vercel/sandbox/universal", "vcr.vercel.com/vercel/sandbox/node:24", "vercel/sandbox/python:3.14",
+	} {
+		if !ValidImage(ref) {
+			t.Errorf("ValidImage(%q) = false", ref)
+		}
+	}
+	for _, ref := range []string{
+		"", " my-image", "my-image ", "-image", "My-Image", "image:", "image:-tag", "image@sha256:short",
+		"image:tag:tag", "a//b", "/image", "image/", "image;rm -rf /", "image\nx", "image:" + strings.Repeat("t", 129),
+		strings.Repeat("a", MaxImageRefBytes+1),
+	} {
+		if ValidImage(ref) {
+			t.Errorf("ValidImage(%q) = true", ref)
+		}
+	}
+}
+
 func TestCreateFailureCleansUp(t *testing.T) {
 	f, c := newFakeAPI(t)
 	f.handle("POST /v2/sandboxes", reply(500, `{"error":{"message":"boom"}}`))
