@@ -126,6 +126,10 @@ type workspaceState struct {
 	// Branches are the extra branches the workspace's mirror keeps in
 	// sync (see workspace.branches).
 	Branches []string `json:"branches,omitempty"`
+	// Queue and QueuePaused are the workspace's queued messages and
+	// whether they are paused (see queue.go).
+	Queue       []queuedMessage `json:"queue,omitempty"`
+	QueuePaused string          `json:"queue_paused,omitempty"`
 }
 
 // store keeps workspaces and their chats in a SQLite database. It is the

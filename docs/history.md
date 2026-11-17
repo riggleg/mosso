@@ -185,8 +185,8 @@ stops a workspace from being restored.
 `state` holds what Mosso needs to continue a workspace and nobody needs to
 query: the checkout directory and base commit, the sandbox's current
 session, the Claude Code session ID, the last worker event applied, whether
-a task was running, the pull request, the last pushed commit and the
-attachment descriptions. Adding a field there needs no migration.
+a task was running, the pull request, the last pushed commit, the
+attachment descriptions and the queued messages ([queue.md](queue.md)). Adding a field there needs no migration.
 
 ## Migrations
 

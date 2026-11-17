@@ -95,6 +95,12 @@ type workspace struct {
 	// failed, so what is shown may be lost if Mosso restarts before a
 	// later save succeeds; computed by snapshotLocked.
 	Unsaved bool `json:"unsaved,omitempty"`
+	// Queue holds the messages sent while Claude was working, to be sent
+	// in order when it is done (see queue.go); QueuePaused, if set, says
+	// why they wait until the user resumes them: "stopped" or "failed".
+	// Guarded by Server.mu.
+	Queue       []queuedMessage `json:"queue,omitempty"`
+	QueuePaused string          `json:"queue_paused,omitempty"`
 
 	creating   bool
 	connecting bool
@@ -140,6 +146,10 @@ type workspace struct {
 func (s *Server) snapshotLocked(ws *workspace) workspace {
 	c := *ws
 	c.PullRequests = slices.Clone(ws.PullRequests)
+	c.Queue = slices.Clone(ws.Queue)
+	for i, q := range c.Queue {
+		c.Queue[i].Sending = s.sendingLocked(ws, q)
+	}
 	c.SandboxState = ws.sandboxState
 	c.Unsaved = ws.unsaved
 	expired := !ws.ExpiresAt.IsZero() && time.Now().After(ws.ExpiresAt)

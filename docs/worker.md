@@ -128,6 +128,7 @@ Mosso does not extend sessions or restart work by itself.
 | Attachments | yes | yes, after resume (not readable while stopped) | no |
 | Published branch and pull request | yes | yes | yes |
 | First message given with a new workspace, not yet sent | yes, sent after the restart (see below) | yes, after resume | no |
+| Messages queued while Claude worked | yes, sent after the restart once Claude is done ([queue.md](queue.md)) | yes, sent once the sandbox runs again | kept, not sent |
 
 **A queued first message.** A workspace created with a first message saves
 it, marked `queued_prompt` in its state, before Claude starts on it. If
@@ -180,7 +181,7 @@ token) travel in the command's environment, never in its arguments.
 | --- | --- |
 | `GET /status` | `{"state":"idle"\|"running","seq":N,"session_id":"…","task_id":"…","started_at":"…","version":"2","pid":…,"pending_calls":["call_…"]}` |
 | `GET /events?after=N[&follow=1]` | The events with a sequence number greater than N, one JSON object per line. With `follow`, the stream stays open, sends new events as they are recorded and a `{"type":"ping"}` line every 15 s. |
-| `POST /messages` | `{"text","attachments","prompt","session_id","dir","system_prompt","model","token"}`. `model`, if set, is passed to `claude --model`. Records the `user` event and starts Claude Code. `202 {"task_id","seq"}`; `409` if a task is running. |
+| `POST /messages` | `{"text","attachments","prompt","session_id","dir","system_prompt","model","token","key"}`. `model`, if set, is passed to `claude --model`. Records the `user` event (with the `key`, if any) and starts Claude Code. `202 {"task_id","seq"}`; `409` if a task is running. A message whose `key` is already in the log is not run again: `200 {"task_id","seq","duplicate":true,"end_seq":…}` names the task that has it (`end_seq` is its terminal event, absent while it runs) (Mosso keys queued messages; see [queue.md](queue.md)). |
 | `POST /stop` | Interrupts the running task (`202`); `409` if idle. |
 | `POST /tools/calls`, `POST /tools/calls/{id}/start`, `POST /tools/calls/{id}/result` | Claude's calls of Mosso's GitHub tools, relayed from the worker's MCP server (`mosso-worker mcp`) to the Mosso server and back; see [agent-github.md](agent-github.md#how-a-call-travels). |
 
@@ -194,7 +195,7 @@ same shape as in [claude-code.md](claude-code.md)), `result` (`result`,
 A `claude` event's `images` lists the images it shows, as references into
 `images/` (`id`, `type`, `size`, `name`, `path`, `ref`), never their bytes.
 
-The worker reports protocol `version` 3 (3 added the image store). When Mosso finds an idle worker of
+The worker reports protocol `version` 4 (3 added the image store, 4 message keys). When Mosso finds an idle worker of
 another version in a sandbox (started by an earlier Mosso), it stops it and
 starts its own, over the same event log.
 

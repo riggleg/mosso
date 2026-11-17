@@ -20,9 +20,9 @@ import (
 )
 
 // Version identifies the worker protocol. 2 added Mosso's tools (calls.go,
-// mcp.go), 3 the image store (images.go); the server replaces an idle
-// worker of another version.
-const Version = "3"
+// mcp.go), 3 the image store (images.go), 4 message keys (Message.Key);
+// the server replaces an idle worker of another version.
+const Version = "4"
 
 // followPing is how often a followed event stream sends a heartbeat.
 const followPing = 15 * time.Second
@@ -199,7 +199,9 @@ func (s *Server) events(w http.ResponseWriter, r *http.Request) {
 
 // message records the prompt and starts Claude Code in the background. It
 // answers 202 as soon as the user event is recorded; the task continues
-// whether or not the caller stays connected. One task runs at a time.
+// whether or not the caller stays connected. One task runs at a time. A
+// message whose key is already in the log is not run again: the answer is
+// 200 with the earlier task (Accepted.Duplicate).
 func (s *Server) message(w http.ResponseWriter, r *http.Request) {
 	var msg Message
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxMessageBytes)).Decode(&msg); err != nil {
@@ -225,6 +227,12 @@ func (s *Server) message(w http.ResponseWriter, r *http.Request) {
 	}
 	t := &task{id: newTaskID(), msg: msg, started: time.Now().UTC(), done: make(chan struct{})}
 	s.mu.Lock()
+	if prev, ok := s.log.UserEvent(msg.Key); ok {
+		end := s.log.TaskEnd(prev.TaskID)
+		s.mu.Unlock()
+		writeJSON(w, http.StatusOK, Accepted{TaskID: prev.TaskID, Seq: prev.Seq, Duplicate: true, EndSeq: end})
+		return
+	}
 	if s.cur != nil {
 		s.mu.Unlock()
 		writeError(w, http.StatusConflict, "a task is already running")
@@ -233,8 +241,9 @@ func (s *Server) message(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithCancel(context.Background())
 	t.cancel = cancel
 	s.cur = t
+	// Recorded before unlocking, so a second copy of a keyed message finds it.
+	user := s.emit(Event{Type: EventUser, TaskID: t.id, Text: msg.Text, Attachments: msg.Attachments, Key: msg.Key})
 	s.mu.Unlock()
-	user := s.emit(Event{Type: EventUser, TaskID: t.id, Text: msg.Text, Attachments: msg.Attachments})
 	go s.work(ctx, t)
 	writeJSON(w, http.StatusAccepted, Accepted{TaskID: t.id, Seq: user.Seq})
 }

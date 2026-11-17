@@ -248,7 +248,8 @@ func (s *Server) workerFollow(ctx context.Context, sessionID string, after int64
 }
 
 // workerSubmit sends a message to the worker, which starts Claude Code and
-// answers at once.
+// answers at once. A keyed message the worker already has is answered with
+// that task (Accepted.Duplicate) instead.
 func (s *Server) workerSubmit(ctx context.Context, sessionID string, msg worker.Message) (worker.Accepted, error) {
 	res, err := s.workerCall(ctx, sessionID, http.MethodPost, "/messages", msg)
 	if err != nil {
@@ -258,6 +259,7 @@ func (s *Server) workerSubmit(ctx context.Context, sessionID string, msg worker.
 	switch {
 	case res.Status == http.StatusConflict:
 		return acc, errors.New("Claude is already running in the sandbox; wait for it to finish")
+	case res.Status == http.StatusOK && msg.Key != "":
 	case res.Status != http.StatusAccepted:
 		return acc, fmt.Errorf("the worker refused the message: HTTP %d: %s", res.Status, res.errorMessage())
 	}

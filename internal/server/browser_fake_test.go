@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/signal"
 	"testing"
+	"time"
 
 	"github.com/riggleg/mosso/internal/claude"
 )
@@ -46,7 +47,9 @@ import (
 // screenshot, wrote a chart and a large image, and showed the screenshot
 // in its reply (next to a missing and a remote image); with
 // MOSSO_FAKE_STOP=1 the sandbox session then stops, so only the images
-// cached locally can be shown.
+// cached locally can be shown. MOSSO_FAKE_SCENARIO=queue creates a
+// workspace in which each Claude turn takes a few seconds, to queue
+// messages while Claude works, cancel them, and watch them run.
 func TestServeFakeForBrowser(t *testing.T) {
 	addr := os.Getenv("MOSSO_FAKE_ADDR")
 	if addr == "" {
@@ -129,6 +132,25 @@ func TestServeFakeForBrowser(t *testing.T) {
 	}
 	if scenario == "sections" {
 		fakeSections(t, srv.Handler())
+	}
+	if scenario == "queue" {
+		rec := do(t, srv.Handler(), http.MethodPost, "/workspaces", `{"repo":"octo/widgets"}`)
+		var ws testWorkspace
+		_ = json.Unmarshal(rec.Body.Bytes(), &ws)
+		// Every few seconds, let the waiting turn finish.
+		_, release := fake.claude.blockRuns()
+		go func() {
+			for range time.Tick(4 * time.Second) {
+				fc := fake.claude
+				fc.mu.Lock()
+				next := make(chan struct{})
+				fc.block = next
+				fc.mu.Unlock()
+				close(release)
+				release = next
+			}
+		}()
+		t.Logf("workspace %s: turns take up to 4 seconds", ws.Name)
 	}
 	if scenario == "images" {
 		fakeImages(t, srv, fake)

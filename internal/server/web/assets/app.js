@@ -19,6 +19,7 @@ const state = {
   sending: false,
   publishing: false,
   resuming: false,
+  resumingQueue: false,
   archiving: false,
   showArchived: false, // the sidebar's Archived section is open
   repos: null,
@@ -810,8 +811,12 @@ function renderWorking() {
   const gone = sandboxGone(ws);
   // Without Vercel a workspace is shown as last saved and cannot be used.
   const offline = noVercel() && !gone;
-  const blocked = busy || state.sending || !ws || uploading || gone || offline;
+  // While Claude works, a message is queued and sent when it finishes.
+  const queues = Queue.queuesNext(ws);
+  const creating = !!ws && ws.status === "creating";
+  const blocked = creating || state.sending || !ws || uploading || gone || offline;
   send.disabled = blocked;
+  send.textContent = queues ? "Queue" : "Send";
   prompt.disabled = gone || offline;
   // Nothing can be sent to a terminated workspace, so there is no composer.
   $("composer").classList.toggle("hidden", isTerminated(ws));
@@ -824,16 +829,56 @@ function renderWorking() {
   } else if (ws && ws.status === "creating") {
     prompt.placeholder = "The workspace is being set up…";
     hint.textContent = "";
+  } else if (queues) {
+    prompt.placeholder = "Claude is busy. Send your next message to queue it: queued messages are sent in order, each when Claude has finished the one before.";
+    hint.textContent = uploading ? "Waiting for attachments…" : "Busy: new messages are queued.";
   } else if (ws && ws.status === "stopped") {
     prompt.placeholder = "Ask Claude to make a change…  (the stopped sandbox resumes first, which takes a few seconds)";
     hint.textContent = "Sandbox stopped; sending resumes it.";
   } else if (busy) {
-    prompt.placeholder = "Claude is busy. You can type your next message; send it when the current task finishes.";
+    prompt.placeholder = "Mosso is reconnecting to the sandbox. You can type your next message.";
     hint.textContent = "Busy";
   } else {
     prompt.placeholder = "Ask Claude to make a change…  (Enter to send, Shift+Enter for a new line)";
     hint.textContent = uploading ? "Waiting for attachments…" : state.entries.some((e) => e.type === "user") ? "Follow-ups continue the same conversation." : "";
   }
+}
+
+// renderQueue shows the messages queued while Claude works at the end of
+// the chat, marked Queued, each with a Cancel button until it is sent.
+function renderQueue() {
+  const box = $("queue");
+  const v = state.ws && Queue.view(state.ws);
+  box.classList.toggle("hidden", !v);
+  if (!v) {
+    box.replaceChildren();
+    return;
+  }
+  const name = state.selected;
+  box.replaceChildren(
+    h(
+      "div",
+      { class: "queue-head" },
+      h("strong", { text: v.title }),
+      h("span", { class: "muted", text: v.note }),
+      v.canResume ? h("button", { class: "small", type: "button", disabled: state.resumingQueue || noVercel(), onclick: resumeQueue, text: "Resume queue" }) : null,
+    ),
+    ...v.items.map((item) =>
+      h(
+        "div",
+        { class: "entry user-msg queued" + (item.label === "Sending…" ? " sending" : "") },
+        h(
+          "span",
+          { class: "who" },
+          "You",
+          h("span", { class: "queued-badge", text: item.label }),
+          item.canCancel ? h("button", { class: "small queue-cancel", type: "button", title: "Remove this message from the queue", onclick: () => cancelQueued(name, item.id), text: "Cancel" }) : null,
+        ),
+        item.text,
+        item.attachments.length ? h("ul", { class: "attachments" }, ...item.attachments.map((a) => attachmentChip(a, { url: attachmentURL(name, a.id) }))) : null,
+      ),
+    ),
+  );
 }
 
 function render() {
@@ -855,6 +900,7 @@ function render() {
   if (hasWs) {
     renderHeader();
     renderWorking();
+    renderQueue();
     $("chat-empty").classList.toggle("hidden", state.entries.length > 0 || state.ws.status === "creating");
   }
 }
@@ -1430,7 +1476,7 @@ async function sendPrompt() {
   const text = prompt.value;
   const name = state.selected;
   const items = (name && state.pending.get(name)) || [];
-  if ((!text.trim() && items.length === 0) || !state.ws || isWorking() || state.sending) return;
+  if ((!text.trim() && items.length === 0) || !state.ws || state.ws.status === "creating" || state.sending) return;
   if (items.some((i) => i.status !== "done")) {
     showBanner("Wait for the attachments to finish uploading, or remove the ones that failed.");
     return;
@@ -1466,6 +1512,33 @@ async function resumeSandbox() {
     showBanner("Could not resume the sandbox: " + e.message);
   } finally {
     state.resuming = false;
+    refreshList();
+  }
+}
+
+async function cancelQueued(name, id) {
+  try {
+    await api("DELETE", wsPath(name) + "/queue/" + encodeURIComponent(id));
+    hideBanner();
+  } catch (e) {
+    showBanner(e.status === 409 ? "That message is already on its way to Claude." : "Could not cancel the message: " + e.message);
+  } finally {
+    refreshList();
+  }
+}
+
+async function resumeQueue() {
+  const name = state.selected;
+  if (!name || state.resumingQueue) return;
+  state.resumingQueue = true;
+  render();
+  try {
+    await api("POST", wsPath(name) + "/queue/resume", {});
+    hideBanner();
+  } catch (e) {
+    showBanner("Could not resume the queue: " + e.message);
+  } finally {
+    state.resumingQueue = false;
     refreshList();
   }
 }

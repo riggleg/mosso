@@ -71,10 +71,12 @@ type Event struct {
 	// Attachments is opaque to the worker: the server's description of the
 	// files attached to a user message, stored and returned as is.
 	Attachments json.RawMessage `json:"attachments,omitempty"`
-	Event       *claude.Event   `json:"event,omitempty"`
-	Result      *Result         `json:"result,omitempty"`
-	SessionID   string          `json:"session_id,omitempty"`
-	Call        *ToolCall       `json:"call,omitempty"`
+	// Key is the user message's Message.Key, if it had one.
+	Key       string        `json:"key,omitempty"`
+	Event     *claude.Event `json:"event,omitempty"`
+	Result    *Result       `json:"result,omitempty"`
+	SessionID string        `json:"session_id,omitempty"`
+	Call      *ToolCall     `json:"call,omitempty"`
 }
 
 // ToolCall is a tool call in a tool_call event, or its outcome in a
@@ -144,6 +146,10 @@ type Message struct {
 	// Token is the Claude Code OAuth token for this task. The worker
 	// holds it in memory for the task only and never writes it to disk.
 	Token string `json:"token"`
+	// Key, if set, makes sending the message idempotent: the worker runs
+	// a message with a given key once, however often it is sent (see
+	// Accepted.Duplicate). Mosso keys the messages it queues.
+	Key string `json:"key,omitempty"`
 }
 
 // Accepted is the body of a 202 response to POST /messages.
@@ -151,4 +157,9 @@ type Accepted struct {
 	TaskID string `json:"task_id"`
 	// Seq is the sequence number of the recorded user event.
 	Seq int64 `json:"seq"`
+	// Duplicate says the message's key was already in the log: nothing
+	// new started, and TaskID and Seq are the earlier task's. EndSeq is
+	// the sequence number of that task's terminal event, 0 while it runs.
+	Duplicate bool  `json:"duplicate,omitempty"`
+	EndSeq    int64 `json:"end_seq,omitempty"`
 }

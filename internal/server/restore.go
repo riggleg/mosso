@@ -153,6 +153,8 @@ func (s *Server) loadWorkspace(rec workspaceRecord) (*workspace, error) {
 		queuedPrompt: rec.QueuedPrompt,
 		PullRequests: rec.PullRequests,
 		branches:     rec.Branches,
+		Queue:        rec.Queue,
+		QueuePaused:  rec.QueuePaused,
 	}
 	if ws.PullRequest != nil && len(ws.PullRequests) == 0 {
 		// Saved before Mosso kept a list.
@@ -231,6 +233,8 @@ func (s *Server) reconnect(ws *workspace, lastState string, taskRunning bool) {
 		ws.connecting = false
 		ws.chat.notify()
 		s.mu.Unlock()
+		// Messages queued before the restart go on if the sandbox runs.
+		s.dispatchQueue(ws)
 	}()
 	if lastState == sandboxGone {
 		return
@@ -362,7 +366,12 @@ func (s *Server) connect(ctx context.Context, ws *workspace) error {
 		ws.follower = cancel
 		go s.follow(fctx, ws, session)
 	}
+	queued := len(ws.Queue) > 0
 	s.mu.Unlock()
+	if queued {
+		// Messages that waited for the sandbox to run again go on now.
+		go s.dispatchQueue(ws)
+	}
 	return nil
 }
 
@@ -493,8 +502,12 @@ func (s *Server) reconcile(ws *workspace, st worker.Status) {
 		submitted = false
 	}
 	if ws.taskRunning && submitted && st.State == "idle" && st.Seq <= ws.lastSeq {
-		// Nothing more will come for the task Mosso was waiting on.
-		ws.chat.add(chatEntry{Type: "notice", Text: "Interrupted: Claude is no longer running in the sandbox and left no result for the last message. Send a follow-up to continue."})
+		// Nothing more will come for the task Mosso was waiting on. If it
+		// was a queued message Mosso was sending when it stopped, the worker
+		// never got it: it stays queued and is sent again.
+		if len(ws.Queue) == 0 || !ws.Queue[0].Sending {
+			ws.chat.add(chatEntry{Type: "notice", Text: "Interrupted: Claude is no longer running in the sandbox and left no result for the last message. Send a follow-up to continue."})
+		}
 		s.finishTurnLocked(ws, ws.chat.running)
 	}
 	if st.SessionID != "" && ws.chat.sessionID == "" {
@@ -601,6 +614,7 @@ func (s *Server) saveLocked(ws *workspace) error {
 			BaseSHA: ws.BaseSHA, Dir: ws.Dir, Sandbox: ws.Sandbox, ExpiresAt: ws.ExpiresAt, PullRequest: ws.PullRequest,
 			Pushed: ws.pushed, SessionID: ws.chat.sessionID, LastSeq: ws.lastSeq, TaskRunning: ws.taskRunning,
 			QueuedPrompt: ws.queuedPrompt, PullRequests: ws.PullRequests, Branches: ws.branches,
+			Queue: ws.Queue, QueuePaused: ws.QueuePaused,
 		},
 	}
 	for _, a := range ws.attachments {

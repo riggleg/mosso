@@ -6,7 +6,7 @@ The initial Minimum Usable Product (MUP) will run Pi in a Vercel Sandbox, offer 
 
 > Early development. The first end-to-end workflow (repository → Claude Code → pull request) works in a local web UI and through the local API. Workspaces are saved on your machine and in persistent sandboxes, so you can stop Mosso while Claude works and pick the conversation up later.
 
-**Quick start:** configure Vercel, Claude Code and GitHub (see below), run `make run`, and open <http://127.0.0.1:8080>. Create a workspace from a GitHub repository (optionally with Claude's first task, which starts as soon as the workspace is ready), chat with Claude Code while its tool activity streams in, and publish the result as a pull request. See [docs/web-ui.md](docs/web-ui.md).
+**Quick start:** configure Vercel, Claude Code and GitHub (see below), run `make run`, and open <http://127.0.0.1:8080>. Create a workspace from a GitHub repository (optionally with Claude's first task, which starts as soon as the workspace is ready), chat with Claude Code while its tool activity streams in, and publish the result as a pull request. See [docs/web-ui.md](docs/web-ui.md). Messages sent while Claude is working are queued and sent in order when it finishes; see [docs/queue.md](docs/queue.md).
 
 **Toolchain:** [`.tool-versions`](.tool-versions) pins Go (build and tests) and Node.js (only for the web UI tests; Mosso itself has no Node.js dependency). With [asdf](https://asdf-vm.com), run `asdf plugin add golang && asdf plugin add nodejs && asdf install`; [mise](https://mise.jdx.dev) reads the same file with `mise install`.
 
