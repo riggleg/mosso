@@ -9,6 +9,7 @@
   <script src="/assets/markdown.js" defer></script>
   <script src="/assets/attachments.js" defer></script>
   <script src="/assets/sections.js" defer></script>
+  <script src="/assets/github.js" defer></script>
   <script src="/assets/app.js" defer></script>
 </head>
 <body>
@@ -51,7 +52,7 @@
         <div class="ws-meta">
           <span id="ws-expiry" class="muted"></span>
           <select id="ws-section" class="compact" title="Section: where this workspace is listed. Moving it keeps its configuration, sandbox and instructions." aria-label="Section"></select>
-          <a id="ws-pr" class="pr-link hidden" target="_blank" rel="noopener noreferrer"></a>
+          <span id="ws-prs" class="pr-links"></span>
           <button id="resume" class="hidden" type="button" title="Start a new sandbox session from the saved snapshot and fetch what Claude did meanwhile">Resume sandbox</button>
           <button id="publish" type="button">Create PR</button>
           <button id="terminate" class="danger" type="button">Terminate</button>

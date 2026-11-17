@@ -51,6 +51,12 @@ const (
 	// EventPing is a heartbeat on a followed event stream. It has no
 	// sequence number and is never recorded.
 	EventPing = "ping"
+	// EventToolCall is a call of one of Mosso's tools (Call: ID, Name,
+	// Arguments) that Claude made during a task, for the Mosso server to
+	// run (see calls.go).
+	EventToolCall = "tool_call"
+	// EventToolResult ends a tool call (Call: ID, and Result or Error).
+	EventToolResult = "tool_result"
 )
 
 // Event is one entry of the worker's log. Seq increases by one per event;
@@ -68,6 +74,17 @@ type Event struct {
 	Event       *claude.Event   `json:"event,omitempty"`
 	Result      *Result         `json:"result,omitempty"`
 	SessionID   string          `json:"session_id,omitempty"`
+	Call        *ToolCall       `json:"call,omitempty"`
+}
+
+// ToolCall is a tool call in a tool_call event, or its outcome in a
+// tool_result event.
+type ToolCall struct {
+	ID        string          `json:"id"`
+	Name      string          `json:"name,omitempty"`
+	Arguments json.RawMessage `json:"arguments,omitempty"`
+	Result    json.RawMessage `json:"result,omitempty"`
+	Error     string          `json:"error,omitempty"`
 }
 
 // Terminal reports whether the event ends its task.
@@ -104,6 +121,8 @@ type Status struct {
 	// Version identifies the worker build.
 	Version string `json:"version"`
 	PID     int    `json:"pid"`
+	// PendingCalls are the tool calls waiting for the server to run them.
+	PendingCalls []string `json:"pending_calls,omitempty"`
 }
 
 // Message is the body of POST /messages: one prompt for Claude Code.

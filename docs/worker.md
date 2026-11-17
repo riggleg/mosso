@@ -177,15 +177,22 @@ token) travel in the command's environment, never in its arguments.
 
 | Method & path | Description |
 | --- | --- |
-| `GET /status` | `{"state":"idle"\|"running","seq":N,"session_id":"…","task_id":"…","started_at":"…","version":"1","pid":…}` |
+| `GET /status` | `{"state":"idle"\|"running","seq":N,"session_id":"…","task_id":"…","started_at":"…","version":"2","pid":…,"pending_calls":["call_…"]}` |
 | `GET /events?after=N[&follow=1]` | The events with a sequence number greater than N, one JSON object per line. With `follow`, the stream stays open, sends new events as they are recorded and a `{"type":"ping"}` line every 15 s. |
 | `POST /messages` | `{"text","attachments","prompt","session_id","dir","system_prompt","model","token"}`. `model`, if set, is passed to `claude --model`. Records the `user` event and starts Claude Code. `202 {"task_id","seq"}`; `409` if a task is running. |
 | `POST /stop` | Interrupts the running task (`202`); `409` if idle. |
+| `POST /tools/calls`, `POST /tools/calls/{id}/start`, `POST /tools/calls/{id}/result` | Claude's calls of Mosso's GitHub tools, relayed from the worker's MCP server (`mosso-worker mcp`) to the Mosso server and back; see [agent-github.md](agent-github.md#how-a-call-travels). |
 
 Events: `{"seq","time","type","task_id",…}` with `type` one of `user`
 (`text`, `attachments`), `session` (`session_id`), `claude` (`event`: the
 same shape as in [claude-code.md](claude-code.md)), `result` (`result`,
-`session_id`), `error`, `stopped`, `interrupted`, `notice`.
+`session_id`), `error`, `stopped`, `interrupted`, `notice`, `tool_call`
+(`call`: `id`, `name`, `arguments`) and `tool_result` (`call`: `id`,
+`result` or `error`).
+
+The worker reports protocol `version` 2. When Mosso finds an idle worker of
+another version in a sandbox (started by an earlier Mosso), it stops it and
+starts its own, over the same event log.
 
 The event log is bounded: tool inputs over 64 KiB are replaced with a
 placeholder, tool results are truncated to 16 KiB (as before), and past 64
@@ -230,7 +237,9 @@ last sequence number it applied, so a reconnect never duplicates an entry.
   (which needs a token it would have to steal first). This is the same
   trust level as the sandbox's own files.
 - **GitHub credentials never enter the sandbox** (unchanged); pushes still
-  run on your machine.
+  run on your machine, including the ones Claude asks for with Mosso's
+  GitHub tools: the worker only relays those calls, and Mosso runs them for
+  the workspace that owns the sandbox (see [agent-github.md](agent-github.md#security)).
 - **The database** in the data directory holds your prompts and Claude's
   output, like the web UI did in memory, and keeps them after a workspace is
   terminated. It holds no credentials and is created readable by its owner

@@ -68,6 +68,17 @@ echo "the worker did not start; its log ends with:" >&2
 tail -n 20 "$state/worker.log" >&2 || true
 exit 1`
 
+// workerStopScript stops the worker whose process ID is $1 (listening on
+// port $2) and waits until it no longer answers, so a newer one can start.
+const workerStopScript = `set -u
+kill "$1" 2>/dev/null || true
+for _ in $(seq 1 50); do
+  if ! curl -sf --max-time 2 "http://127.0.0.1:$2/status" >/dev/null 2>&1; then exit 0; fi
+  sleep 0.2
+done
+echo "the old worker did not stop" >&2
+exit 1`
+
 // workerProbeScript creates the state directory and reports whether the
 // worker binary ($1) is already there.
 const workerProbeScript = `set -u
@@ -156,8 +167,24 @@ func (s *Server) workerStatus(ctx context.Context, sessionID string) (worker.Sta
 // (unless this build's is already there) and starts it detached. A worker
 // started after a sandbox resume recovers its event log from the
 // filesystem.
+//
+// An idle worker of another protocol version (from an earlier Mosso) is
+// replaced, so every turn gets the tools this Mosso offers; its event log
+// stays. A busy one is left to finish its task.
 func (s *Server) ensureWorker(ctx context.Context, name, sessionID string) (worker.Status, error) {
 	st, err := s.workerStatus(ctx, sessionID)
+	if err == nil && st.Version != worker.Version && st.State == "idle" && st.PID > 0 {
+		log.Printf("workspace %s: replacing the sandbox worker (protocol %s) with this Mosso's (protocol %s)", name, st.Version, worker.Version)
+		res, err := s.vercel.Run(ctx, sessionID, vercel.Command{Name: "bash",
+			Args: []string{"-c", workerStopScript, "stop", strconv.Itoa(st.PID), strconv.Itoa(worker.DefaultPort)}})
+		if err != nil {
+			return st, err
+		}
+		if res.ExitCode != 0 {
+			return st, fmt.Errorf("stop the old worker: exit code %d: %s", res.ExitCode, strings.TrimSpace(res.Stderr))
+		}
+		st, err = worker.Status{}, errWorkerDown
+	}
 	if !errors.Is(err, errWorkerDown) {
 		return st, err
 	}

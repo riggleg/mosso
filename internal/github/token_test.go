@@ -105,7 +105,7 @@ func TestNewTokenURL(t *testing.T) {
 	}
 	want := url.Values{
 		"name": {"Mosso"}, "description": {"GitHub access for Mosso coding workspaces"}, "expires_in": {"90"},
-		"contents": {"write"}, "pull_requests": {"write"},
+		"contents": {"write"}, "pull_requests": {"write"}, "checks": {"read"}, "statuses": {"read"},
 	}
 	if got := u.Query(); got.Encode() != want.Encode() {
 		t.Fatalf("query = %v, want exactly %v (no workflows, actions or administration)", got, want)

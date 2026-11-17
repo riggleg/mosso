@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -33,6 +34,9 @@ const maxStderrBytes = 64 << 10
 // Code's process group.
 func (s *Server) runClaude(ctx context.Context, msg Message, emit func(Event)) (*claude.Turn, error) {
 	args := []string{"-p", "--output-format", "stream-json", "--verbose", "--permission-mode", "bypassPermissions"}
+	if cfg := s.mcpConfig(); cfg != "" {
+		args = append(args, "--mcp-config", cfg)
+	}
 	if msg.SessionID != "" {
 		args = append(args, "--resume", msg.SessionID)
 	}
@@ -47,7 +51,10 @@ func (s *Server) runClaude(ctx context.Context, msg Message, emit func(Event)) (
 	cmd := exec.CommandContext(ctx, s.claudePath, args...)
 	cmd.Dir = msg.Dir
 	cmd.Stdin = strings.NewReader(msg.Prompt)
-	cmd.Env = append(os.Environ(), claude.EnvToken+"="+msg.Token, "DISABLE_AUTOUPDATER=1")
+	cmd.Env = append(os.Environ(), claude.EnvToken+"="+msg.Token, "DISABLE_AUTOUPDATER=1",
+		// A tool call can wait for Mosso longer than Claude Code's default;
+		// the worker always answers within its own call timeout.
+		fmt.Sprintf("MCP_TOOL_TIMEOUT=%d", (s.callTimeout+time.Minute).Milliseconds()))
 	// Claude Code's own children live in the same process group, so one
 	// SIGTERM reaches them all.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
@@ -93,6 +100,18 @@ func (s *Server) runClaude(ctx context.Context, msg Message, emit func(Event)) (
 		return nil, fmt.Errorf("claude code exited with code %d: %s: %s", code, perr.Error(), tail(tok.Redact(stderr.String())))
 	}
 	return turn, nil
+}
+
+// mcpConfig is the --mcp-config value that makes Claude Code start the
+// worker's MCP server as "mosso", or "" when the worker offers no tools.
+func (s *Server) mcpConfig() string {
+	if len(s.mcp) == 0 {
+		return ""
+	}
+	b, _ := json.Marshal(map[string]any{"mcpServers": map[string]any{
+		"mosso": map[string]any{"type": "stdio", "command": s.mcp[0], "args": s.mcp[1:]},
+	}})
+	return string(b)
 }
 
 // limitedBuffer keeps the first maxStderrBytes written to it and accepts

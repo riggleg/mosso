@@ -149,6 +149,12 @@ func (s *Server) loadWorkspace(rec workspaceRecord) (*workspace, error) {
 		sandboxState: rec.SandboxState,
 		pushed:       rec.Pushed,
 		queuedPrompt: rec.QueuedPrompt,
+		PullRequests: rec.PullRequests,
+		branches:     rec.Branches,
+	}
+	if ws.PullRequest != nil && len(ws.PullRequests) == 0 {
+		// Saved before Mosso kept a list.
+		ws.PullRequests = []pullRequestRecord{{Number: ws.PullRequest.Number, URL: ws.PullRequest.URL, Head: ws.Branch, Base: ws.Base, By: "user"}}
 	}
 	if ws.sandboxState == "" {
 		ws.sandboxState = sandboxStopped
@@ -190,6 +196,7 @@ func (s *Server) loadWorkspace(rec workspaceRecord) (*workspace, error) {
 	if rec.BaseSHA != "" && reconnecting {
 		mirror, err := github.NewMirror(s.vercel, rec.Sandbox.SessionID, github.MirrorOptions{
 			Repo: rec.Repo, Base: rec.Base, BaseSHA: rec.BaseSHA, Branch: rec.Branch, Dir: rec.Dir, Pushed: rec.Pushed,
+			Extra: rec.Branches,
 		})
 		if err != nil {
 			return nil, err
@@ -431,6 +438,10 @@ func (s *Server) follow(ctx context.Context, ws *workspace, session string) {
 		st, err := s.ensureWorker(ctx, ws.Name, session)
 		if err == nil {
 			s.reconcile(ws, st)
+			// Tool calls made while Mosso was not following.
+			for _, id := range st.PendingCalls {
+				go s.handleToolCall(ws, id)
+			}
 			s.mu.Lock()
 			after := ws.lastSeq
 			s.mu.Unlock()
@@ -587,7 +598,7 @@ func (s *Server) saveLocked(ws *workspace) error {
 		workspaceState: workspaceState{
 			BaseSHA: ws.BaseSHA, Dir: ws.Dir, Sandbox: ws.Sandbox, ExpiresAt: ws.ExpiresAt, PullRequest: ws.PullRequest,
 			Pushed: ws.pushed, SessionID: ws.chat.sessionID, LastSeq: ws.lastSeq, TaskRunning: ws.taskRunning,
-			QueuedPrompt: ws.queuedPrompt,
+			QueuedPrompt: ws.queuedPrompt, PullRequests: ws.PullRequests, Branches: ws.branches,
 		},
 	}
 	for _, a := range ws.attachments {

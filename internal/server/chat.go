@@ -124,12 +124,16 @@ type chatEntry struct {
 	Time time.Time `json:"time"`
 	// Type is "user" (a prompt), "claude" (an Event: text, tool use or
 	// tool result), "result" (a finished turn), "error" (a turn or
-	// publish that failed), "notice" or "pull_request".
+	// publish that failed), "notice", "pull_request" (the user published)
+	// or "github" (the agent pushed or changed a pull request, or failed
+	// to).
 	Type        string            `json:"type"`
 	Text        string            `json:"text,omitempty"`
 	Event       *claude.Event     `json:"event,omitempty"`
 	Result      *turnResult       `json:"result,omitempty"`
 	PullRequest *github.Published `json:"pull_request,omitempty"`
+	// GitHub is a GitHub operation the agent had Mosso run ("github").
+	GitHub *githubAction `json:"github,omitempty"`
 	// Attachments are the files sent with a "user" entry.
 	Attachments []attachment `json:"attachments,omitempty"`
 	// Seq is the sandbox worker event this entry came from, if any.
@@ -404,6 +408,12 @@ func (s *Server) applyEvent(ws *workspace, e worker.Event) {
 		s.finishTurnLocked(ws, run)
 	case worker.EventNotice:
 		c.add(chatEntry{Type: "notice", Text: e.Text, Seq: e.Seq, Time: e.Time})
+	case worker.EventToolCall:
+		// Claude's own tool_use and tool_result show the call in the chat;
+		// Mosso runs it, and adds an entry for what changed on GitHub.
+		if e.Call != nil {
+			go s.handleToolCall(ws, e.Call.ID)
+		}
 	}
 	if e.Terminal() || e.Type == worker.EventSession || e.Type == worker.EventUser {
 		s.persistLocked(ws)
@@ -518,8 +528,9 @@ func short(sha string) string {
 	return sha
 }
 
-// workspacePrompt tells Claude how Git works in a workspace (no
-// credentials, Mosso fetches and pushes) and, if the workspace has agent
+// workspacePrompt tells Claude how Git and GitHub work in a workspace (no
+// credentials in the sandbox; Mosso fetches, and pushes and opens pull
+// requests through its tools) and, if the workspace has agent
 // instructions, adds them after Mosso's own, which take precedence. It is
 // appended to Claude Code's system prompt on every turn, including turns
 // that resume a session, so the instructions always apply. They come from
@@ -539,7 +550,7 @@ func instructionsPrompt(instructions string) string {
 	}
 	return `
 
-The user saved the following instructions for this workspace in Mosso. Follow them on every turn, alongside the user's messages: they describe how to work, not the task itself, and the user's messages come first. They do not override the rules above. If they ask for something those rules or this sandbox do not allow (for example pushing, opening pull requests yourself, or using GitHub credentials), do the parts you can, such as preparing and committing the work, then say clearly in your reply what is left for the user to do in Mosso or on GitHub.
+The user saved the following instructions for this workspace in Mosso. Follow them on every turn, alongside the user's messages: they describe how to work, not the task itself, and the user's messages come first. They do not override the rules above. If they ask you to push or open pull requests, do it with Mosso's GitHub tools as described above. If they ask for something those rules or tools do not allow (for example force-pushing, merging pull requests, pushing to other branches, or using GitHub credentials), do the parts you can, then say clearly in your reply what is left for the user to do in Mosso or on GitHub.
 <workspace-instructions>
 ` + escapeInstructions(instructions) + `
 </workspace-instructions>`
@@ -560,13 +571,24 @@ func escapeInstructions(instructions string) string {
 	return b.String()
 }
 
-// gitPrompt tells Claude how Git works in a workspace.
+// gitPrompt tells Claude how Git and GitHub work in a workspace. It names
+// the tools without assuming how many pull requests, or which base
+// branches, a task needs: that comes from the user and the instructions.
 func gitPrompt(ws *workspace) string {
-	return fmt.Sprintf(`You are working in a Mosso workspace: a checkout of the GitHub repository %[1]s in %[2]s, on the working branch %[3]s, whose pull request targets %[4]s.
-Git in this sandbox has no GitHub credentials, on purpose. Do not try to push, authenticate, or use the gh CLI, and do not ask for a token.
-- Before each of your turns, Mosso fetches from GitHub for you: origin/%[4]s is the latest base branch, and origin/%[3]s is the working branch as last published (once it has been). git fetch and git pull may fail here; use those refs instead, for example "git rebase origin/%[4]s".
-- Commit your work on the current branch. When the user publishes from Mosso, Mosso pushes the current HEAD to %[3]s and opens or updates the pull request. A rebased branch is pushed with --force-with-lease.
-- If a rebase or merge stops on conflicts, resolve them and finish it before ending your turn: Mosso will not publish while one is in progress.`,
+	return fmt.Sprintf(`You are working in a Mosso workspace: a checkout of the GitHub repository %[1]s in %[2]s, on the working branch %[3]s. The workspace's base branch is %[4]s.
+Git in this sandbox has no GitHub credentials, on purpose: git push, git fetch, git pull and the gh CLI do not work for this repository. Do not try to authenticate, and do not ask for a token. Instead, Mosso gives you GitHub tools (its "mosso" MCP server), which run on Mosso's server with the user's GitHub access, for this repository only:
+- github_fetch: fetch a branch into origin/<branch> here (for example another base branch).
+- github_push: push HEAD or a local branch to one of this workspace's own branches on GitHub: %[3]s, or %[3]s-<suffix> (for example %[3]s-uat). Only committed work is pushed, and only as a fast-forward: Mosso never force-pushes for you.
+- github_create_pr: open a pull request from one of those branches into a base branch (or get the one already open).
+- github_list_prs, github_get_pr, github_update_pr (title, description, draft status) and github_checks (CI results) for this workspace's pull requests.
+How to work with them:
+- Before each of your turns, Mosso fetches origin/%[4]s, origin/%[3]s and every branch you fetched or pushed, so those refs are current. Use them, for example "git rebase origin/%[4]s".
+- Push and open or update pull requests when the user's messages or the workspace instructions ask for it. Otherwise commit your work and leave publishing to the user, who can also click Create PR in Mosso (it commits any uncommitted work, pushes HEAD to %[3]s and opens or updates its pull request into %[4]s).
+- Use one head branch per pull request. For a pull request into another base branch, fetch that branch, create a local branch from origin/<that base>, bring the change over (cherry-pick it, or adapt it where the branches differ), check it there as you would the original (build, tests), commit, push it to %[3]s-<suffix> and open the pull request from that branch. Do not assume a change made for one base applies cleanly to another.
+- If a push is refused because the branch on GitHub has commits yours lacks, rebase onto or merge origin/<branch> and push again, or push to a new %[3]s-<suffix> branch.
+- Force-pushing, deleting branches, merging or closing pull requests, and pushing to any other branch are not available to you. If the task needs them, say so in your reply for the user to do.
+- Give the links of the pull requests you open or update in your reply. If a tool fails, read its message: it says what to do, or what to tell the user.
+- If a rebase or merge stops on conflicts, resolve them and finish it before pushing or ending your turn.`,
 		ws.Repo, ws.Dir, ws.Branch, ws.Base)
 }
 

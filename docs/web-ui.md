@@ -50,6 +50,10 @@ frontend build step, Node.js dependency or separate frontend server.
 6. Click **Create PR**, check the title, and publish. The chat shows the pull
    request link and whether it was opened or updated, and the header links
    to it. If nothing changed, the chat says so and nothing is pushed.
+   Or ask Claude to do it: it can push and open pull requests itself, into
+   any base branch, with Mosso's GitHub tools. Each push and pull request it
+   makes shows as a card with its link (or the error), and the header lists
+   every pull request of the workspace. See [agent-github.md](agent-github.md).
 7. Keep working and click **Update PR** to push the new work to the same pull
    request. Before each message Mosso fetches the base branch, so you can ask
    Claude to rebase onto `origin/<base>` when the pull request has conflicts;
@@ -218,6 +222,7 @@ Entry `type`s:
 Entries that came from the sandbox worker also carry `seq`, the worker's
 sequence number.
 | `pull_request` | `pull_request`: `number`, `url`, `branch`, `commit`, `created` | a publish succeeded |
+| `github`       | `github`: `tool`, `text`, `error`, `branch`, `commit`, `pull_request` | Claude pushed, or opened or updated a pull request, with Mosso's GitHub tools, or failed to ([agent-github.md](agent-github.md)) |
 
 `closed` means the workspace was destroyed and the stream ends. An unknown
 workspace returns `404`.

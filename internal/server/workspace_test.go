@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -39,6 +40,168 @@ type fakeGitHubAPI struct {
 	noChanges bool
 	publishes []github.PublishOptions
 	pubTokens []github.Token
+
+	// remote are the branches on "GitHub" besides main, by name;
+	// pushes and fetches are what the agent's tools asked for; pushErr
+	// makes pushes fail; checkRuns are every commit's check runs.
+	remote    map[string]string
+	pushes    []github.PushOptions
+	fetches   [][]string
+	pushErr   error
+	checkRuns []map[string]any
+	// statusForbidden makes commit statuses unreadable, like a token
+	// without the Commit statuses permission.
+	statusForbidden bool
+}
+
+// pull returns pull request number n. Call with f.mu held.
+func (f *fakeGitHubAPI) pull(n string) map[string]any {
+	for _, p := range f.pulls {
+		if fmt.Sprint(p["number"]) == n {
+			return p
+		}
+	}
+	return nil
+}
+
+// apiPull renders a stored pull request like GitHub's REST API.
+func (f *fakeGitHubAPI) apiPull(p map[string]any) map[string]any {
+	head, _ := p["head"].(string)
+	repo, _ := p["head_repo"].(string)
+	if repo == "" {
+		repo = "octo/widgets"
+	}
+	return map[string]any{
+		"number": p["number"], "html_url": p["html_url"], "node_id": fmt.Sprintf("PR_%v", p["number"]),
+		"title": p["title"], "body": p["body"], "state": p["state"], "draft": p["draft"] == true, "merged_at": nil,
+		"head": map[string]any{"ref": head, "sha": f.remote[head], "repo": map[string]any{"full_name": repo}},
+		"base": map[string]any{"ref": p["base"]},
+	}
+}
+
+// addPull adds a pull request, as if opened on GitHub. Call with f.mu held.
+func (f *fakeGitHubAPI) addPull(p map[string]any) map[string]any {
+	n := len(f.pulls) + 1
+	if n == 7 {
+		n++ // 7 is the publish fake's
+	}
+	p["number"], p["state"] = n, "open"
+	p["html_url"] = fmt.Sprintf("https://github.com/octo/widgets/pull/%d", n)
+	f.pulls = append(f.pulls, p)
+	return p
+}
+
+// pullsAPI serves the pull request, branch and checks endpoints. Call with
+// f.mu held.
+func (f *fakeGitHubAPI) pullsAPI(w http.ResponseWriter, r *http.Request, reply func(int, any)) bool {
+	const repo = "/repos/octo/widgets"
+	p := r.URL.Path
+	switch {
+	case r.Method == http.MethodGet && p == repo+"/pulls":
+		q := r.URL.Query()
+		out := []map[string]any{}
+		for _, pr := range f.pulls {
+			if "octo:"+pr["head"].(string) != q.Get("head") || (q.Get("state") != "all" && pr["state"] != q.Get("state")) {
+				continue
+			}
+			out = append(out, f.apiPull(pr))
+		}
+		reply(200, out)
+	case r.Method == http.MethodPost && p == repo+"/pulls":
+		var in map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&in)
+		reply(201, f.apiPull(f.addPull(in)))
+	case strings.HasPrefix(p, repo+"/pulls/"):
+		pr := f.pull(strings.TrimPrefix(p, repo+"/pulls/"))
+		if pr == nil {
+			reply(404, map[string]string{"message": "Not Found"})
+			return true
+		}
+		if r.Method == http.MethodPatch {
+			var in map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&in)
+			for _, k := range []string{"title", "body"} {
+				if v, ok := in[k]; ok {
+					pr[k] = v
+				}
+			}
+		}
+		out := f.apiPull(pr)
+		out["mergeable"], out["mergeable_state"] = true, "clean"
+		reply(200, out)
+	case r.Method == http.MethodPost && p == "/graphql":
+		var in struct {
+			Query     string         `json:"query"`
+			Variables map[string]any `json:"variables"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&in)
+		id, _ := in.Variables["id"].(string)
+		if pr := f.pull(strings.TrimPrefix(id, "PR_")); pr != nil {
+			pr["draft"] = strings.Contains(in.Query, "convertPullRequestToDraft")
+		}
+		reply(200, map[string]any{"data": map[string]any{}})
+	case strings.HasPrefix(p, repo+"/git/ref/heads/"):
+		sha := f.remote[strings.TrimPrefix(p, repo+"/git/ref/heads/")]
+		if sha == "" {
+			reply(404, map[string]string{"message": "Not Found"})
+			return true
+		}
+		reply(200, map[string]any{"object": map[string]any{"sha": sha}})
+	case strings.HasSuffix(p, "/check-runs"):
+		reply(200, map[string]any{"check_runs": f.checkRuns})
+	case strings.HasPrefix(p, repo+"/commits/") && strings.HasSuffix(p, "/status") && f.statusForbidden:
+		reply(403, map[string]string{"message": "Resource not accessible by personal access token"})
+	case strings.HasPrefix(p, repo+"/commits/") && strings.HasSuffix(p, "/status"):
+		reply(200, map[string]any{"state": "success", "statuses": []any{}})
+	default:
+		return false
+	}
+	return true
+}
+
+// push fakes Mirror.Push: it pushes the source's commit (testCommitSHA for
+// HEAD, a commit named after a local branch otherwise) to one of the
+// workspace's own branches.
+func (f *fakeGitHubAPI) push(m *github.Mirror, _ context.Context, tok github.Token, opts github.PushOptions) (*github.Pushed, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.pushes = append(f.pushes, opts)
+	switch {
+	case tok.Reveal() != testGitHubToken:
+		return nil, errors.New("push without the token")
+	case f.pushErr != nil:
+		return nil, f.pushErr
+	case !github.OwnBranch(m.Options().Branch, opts.Branch):
+		return nil, errors.New("push: Mosso only pushes this workspace's own branches")
+	}
+	sha := testCommitSHA
+	if opts.Source != "" && opts.Source != "HEAD" {
+		sha = fmt.Sprintf("%040x", len(opts.Source))
+	}
+	if f.remote == nil {
+		f.remote = map[string]string{}
+	}
+	prev := f.remote[opts.Branch]
+	f.remote[opts.Branch] = sha
+	return &github.Pushed{Branch: opts.Branch, Commit: sha, Previous: prev, Updated: prev != sha}, nil
+}
+
+// fetch fakes Mirror.Fetch over the fake's branches.
+func (f *fakeGitHubAPI) fetch(m *github.Mirror, _ context.Context, tok github.Token, branches ...string) (map[string]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.fetches = append(f.fetches, branches)
+	if tok.Reveal() != testGitHubToken {
+		return nil, errors.New("fetch without the token")
+	}
+	out := map[string]string{}
+	for _, b := range branches {
+		out[b] = f.remote[b]
+		if b == "main" {
+			out[b] = m.Options().BaseSHA
+		}
+	}
+	return out, nil
 }
 
 func (f *fakeGitHubAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -59,6 +222,9 @@ func (f *fakeGitHubAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("GitHub-Authentication-Token-Expiration", "2026-12-01 00:00:00 UTC")
+	if f.pullsAPI(w, r, reply) {
+		return
+	}
 	const repo = "/repos/octo/widgets"
 	switch p := r.URL.Path; {
 	case p == "/user":
@@ -106,12 +272,21 @@ func (f *fakeGitHubAPI) publish(m *github.Mirror, _ context.Context, gh *github.
 		return nil, github.ErrNoChanges
 	}
 	branch := m.Options().Branch
-	out := &github.Published{Branch: branch, Commit: testCommitSHA,
-		PullRequest: github.PullRequest{Number: 7, URL: "https://github.com/octo/widgets/pull/7"}}
-	if len(f.pulls) == 0 {
-		f.pulls = append(f.pulls, map[string]any{"head": branch, "base": "main", "title": opts.Title, "draft": opts.Draft})
-		out.Created = true
+	if f.remote == nil {
+		f.remote = map[string]string{}
 	}
+	f.remote[branch] = testCommitSHA
+	out := &github.Published{Branch: branch, Commit: testCommitSHA}
+	for _, p := range f.pulls {
+		if p["head"] == branch && p["base"] == "main" && p["state"] == "open" {
+			out.PullRequest = github.PullRequest{Number: p["number"].(int), URL: p["html_url"].(string)}
+			return out, nil
+		}
+	}
+	f.pulls = append(f.pulls, map[string]any{"head": branch, "base": "main", "title": opts.Title, "draft": opts.Draft,
+		"number": 7, "state": "open", "html_url": "https://github.com/octo/widgets/pull/7"})
+	out.PullRequest = github.PullRequest{Number: 7, URL: "https://github.com/octo/widgets/pull/7"}
+	out.Created = true
 	return out, nil
 }
 
@@ -141,6 +316,8 @@ func withGitHub(t *testing.T, srv *Server, api *fakeGitHubAPI) {
 	}
 	srv.gitSync = api.sync
 	srv.gitPublish = api.publish
+	srv.gitPush = api.push
+	srv.gitFetch = api.fetch
 }
 
 type testWorkspace struct {

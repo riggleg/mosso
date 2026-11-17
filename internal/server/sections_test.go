@@ -403,7 +403,7 @@ func TestWorkspaceInheritsSection(t *testing.T) {
 // first, then the instructions, framed as not overriding them.
 func checkInstructionsPrompt(t *testing.T, prompt, instructions string) {
 	t.Helper()
-	rules := strings.Index(prompt, "Do not try to push")
+	rules := strings.Index(prompt, "Do not try to authenticate")
 	block := strings.Index(prompt, "<workspace-instructions>\n"+escapeInstructions(instructions)+"\n</workspace-instructions>")
 	if rules < 0 || block < 0 || block < rules || !strings.Contains(prompt, "They do not override the rules above") {
 		t.Fatalf("system prompt = %q", prompt)
@@ -806,7 +806,7 @@ func TestStoreSections(t *testing.T) {
 func TestInstructionsPrompt(t *testing.T) {
 	ws := &workspace{Repo: "octo/widgets", Dir: "/vercel/sandbox/widgets", Branch: "mosso/x", Base: "master"}
 	plain := workspacePrompt(ws)
-	if strings.Contains(plain, "instructions") {
+	if strings.Contains(plain, "<workspace-instructions>") || strings.Contains(plain, "The user saved") {
 		t.Fatalf("prompt without instructions = %q", plain)
 	}
 	ws.Instructions = testInstructions

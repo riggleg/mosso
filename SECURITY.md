@@ -47,6 +47,12 @@ data in public issues. Contact the repository owner privately before disclosure.
   Before pushing, Mosso refuses commits that contain the GitHub or Claude token,
   but it only matches the literal values: an encoded copy, or exfiltration over
   the network from the sandbox, is not caught.
+- Claude's GitHub tools (push, pull requests, checks) run on the Mosso server
+  with that token. Tool calls carry only branch names and pull request
+  numbers, are checked against the workspace that owns the sandbox they came
+  from, and can only fast-forward that workspace's own `mosso/*` branches;
+  no force push, merge or branch deletion is possible through them. See
+  [docs/agent-github.md](docs/agent-github.md#security).
 - If a credential is exposed, **revoke or rotate it immediately**. Removing it
   from a subsequent commit does not make the exposure safe.
 

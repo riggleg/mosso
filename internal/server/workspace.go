@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"path"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -75,8 +76,13 @@ type workspace struct {
 	CreatedAt time.Time `json:"created_at"`
 	// ArchivedAt is set while the workspace is archived: still readable,
 	// but listed apart from the rest of the history.
-	ArchivedAt  time.Time           `json:"archived_at,omitzero"`
-	PullRequest *github.PullRequest `json:"pull_request,omitempty"`
+	ArchivedAt time.Time `json:"archived_at,omitzero"`
+	// PullRequest is the pull request from the working branch into the
+	// base branch, which Create PR / Update PR publishes to, once it
+	// exists. PullRequests are all the workspace's pull requests, opened
+	// by the user or the agent, into any base branch. Guarded by Server.mu.
+	PullRequest  *github.PullRequest `json:"pull_request,omitempty"`
+	PullRequests []pullRequestRecord `json:"pull_requests,omitempty"`
 	// Status is "creating", "connecting" (checking the sandbox after a
 	// restart), "ready", "working" (Claude or a publish is running),
 	// "stopped" (the sandbox session ended; the next message resumes it),
@@ -103,6 +109,14 @@ type workspace struct {
 	git *github.Mirror
 	// pushed is the working branch head Mosso last pushed.
 	pushed string
+	// branches are the branches the mirror keeps in sync besides the base
+	// and working branch: ones the agent fetched, pushed or opened a pull
+	// request into. Guarded by Server.mu.
+	branches []string
+	// toolCalls are the agent's tool calls being run; guarded by
+	// Server.mu. toolSem lets one of them run at a time.
+	toolCalls map[string]bool
+	toolSem   chan struct{}
 	// unsaved is set while the database is behind what is in memory.
 	unsaved bool
 	// queuedPrompt is set while the first message given with the workspace
@@ -125,6 +139,7 @@ type workspace struct {
 // snapshotLocked returns a copy of ws with its current status.
 func (s *Server) snapshotLocked(ws *workspace) workspace {
 	c := *ws
+	c.PullRequests = slices.Clone(ws.PullRequests)
 	c.SandboxState = ws.sandboxState
 	c.Unsaved = ws.unsaved
 	expired := !ws.ExpiresAt.IsZero() && time.Now().After(ws.ExpiresAt)
@@ -822,7 +837,13 @@ func (s *Server) workspacePullRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.mu.Lock()
-	ws.PullRequest = &pub.PullRequest
+	rec := pullRequestRecord{Number: pub.Number, URL: pub.URL, Head: ws.Branch, Base: ws.Base, By: "user"}
+	if pub.Created {
+		rec.Title, rec.Draft = req.Title, req.Draft
+	} else if i := slices.IndexFunc(ws.PullRequests, func(p pullRequestRecord) bool { return p.Number == pub.Number }); i >= 0 {
+		rec = ws.PullRequests[i]
+	}
+	recordPullRequestLocked(ws, rec)
 	ws.pushed = pub.Commit
 	ws.chat.err = ""
 	ws.chat.add(chatEntry{Type: "pull_request", PullRequest: pub})

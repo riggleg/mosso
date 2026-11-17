@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"path"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -393,6 +394,12 @@ func (f *fakeVercel) startCommand(w http.ResponseWriter, r *http.Request, sessio
 			cmd.stdout = "running\n"
 		}
 		close(cmd.done)
+	case workerStopScript:
+		fw.stop()
+		fw.mu.Lock()
+		fw.version = ""
+		fw.mu.Unlock()
+		close(cmd.done)
 	case workerFollowScript:
 		cmd.stream = func(w http.ResponseWriter, r *http.Request, killed <-chan struct{}) {
 			cmd.exit = fw.follow(w, r, args[3], killed)
@@ -511,6 +518,9 @@ type fakeWorker struct {
 	w      *worker.Server
 	log    *worker.Log
 	starts int
+	// version, if set, is the protocol version the worker reports, to
+	// play a worker an earlier Mosso started.
+	version string
 }
 
 func (fw *fakeWorker) start() bool {
@@ -525,8 +535,28 @@ func (fw *fakeWorker) start() bool {
 	}
 	fw.log = l
 	fw.w = worker.New(l, "/nonexistent/claude")
-	fw.w.SetRunner(fw.claude.run)
-	fw.srv = httptest.NewServer(fw.w.Handler())
+	h := fw.w.Handler()
+	if fw.version != "" {
+		// A worker from an earlier Mosso: same API, older protocol.
+		inner, version := h, fw.version
+		h = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != "/status" {
+				inner.ServeHTTP(w, r)
+				return
+			}
+			rec := httptest.NewRecorder()
+			inner.ServeHTTP(rec, r)
+			var st worker.Status
+			_ = json.Unmarshal(rec.Body.Bytes(), &st)
+			st.Version = version
+			_ = json.NewEncoder(w).Encode(st)
+		})
+	}
+	fw.srv = httptest.NewServer(h)
+	url := fw.srv.URL
+	fw.w.SetRunner(func(ctx context.Context, msg worker.Message, emit func(worker.Event)) (*claude.Turn, error) {
+		return fw.claude.run(ctx, msg, emit, url)
+	})
 	fw.starts++
 	return true
 }
@@ -623,19 +653,71 @@ func (fw *fakeWorker) follow(w http.ResponseWriter, r *http.Request, url string,
 // fakeClaudeRunner scripts Claude inside the fake workers: it reports the
 // session ID (the one being resumed, or testSessionID), runs one tool, and
 // answers "you said <text>". With block set, it waits after the tool until
-// the channel is closed or it is stopped.
+// the channel is closed or it is stopped. With toolCalls set, it then calls
+// those Mosso tools through the worker's API, as Claude Code's MCP client
+// would (after gate is closed, if set), and keeps the answers.
 type fakeClaudeRunner struct {
-	mu      sync.Mutex
-	tasks   []worker.Message
-	block   chan struct{}
-	started chan struct{} // receives once per run that starts
-	fail    bool          // report an error result, like an expired token
+	mu        sync.Mutex
+	tasks     []worker.Message
+	block     chan struct{}
+	started   chan struct{} // receives once per run that starts
+	fail      bool          // report an error result, like an expired token
+	toolCalls []worker.CallRequest
+	gate      chan struct{}
+	answers   []toolAnswer
 }
 
-func (fc *fakeClaudeRunner) run(ctx context.Context, msg worker.Message, emit func(worker.Event)) (*claude.Turn, error) {
+// toolAnswer is what one tool call returned to the fake Claude.
+type toolAnswer struct {
+	name string
+	ans  worker.CallAnswer
+	err  error
+}
+
+// result decodes a successful answer's result.
+func (a toolAnswer) result(t *testing.T) map[string]any {
+	t.Helper()
+	if a.err != nil || a.ans.Error != "" {
+		t.Fatalf("%s failed: %v %s", a.name, a.err, a.ans.Error)
+	}
+	var out map[string]any
+	if err := json.Unmarshal(a.ans.Result, &out); err != nil {
+		t.Fatalf("%s: %v: %s", a.name, err, a.ans.Result)
+	}
+	return out
+}
+
+// failure is the error a call returned, "" if none.
+func (a toolAnswer) failure() string {
+	if a.err != nil {
+		return a.err.Error()
+	}
+	return a.ans.Error
+}
+
+// script sets the tool calls the next runs make, and forgets earlier
+// answers.
+func (fc *fakeClaudeRunner) script(calls ...worker.CallRequest) {
+	fc.mu.Lock()
+	defer fc.mu.Unlock()
+	fc.toolCalls, fc.answers = calls, nil
+}
+
+func (fc *fakeClaudeRunner) toolAnswers() []toolAnswer {
+	fc.mu.Lock()
+	defer fc.mu.Unlock()
+	return slices.Clone(fc.answers)
+}
+
+// call is a tool call for script.
+func call(name, args string) worker.CallRequest {
+	return worker.CallRequest{Name: name, Arguments: json.RawMessage(args)}
+}
+
+func (fc *fakeClaudeRunner) run(ctx context.Context, msg worker.Message, emit func(worker.Event), workerURL string) (*claude.Turn, error) {
 	fc.mu.Lock()
 	fc.tasks = append(fc.tasks, msg)
-	block, started, fail := fc.block, fc.started, fc.fail
+	block, started, fail, calls, gate := fc.block, fc.started, fc.fail, fc.toolCalls, fc.gate
 	fc.mu.Unlock()
 	if started != nil {
 		started <- struct{}{}
@@ -647,6 +729,29 @@ func (fc *fakeClaudeRunner) run(ctx context.Context, msg worker.Message, emit fu
 	emit(worker.Event{Type: worker.EventSession, SessionID: sid})
 	emit(worker.Event{Type: worker.EventClaude, Event: &claude.Event{Type: "tool_use", ToolUseID: "toolu_1", Name: "Bash", Input: json.RawMessage(`{"command":"ls"}`)}})
 	emit(worker.Event{Type: worker.EventClaude, Event: &claude.Event{Type: "tool_result", ToolUseID: "toolu_1", Content: "README.md"}})
+	if gate != nil && len(calls) > 0 {
+		select {
+		case <-gate:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	for i, c := range calls {
+		id := fmt.Sprintf("toolu_mcp_%d", i)
+		emit(worker.Event{Type: worker.EventClaude, Event: &claude.Event{Type: "tool_use", ToolUseID: id, Name: "mcp__mosso__" + c.Name, Input: c.Arguments}})
+		ans, err := worker.CallTool(ctx, workerURL, c.Name, c.Arguments)
+		fc.mu.Lock()
+		fc.answers = append(fc.answers, toolAnswer{name: c.Name, ans: ans, err: err})
+		fc.mu.Unlock()
+		content := string(ans.Result)
+		if err != nil || ans.Error != "" {
+			content = ans.Error
+			if err != nil {
+				content = err.Error()
+			}
+		}
+		emit(worker.Event{Type: worker.EventClaude, Event: &claude.Event{Type: "tool_result", ToolUseID: id, Content: content, IsError: err != nil || ans.Error != ""}})
+	}
 	if block != nil {
 		select {
 		case <-block:

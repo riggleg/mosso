@@ -13,6 +13,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -50,21 +52,36 @@ var ErrBranchMoved = errors.New("the working branch on GitHub has commits that a
 // Sandbox API. The token therefore never enters the sandbox, where Claude
 // and repository code run.
 //
-// The working branch is the only ref Mosso ever pushes, and pushes use
-// --force-with-lease so a rebased branch replaces only what Mosso itself
-// published. Methods are safe for concurrent use and run one at a time.
+// The Mirror keeps the sandbox's refs/remotes/origin/* current for the
+// branches it tracks: the base branch, the working branch, and the extra
+// branches added with Fetch or Push (other base branches, the agent's other
+// head branches). Mosso only ever pushes the workspace's own branches: the
+// working branch, and branches named after it (see OwnBranch). Publish may
+// replace the working branch with --force-with-lease after a rebase; Push,
+// which the agent asks for, only ever fast-forwards. Methods are safe for
+// concurrent use and run one at a time.
 type Mirror struct {
-	vc      *vercel.Client
+	vc   *vercel.Client
+	opts MirrorOptions
+
+	// session is the sandbox session commands run in. It has its own
+	// lock so pointing the Mirror at a resumed session never waits for a
+	// Git operation in progress.
+	sessMu  sync.Mutex
 	session string
-	opts    MirrorOptions
 
 	mu     sync.Mutex
-	local  string          // bare repository on the server; "" until first use
-	closed bool            // Close was called
-	known  map[string]bool // commits the sandbox is known to have
-	seen   Heads           // the heads the sandbox's origin refs were last set to
-	pushed string          // the working branch head Mosso last pushed
+	local  string            // bare repository on the server; "" until first use
+	closed bool              // Close was called
+	known  map[string]bool   // commits the sandbox is known to have
+	extra  []string          // tracked branches besides the base and working branch
+	seen   map[string]string // branch -> the head the sandbox's origin/<branch> was last set to
+	pushed string            // the working branch head Mosso last pushed
 }
+
+// MaxExtraBranches bounds the branches a Mirror tracks besides the base and
+// working branch, so syncing before each turn stays quick.
+const MaxExtraBranches = 20
 
 // MirrorOptions describes a workspace.
 type MirrorOptions struct {
@@ -76,6 +93,9 @@ type MirrorOptions struct {
 	// Pushed is the working branch head Mosso last pushed, when a saved
 	// workspace is restored; empty for a new one.
 	Pushed string
+	// Extra are the other branches the Mirror tracks, when a saved
+	// workspace is restored (see Fetch and Push).
+	Extra []string
 }
 
 // Heads are the base and working branch heads on GitHub. Branch is "" while
@@ -83,6 +103,24 @@ type MirrorOptions struct {
 type Heads struct {
 	Base   string `json:"base"`
 	Branch string `json:"branch,omitempty"`
+}
+
+// ownSuffix is what may follow "<working branch>-" in the name of another
+// of the workspace's head branches.
+var ownSuffix = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,49}$`)
+
+// OwnBranch reports whether branch belongs to the workspace whose working
+// branch is working: it is the working branch itself, or the working branch
+// followed by "-" and a short suffix (letters, digits, ".", "_", "-"), such
+// as "mosso/0a1b2c3d4e5f-uat". These are the only branches Mosso pushes for
+// the workspace. Working branches are random, so one workspace's branches
+// never match another's.
+func OwnBranch(working, branch string) bool {
+	if branch == working {
+		return ValidBranch(branch)
+	}
+	suffix, ok := strings.CutPrefix(branch, working+"-")
+	return ok && ownSuffix.MatchString(suffix) && ValidBranch(branch)
 }
 
 // NewMirror returns the Mirror of a workspace whose checkout was just
@@ -101,12 +139,48 @@ func NewMirror(vc *vercel.Client, sandboxSession string, opts MirrorOptions) (*M
 	case opts.Pushed != "" && !shaPattern.MatchString(opts.Pushed):
 		return nil, errors.New("mirror: invalid pushed commit")
 	}
-	return &Mirror{
+	m := &Mirror{
 		vc: vc, session: sandboxSession, opts: opts,
 		known:  map[string]bool{opts.BaseSHA: true},
-		seen:   Heads{Base: opts.BaseSHA},
+		seen:   map[string]string{opts.Base: opts.BaseSHA},
 		pushed: opts.Pushed,
-	}, nil
+	}
+	m.opts.Extra = nil
+	for _, b := range opts.Extra {
+		if !ValidBranch(b) {
+			return nil, errors.New("mirror: invalid extra branch")
+		}
+		if err := m.track(b); err != nil {
+			return nil, err
+		}
+	}
+	return m, nil
+}
+
+// track adds branch to the tracked branches, if it is not one already.
+func (m *Mirror) track(branch string) error {
+	if slices.Contains(m.tracked(), branch) {
+		return nil
+	}
+	if len(m.extra) >= MaxExtraBranches {
+		return fmt.Errorf("Mosso keeps at most %d extra branches per workspace in sync, and this one has that many", MaxExtraBranches)
+	}
+	m.extra = append(m.extra, branch)
+	return nil
+}
+
+// tracked returns every branch the Mirror keeps current: the base branch,
+// the working branch, then the extra ones.
+func (m *Mirror) tracked() []string {
+	return append([]string{m.opts.Base, m.opts.Branch}, m.extra...)
+}
+
+// Branches returns the extra branches the Mirror tracks, to save with the
+// workspace.
+func (m *Mirror) Branches() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return slices.Clone(m.extra)
 }
 
 // Options returns the workspace the Mirror was created for.
@@ -115,9 +189,24 @@ func (m *Mirror) Options() MirrorOptions { return m.opts }
 // SetSandboxSession points the Mirror at a new session of the same sandbox,
 // after the sandbox was resumed. The checkout is the same filesystem.
 func (m *Mirror) SetSandboxSession(id string) {
+	m.sessMu.Lock()
+	defer m.sessMu.Unlock()
+	m.session = id
+}
+
+// sandboxSession returns the session commands run in.
+func (m *Mirror) sandboxSession() string {
+	m.sessMu.Lock()
+	defer m.sessMu.Unlock()
+	return m.session
+}
+
+// Pushed returns the working branch head Mosso last pushed, to save with
+// the workspace.
+func (m *Mirror) Pushed() string {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.session = id
+	return m.pushed
 }
 
 // Close removes the server-side repository. Later calls fail.
@@ -143,22 +232,77 @@ type Synced struct {
 // Changed reports whether the sync moved a ref.
 func (s Synced) Changed() bool { return s.Before != s.After }
 
-// Sync fetches the base and working branches from GitHub and sets the
-// sandbox's refs/remotes/origin/<base> and origin/<branch> to them, sending
-// the commits the sandbox lacks. Claude can then rebase onto or merge them
-// without credentials. Nothing else in the checkout changes.
+// Sync fetches the tracked branches from GitHub and sets the sandbox's
+// refs/remotes/origin/<branch> to them, sending the commits the sandbox
+// lacks. Claude can then rebase onto or merge them without credentials.
+// Nothing else in the checkout changes. The result reports the base and
+// working branches.
 func (m *Mirror) Sync(ctx context.Context, tok Token) (Synced, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	before := m.seen
-	heads, err := m.fetch(ctx, tok)
+	before := m.headsLocked()
+	heads, err := m.fetch(ctx, tok, m.tracked())
 	if err != nil {
 		return Synced{Before: before, After: before}, err
 	}
-	if err := m.send(ctx, heads); err != nil {
+	if err := m.sendRequired(ctx, heads); err != nil {
 		return Synced{Before: before, After: before}, err
 	}
-	return Synced{Before: before, After: heads}, nil
+	return Synced{Before: before, After: m.headsLocked()}, nil
+}
+
+// headsLocked returns the base and working branch heads the sandbox was
+// last shown.
+func (m *Mirror) headsLocked() Heads {
+	return Heads{Base: m.seen[m.opts.Base], Branch: m.seen[m.opts.Branch]}
+}
+
+// Fetch fetches branches from GitHub into the sandbox's
+// refs/remotes/origin/<branch>, and keeps them current there from then on
+// (see Sync), along with every other tracked branch. It returns the
+// branches' heads; a branch that does not exist on GitHub is "" and is not
+// tracked.
+func (m *Mirror) Fetch(ctx context.Context, tok Token, branches ...string) (map[string]string, error) {
+	for _, b := range branches {
+		switch {
+		case !ValidBranch(b):
+			return nil, fmt.Errorf("fetch: %q is not a branch name Mosso accepts", b)
+		case strings.HasPrefix(b, BranchPrefix) && !OwnBranch(m.opts.Branch, b):
+			return nil, fmt.Errorf("fetch: %s belongs to another Mosso workspace", b)
+		}
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	names := m.tracked()
+	for _, b := range branches {
+		if !slices.Contains(names, b) {
+			names = append(names, b)
+		}
+	}
+	heads, err := m.fetch(ctx, tok, names)
+	if err != nil {
+		return nil, err
+	}
+	out := map[string]string{}
+	var add []string
+	for _, b := range branches {
+		out[b] = heads[b]
+		if heads[b] != "" && !slices.Contains(m.tracked(), b) {
+			if len(m.extra)+len(add) >= MaxExtraBranches {
+				return nil, fmt.Errorf("Mosso keeps at most %d extra branches per workspace in sync, and this one has that many", MaxExtraBranches)
+			}
+			add = append(add, b)
+		}
+	}
+	// Tracked only once the sandbox has them, so a branch that cannot be
+	// sent is not kept.
+	if err := m.sendRequired(ctx, heads, branches...); err != nil {
+		return nil, err
+	}
+	for _, b := range add {
+		_ = m.track(b)
+	}
+	return out, nil
 }
 
 // PublishOptions describes the pull request to publish.
@@ -205,25 +349,23 @@ func (m *Mirror) Publish(ctx context.Context, gh *Client, opts PublishOptions) (
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	heads, err := m.fetch(ctx, tok)
+	heads, err := m.fetch(ctx, tok, m.tracked())
 	if err != nil {
 		return nil, err
 	}
-	if err := m.send(ctx, heads); err != nil {
+	if err := m.sendRequired(ctx, heads); err != nil {
 		return nil, err
 	}
-	have := []string{heads.Base}
-	if heads.Branch != "" {
-		have = append(have, heads.Branch)
-	}
-	head, err := m.receive(ctx, message, have)
+	base, branch := heads[m.opts.Base], heads[m.opts.Branch]
+	have := haveCommits(heads)
+	head, _, err := m.receive(ctx, message, "HEAD", have)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("publish: %w", err)
 	}
 
 	out := &Published{Branch: m.opts.Branch, Commit: head}
-	if heads.Branch == "" {
-		n, err := m.git(ctx, nil, "", "rev-list", "--count", head, "^"+heads.Base)
+	if branch == "" {
+		n, err := m.git(ctx, nil, "", "rev-list", "--count", head, "^"+base)
 		if err != nil {
 			return nil, fmt.Errorf("publish: %w", err)
 		}
@@ -231,9 +373,9 @@ func (m *Mirror) Publish(ctx context.Context, gh *Client, opts PublishOptions) (
 			return nil, ErrNoChanges
 		}
 	}
-	if head != heads.Branch {
-		if heads.Branch != "" && !m.isAncestor(ctx, heads.Branch, head) {
-			if heads.Branch != m.pushed {
+	if head != branch {
+		if branch != "" && !m.isAncestor(ctx, branch, head) {
+			if branch != m.pushed {
 				return nil, fmt.Errorf("%w. Mosso has fetched it as origin/%s in the sandbox: ask Claude to rebase onto or merge origin/%s, then publish again", ErrBranchMoved, m.opts.Branch, m.opts.Branch)
 			}
 			out.Forced = true
@@ -242,92 +384,205 @@ func (m *Mirror) Publish(ctx context.Context, gh *Client, opts PublishOptions) (
 		if err := m.checkSecrets(ctx, head, have, secrets); err != nil {
 			return nil, err
 		}
-		if err := m.push(ctx, tok, head, heads.Branch); err != nil {
+		if err := m.push(ctx, tok, m.opts.Branch, head, branch); err != nil {
 			return nil, err
 		}
 		m.pushed = head
-		heads.Branch = head
+		heads[m.opts.Branch] = head
 		_, _ = m.git(ctx, nil, "", "update-ref", "refs/remotes/origin/"+m.opts.Branch, head)
 		// Show the sandbox the published branch; it already has the commit.
 		_ = m.send(ctx, heads)
 	}
 
-	pr, err := gh.openPullRequest(ctx, m.opts.Repo, m.opts.Branch, m.opts.Base)
+	pr, created, err := gh.OpenPullRequest(ctx, m.opts.Repo, NewPullRequest{
+		Title: opts.Title, Body: opts.Body, Head: m.opts.Branch, Base: m.opts.Base, Draft: opts.Draft,
+	})
 	if err != nil {
 		return nil, err
 	}
-	if pr == nil {
-		body := opts.Body
-		if strings.TrimSpace(body) == "" {
-			body = "Created with Mosso."
-		}
-		pr, err = gh.createPullRequest(ctx, m.opts.Repo, NewPullRequest{
-			Title: opts.Title, Body: body, Head: m.opts.Branch, Base: m.opts.Base, Draft: opts.Draft,
-		})
-		if err != nil {
-			return nil, err
-		}
-		out.Created = true
-	}
-	out.PullRequest = *pr
+	out.PullRequest, out.Created = *pr, created
 	return out, nil
 }
 
-// fetch brings the base and working branches from GitHub into the server's
-// repository, as refs/remotes/origin/*, and returns their heads.
-func (m *Mirror) fetch(ctx context.Context, tok Token) (Heads, error) {
-	if err := m.init(ctx); err != nil {
-		return Heads{}, err
-	}
-	baseRef, branchRef := "refs/heads/"+m.opts.Base, "refs/heads/"+m.opts.Branch
-	out, err := m.git(ctx, nil, tok, "ls-remote", "--", repoURL(m.opts.Repo), baseRef, branchRef)
-	if err != nil {
-		return Heads{}, gitHubError("fetch from GitHub", m.opts.Repo, err)
-	}
-	var heads Heads
-	for _, line := range strings.Split(out, "\n") {
-		sha, ref, _ := strings.Cut(line, "\t")
-		switch {
-		case !shaPattern.MatchString(sha):
-		case ref == baseRef:
-			heads.Base = sha
-		case ref == branchRef:
-			heads.Branch = sha
+// haveCommits returns the branch heads that exist, for bundles and secret
+// checks: commits GitHub already has.
+func haveCommits(heads map[string]string) []string {
+	var have []string
+	for _, sha := range heads {
+		if sha != "" && !slices.Contains(have, sha) {
+			have = append(have, sha)
 		}
 	}
-	if heads.Base == "" {
-		return Heads{}, fmt.Errorf("fetch from GitHub: the base branch %s no longer exists in %s", m.opts.Base, m.opts.Repo)
+	slices.Sort(have)
+	return have
+}
+
+// PushOptions describes a push the agent asked for.
+type PushOptions struct {
+	// Branch is the branch on GitHub to push to: the working branch, or
+	// another of the workspace's own branches (see OwnBranch).
+	Branch string
+	// Source is what to push from the sandbox: "HEAD" (the default) or
+	// a local branch name. Uncommitted changes are not pushed.
+	Source string
+	// Secrets must not appear in any pushed commit. The token is always
+	// checked.
+	Secrets []string
+}
+
+// Pushed is the outcome of a Push.
+type Pushed struct {
+	Branch string `json:"branch"`
+	// Commit is the branch's head on GitHub after the push.
+	Commit string `json:"commit"`
+	// Previous is the branch's head on GitHub before, "" if it was new.
+	Previous string `json:"previous,omitempty"`
+	// Updated is false when GitHub already had exactly this commit.
+	Updated bool `json:"updated"`
+	// Dirty reports uncommitted changes in the sandbox's checkout, which
+	// were not pushed.
+	Dirty bool `json:"dirty,omitempty"`
+}
+
+// ErrNotFastForward means a push would replace commits on GitHub: Push
+// never force-pushes.
+var ErrNotFastForward = errors.New("the push is not a fast-forward")
+
+// Push pushes a commit from the sandbox (HEAD or a local branch) to one of
+// the workspace's own branches on GitHub, creating it if needed, and tracks
+// that branch from then on. It never commits for the agent, never pushes
+// to any other branch, and never rewrites history: if the branch on GitHub
+// has commits the pushed one does not contain, it fails with
+// ErrNotFastForward and leaves everything as it was. The same checks as
+// Publish apply: the commits are fsck'd, refused if they contain a
+// credential, and pushed with a lease.
+func (m *Mirror) Push(ctx context.Context, tok Token, opts PushOptions) (*Pushed, error) {
+	source := opts.Source
+	if source == "" {
+		source = "HEAD"
 	}
-	refspecs := []string{}
-	if !m.hasCommit(ctx, heads.Base) {
-		refspecs = append(refspecs, "+"+baseRef+":refs/remotes/origin/"+m.opts.Base)
+	switch {
+	case !OwnBranch(m.opts.Branch, opts.Branch):
+		return nil, fmt.Errorf("push: Mosso only pushes this workspace's own branches: %s, or %s-<suffix> (suffix: letters, digits, '.', '_' or '-'), not %q", m.opts.Branch, m.opts.Branch, opts.Branch)
+	case source != "HEAD" && !ValidBranch(source):
+		return nil, fmt.Errorf("push: source must be HEAD or a local branch name, not %q", source)
 	}
-	if heads.Branch != "" && !m.hasCommit(ctx, heads.Branch) {
-		refspecs = append(refspecs, "+"+branchRef+":refs/remotes/origin/"+m.opts.Branch)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	names := m.tracked()
+	if !slices.Contains(names, opts.Branch) {
+		if len(m.extra) >= MaxExtraBranches {
+			return nil, fmt.Errorf("push: Mosso keeps at most %d extra branches per workspace in sync, and this one has that many: push to one of its existing branches", MaxExtraBranches)
+		}
+		names = append(names, opts.Branch)
+	}
+	heads, err := m.fetch(ctx, tok, names)
+	if err != nil {
+		return nil, err
+	}
+	if err := m.sendRequired(ctx, heads, opts.Branch); err != nil {
+		return nil, err
+	}
+	have := haveCommits(heads)
+	head, dirty, err := m.receive(ctx, "", source, have)
+	if err != nil {
+		return nil, fmt.Errorf("push: %w", err)
+	}
+	remote := heads[opts.Branch]
+	out := &Pushed{Branch: opts.Branch, Commit: head, Previous: remote, Dirty: dirty}
+	if head == remote {
+		_ = m.track(opts.Branch)
+		return out, nil
+	}
+	if remote != "" && !m.isAncestor(ctx, remote, head) {
+		hint := ""
+		if opts.Branch == m.opts.Branch {
+			hint = ", or ask the user to click Update PR in Mosso, which may replace a branch Mosso itself pushed"
+		}
+		return nil, fmt.Errorf("push: %w: %s on GitHub (%s) has commits that %s (%s) does not contain, and Mosso does not force-push for agents. Mosso has fetched it as origin/%s in the sandbox: rebase onto or merge it, then push again; or push to a new branch (%s-<suffix>)%s",
+			ErrNotFastForward, opts.Branch, short(remote), source, short(head), opts.Branch, m.opts.Branch, hint)
+	}
+	secrets := append([]string{tok.Reveal()}, opts.Secrets...)
+	if err := m.checkSecrets(ctx, head, have, secrets); err != nil {
+		return nil, err
+	}
+	if err := m.push(ctx, tok, opts.Branch, head, remote); err != nil {
+		return nil, err
+	}
+	if opts.Branch == m.opts.Branch {
+		m.pushed = head
+	}
+	out.Updated = true
+	_ = m.track(opts.Branch)
+	heads[opts.Branch] = head
+	_, _ = m.git(ctx, nil, "", "update-ref", "refs/remotes/origin/"+opts.Branch, head)
+	// Show the sandbox the pushed branch; it already has the commit.
+	_ = m.send(ctx, heads)
+	return out, nil
+}
+
+func short(sha string) string {
+	if len(sha) > 12 {
+		return sha[:12]
+	}
+	return sha
+}
+
+// fetch brings branches from GitHub into the server's repository, as
+// refs/remotes/origin/*, and returns their heads: "" for a branch that does
+// not exist on GitHub (its ref is removed). The base branch must exist.
+func (m *Mirror) fetch(ctx context.Context, tok Token, names []string) (map[string]string, error) {
+	if err := m.init(ctx); err != nil {
+		return nil, err
+	}
+	args := []string{"ls-remote", "--", repoURL(m.opts.Repo)}
+	heads := map[string]string{}
+	for _, b := range names {
+		args = append(args, "refs/heads/"+b)
+		heads[b] = ""
+	}
+	out, err := m.git(ctx, nil, tok, args...)
+	if err != nil {
+		return nil, gitHubError("fetch from GitHub", m.opts.Repo, err)
+	}
+	for _, line := range strings.Split(out, "\n") {
+		sha, ref, _ := strings.Cut(line, "\t")
+		name, ok := strings.CutPrefix(ref, "refs/heads/")
+		if _, wanted := heads[name]; ok && wanted && shaPattern.MatchString(sha) {
+			heads[name] = sha
+		}
+	}
+	if base, ok := heads[m.opts.Base]; ok && base == "" {
+		return nil, fmt.Errorf("fetch from GitHub: the base branch %s no longer exists in %s", m.opts.Base, m.opts.Repo)
+	}
+	var refspecs []string
+	for _, b := range names {
+		if h := heads[b]; h != "" && !m.hasCommit(ctx, h) {
+			refspecs = append(refspecs, "+refs/heads/"+b+":refs/remotes/origin/"+b)
+		}
 	}
 	if len(refspecs) > 0 {
 		args := append([]string{"fetch", "--quiet", "--no-tags", "--no-write-fetch-head", "--", repoURL(m.opts.Repo)}, refspecs...)
 		if _, err := m.git(ctx, nil, tok, args...); err != nil {
-			return Heads{}, gitHubError("fetch from GitHub", m.opts.Repo, err)
+			return nil, gitHubError("fetch from GitHub", m.opts.Repo, err)
 		}
 		// If a branch was force-pushed between ls-remote and fetch, the
 		// head ls-remote reported may not have arrived.
-		for _, h := range []*string{&heads.Base, &heads.Branch} {
-			if *h != "" && !m.hasCommit(ctx, *h) {
-				return Heads{}, errors.New("fetch from GitHub: the branch changed while fetching; try again")
+		for _, h := range heads {
+			if h != "" && !m.hasCommit(ctx, h) {
+				return nil, errors.New("fetch from GitHub: the branch changed while fetching; try again")
 			}
 		}
 	}
 	// Record the heads so later bundles and secret checks can use them.
-	if _, err := m.git(ctx, nil, "", "update-ref", "refs/remotes/origin/"+m.opts.Base, heads.Base); err != nil {
-		return Heads{}, err
-	}
-	if heads.Branch != "" {
-		if _, err := m.git(ctx, nil, "", "update-ref", "refs/remotes/origin/"+m.opts.Branch, heads.Branch); err != nil {
-			return Heads{}, err
+	for _, b := range names {
+		if h := heads[b]; h != "" {
+			if _, err := m.git(ctx, nil, "", "update-ref", "refs/remotes/origin/"+b, h); err != nil {
+				return nil, err
+			}
+		} else {
+			_, _ = m.git(ctx, nil, "", "update-ref", "-d", "refs/remotes/origin/"+b)
 		}
-	} else {
-		_, _ = m.git(ctx, nil, "", "update-ref", "-d", "refs/remotes/origin/"+m.opts.Branch)
 	}
 	return heads, nil
 }
@@ -358,9 +613,32 @@ const uploadScript = `set -euo pipefail
 f=$1; shift
 printf '%s' "$@" >> "$f"`
 
-// send points the sandbox's origin refs at heads, first uploading a bundle
-// of the commits the sandbox does not have yet.
-func (m *Mirror) send(ctx context.Context, heads Heads) error {
+// sendRequired sends heads to the sandbox like send. If that fails, it
+// tries again with only the base branch, the working branch and the
+// required ones, so an extra branch that cannot be sent (one that grew past
+// the size limit, say) does not stop syncs, publishes and pushes; its
+// origin ref in the sandbox is then left as it was.
+func (m *Mirror) sendRequired(ctx context.Context, heads map[string]string, required ...string) error {
+	err := m.send(ctx, heads)
+	if err == nil || ctx.Err() != nil {
+		return err
+	}
+	keep := append([]string{m.opts.Base, m.opts.Branch}, required...)
+	core := map[string]string{}
+	for b, h := range heads {
+		if slices.Contains(keep, b) {
+			core[b] = h
+		}
+	}
+	if len(core) == len(heads) {
+		return err
+	}
+	return m.send(ctx, core)
+}
+
+// send points the sandbox's origin refs at heads ("" removes one), first
+// uploading a bundle of the commits the sandbox does not have yet.
+func (m *Mirror) send(ctx context.Context, heads map[string]string) error {
 	err := m.sendWith(ctx, heads, true)
 	if err != nil && strings.Contains(err.Error(), "prerequisite") {
 		// The sandbox lost a commit Mosso thought it had (Claude may
@@ -371,19 +649,28 @@ func (m *Mirror) send(ctx context.Context, heads Heads) error {
 	if err != nil {
 		return fmt.Errorf("update the sandbox's origin branches: %w", err)
 	}
-	for _, h := range []string{heads.Base, heads.Branch} {
+	for b, h := range heads {
 		if h != "" {
 			m.known[h] = true
+			m.seen[b] = h
+		} else {
+			delete(m.seen, b)
 		}
 	}
-	m.seen = heads
 	return nil
 }
 
-func (m *Mirror) sendWith(ctx context.Context, heads Heads, incremental bool) error {
-	refs := []string{"refs/remotes/origin/" + m.opts.Base}
-	if heads.Branch != "" {
-		refs = append(refs, "refs/remotes/origin/"+m.opts.Branch)
+func (m *Mirror) sendWith(ctx context.Context, heads map[string]string, incremental bool) error {
+	names := make([]string, 0, len(heads))
+	for b := range heads {
+		names = append(names, b)
+	}
+	slices.Sort(names)
+	var refs []string
+	for _, b := range names {
+		if heads[b] != "" {
+			refs = append(refs, "refs/remotes/origin/"+b)
+		}
 	}
 	var exclude []string
 	if incremental {
@@ -418,13 +705,17 @@ func (m *Mirror) sendWith(ctx context.Context, heads Heads, incremental bool) er
 			return err
 		}
 	}
-	branchSHA := heads.Branch
-	if branchSHA == "" {
-		branchSHA = "-"
+	args := []string{"-c", applyScript, "apply", path}
+	for _, b := range names {
+		sha := heads[b]
+		if sha == "" {
+			sha = "-"
+		}
+		args = append(args, b, sha)
 	}
-	res, err := m.vc.Run(ctx, m.session, vercel.Command{
+	res, err := m.vc.Run(ctx, m.sandboxSession(), vercel.Command{
 		Name: "bash",
-		Args: []string{"-c", applyScript, "apply", path, m.opts.Base, heads.Base, m.opts.Branch, branchSHA},
+		Args: args,
 		Cwd:  m.opts.Dir,
 		// send matches Git's English "prerequisite" message.
 		Env: map[string]string{"LC_ALL": "C"},
@@ -447,7 +738,7 @@ func (m *Mirror) upload(ctx context.Context, path, data string) error {
 			args = append(args, data[:n])
 			data = data[n:]
 		}
-		res, err := m.vc.Run(ctx, m.session, vercel.Command{Name: "bash", Args: args})
+		res, err := m.vc.Run(ctx, m.sandboxSession(), vercel.Command{Name: "bash", Args: args})
 		if err != nil {
 			return err
 		}
@@ -458,37 +749,48 @@ func (m *Mirror) upload(ctx context.Context, path, data string) error {
 	return nil
 }
 
-// bundleScript refuses to run in the middle of a rebase or merge, commits
-// any uncommitted work (hooks and signing disabled: they are not Mosso's to
-// run), prints HEAD, then the base64 of a bundle of the commits that are not
-// in the given commits, if there are any.
+// bundleScript refuses to run in the middle of a rebase or merge; with
+// commit=1, commits any uncommitted work (hooks and signing disabled: they
+// are not Mosso's to run); prints the commit of src (HEAD or a local
+// branch) and whether the checkout has uncommitted changes, then the base64
+// of a bundle of the commits that are not in the given commits, if there
+// are any.
 const bundleScript = `set -euo pipefail
-msg=$1 max=$2; shift 2
+msg=$1 max=$2 src=$3 commit=$4; shift 4
 gitdir=$(git rev-parse --git-dir)
 for f in rebase-merge rebase-apply MERGE_HEAD CHERRY_PICK_HEAD REVERT_HEAD; do
   if [ -e "$gitdir/$f" ]; then
-    echo "a rebase, merge, cherry-pick or revert is in progress in the sandbox; ask Claude to finish it (or abort it), then publish again" >&2
+    echo "a rebase, merge, cherry-pick or revert is in progress in the sandbox: finish it (or abort it), then try again" >&2
     exit 3
   fi
 done
 if [ -n "$(git diff --name-only --diff-filter=U)" ]; then
-  echo "the sandbox has unresolved merge conflicts; ask Claude to resolve them, then publish again" >&2
+  echo "the sandbox has unresolved merge conflicts: resolve them, then try again" >&2
   exit 3
 fi
-git add -A
-if ! git diff --cached --quiet; then
-  git -c core.hooksPath=/dev/null -c commit.gpgsign=false commit --quiet --no-verify -m "$msg"
+if [ "$commit" = 1 ]; then
+  git add -A
+  if ! git diff --cached --quiet; then
+    git -c core.hooksPath=/dev/null -c commit.gpgsign=false commit --quiet --no-verify -m "$msg"
+  fi
 fi
-head=$(git rev-parse --verify 'HEAD^{commit}')
-echo "$head"
+ref=HEAD
+if [ "$src" != HEAD ]; then ref="refs/heads/$src"; fi
+if ! head=$(git rev-parse --verify --quiet "$ref^{commit}"); then
+  echo "there is no local branch $src in the sandbox's checkout" >&2
+  exit 3
+fi
+state=clean
+if [ -n "$(git status --porcelain)" ]; then state=dirty; fi
+echo "$head $state"
 not=()
 for c in "$@"; do
   if git cat-file -e "$c^{commit}" 2>/dev/null; then not+=("^$c"); fi
 done
-if [ "$(git rev-list --count HEAD ${not[@]+"${not[@]}"})" -gt 0 ]; then
+if [ "$(git rev-list --count "$head" ${not[@]+"${not[@]}"})" -gt 0 ]; then
   tmp=$(mktemp)
   trap 'rm -f "$tmp"' EXIT
-  git bundle create --quiet "$tmp" HEAD ${not[@]+"${not[@]}"} >&2
+  git bundle create --quiet "$tmp" "$ref" ${not[@]+"${not[@]}"} >&2
   size=$(($(wc -c < "$tmp")))
   if [ "$size" -gt "$max" ]; then
     echo "the new commits are $size bytes as a bundle, more than the $max-byte limit" >&2
@@ -498,54 +800,66 @@ if [ "$(git rev-list --count HEAD ${not[@]+"${not[@]}"})" -gt 0 ]; then
   echo
 fi`
 
-// receive commits in the sandbox and brings its new commits into the
-// server's repository. It returns the sandbox's HEAD.
-func (m *Mirror) receive(ctx context.Context, message string, have []string) (string, error) {
-	res, err := m.vc.Run(ctx, m.session, vercel.Command{
+// receive brings the commit of source (HEAD or a local branch) and its
+// history from the sandbox into the server's repository, and returns it
+// and whether the checkout has uncommitted changes. With a message, it
+// first commits any uncommitted work in the sandbox with that message.
+func (m *Mirror) receive(ctx context.Context, message, source string, have []string) (string, bool, error) {
+	commit := "0"
+	if message != "" {
+		commit = "1"
+	}
+	res, err := m.vc.Run(ctx, m.sandboxSession(), vercel.Command{
 		Name:           "bash",
-		Args:           append([]string{"-c", bundleScript, "bundle", message, strconv.Itoa(MaxPublishBytes)}, have...),
+		Args:           append([]string{"-c", bundleScript, "bundle", message, strconv.Itoa(MaxPublishBytes), source, commit}, have...),
 		Cwd:            m.opts.Dir,
 		MaxOutputBytes: MaxPublishBytes/3*4 + 1<<20,
 	})
 	if err != nil {
-		return "", fmt.Errorf("commit in sandbox: %w", err)
+		return "", false, fmt.Errorf("read the sandbox's commits: %w", err)
 	}
 	if res.ExitCode == 3 {
-		return "", fmt.Errorf("publish: %s", tail(res.Stderr))
+		return "", false, errors.New(tail(res.Stderr))
 	}
 	if res.ExitCode != 0 {
-		return "", fmt.Errorf("commit in sandbox: exit code %d: %s", res.ExitCode, tail(res.Stderr))
+		return "", false, fmt.Errorf("read the sandbox's commits: exit code %d: %s", res.ExitCode, tail(res.Stderr))
 	}
-	head, data, _ := strings.Cut(strings.TrimSpace(res.Stdout), "\n")
-	if !shaPattern.MatchString(head) {
-		return "", fmt.Errorf("commit in sandbox: unexpected output %q", tail(head))
+	first, data, _ := strings.Cut(strings.TrimSpace(res.Stdout), "\n")
+	head, state, _ := strings.Cut(first, " ")
+	if !shaPattern.MatchString(head) || (state != "clean" && state != "dirty") {
+		return "", false, fmt.Errorf("read the sandbox's commits: unexpected output %q", tail(first))
 	}
+	dirty := state == "dirty"
 	m.known[head] = true
 	if data == "" {
 		if !m.hasCommit(ctx, head) {
-			return "", errors.New("publish: the sandbox's HEAD is not a commit Mosso knows; try again")
+			return "", false, errors.New("the sandbox's commit is not one Mosso knows; try again")
 		}
-		return head, nil
+		return head, dirty, nil
 	}
 	bundle, err := base64.StdEncoding.DecodeString(strings.TrimSpace(data))
 	if err != nil {
-		return "", fmt.Errorf("read commits from sandbox: %w", err)
+		return "", false, fmt.Errorf("read the sandbox's commits: %w", err)
 	}
 	f := filepath.Join(m.local, "publish.bundle")
 	if err := os.WriteFile(f, bundle, 0o600); err != nil {
-		return "", err
+		return "", false, err
 	}
 	defer os.Remove(f)
+	ref := "HEAD"
+	if source != "HEAD" {
+		ref = "refs/heads/" + source
+	}
 	// fsckObjects: the bundle comes from the sandbox, so check every
 	// object before the server's Git uses it.
 	if _, err := m.git(ctx, nil, "", "-c", "fetch.fsckObjects=true", "fetch", "--quiet", "--no-tags", "--no-write-fetch-head",
-		f, "+HEAD:refs/mosso/head"); err != nil {
-		return "", fmt.Errorf("read commits from sandbox: %w", err)
+		f, "+"+ref+":refs/mosso/head"); err != nil {
+		return "", false, fmt.Errorf("read the sandbox's commits: %w", err)
 	}
 	if got, err := m.git(ctx, nil, "", "rev-parse", "refs/mosso/head"); err != nil || got != head {
-		return "", errors.New("read commits from sandbox: the bundle does not match the sandbox's HEAD")
+		return "", false, errors.New("read the sandbox's commits: the bundle does not match the sandbox's commit")
 	}
-	return head, nil
+	return head, dirty, nil
 }
 
 // checkSecrets refuses to push if any new object (file, tree or commit
@@ -615,11 +929,11 @@ func (m *Mirror) checkSecrets(ctx context.Context, head string, have, secrets []
 	return nil
 }
 
-// push pushes head to the working branch, with a lease on its current head
-// (expect, "" if it must not exist yet): GitHub rejects the push if the
-// branch moved since Mosso fetched it.
-func (m *Mirror) push(ctx context.Context, tok Token, head, expect string) error {
-	ref := "refs/heads/" + m.opts.Branch
+// push pushes head to branch, with a lease on its current head (expect, ""
+// if it must not exist yet): GitHub rejects the push if the branch moved
+// since Mosso fetched it.
+func (m *Mirror) push(ctx context.Context, tok Token, branch, head, expect string) error {
+	ref := "refs/heads/" + branch
 	_, err := m.git(ctx, nil, tok, "push", "--quiet", "--no-verify",
 		"--force-with-lease="+ref+":"+expect, "--", repoURL(m.opts.Repo), head+":"+ref)
 	if err != nil {
@@ -638,7 +952,7 @@ func gitHubError(op, repo string, err error) error {
 	case strings.Contains(lower, "workflow") && strings.Contains(lower, "refusing to allow"):
 		hint = "GitHub refused the push because it changes files in .github/workflows, and Mosso's token deliberately has no Workflows permission. Ask Claude to drop those changes, or push them yourself"
 	case strings.Contains(lower, "stale info") || strings.Contains(lower, "fetch first") || strings.Contains(lower, "non-fast-forward"):
-		hint = "the branch changed on GitHub while Mosso was pushing; publish again"
+		hint = "the branch changed on GitHub while Mosso was pushing; try again"
 	case strings.Contains(lower, "invalid username or token") || strings.Contains(lower, "authentication failed") ||
 		strings.Contains(lower, "returned error: 401") || strings.Contains(lower, "could not read username"):
 		hint = hintExpired
@@ -648,7 +962,7 @@ func gitHubError(op, repo string, err error) error {
 	case strings.Contains(lower, "repository not found") || strings.Contains(lower, "returned error: 404"):
 		hint = "repository " + repo + " was not found, or the GitHub token cannot access it: check the token's Repository access"
 	case strings.Contains(lower, "gh006") || strings.Contains(lower, "gh013") || strings.Contains(lower, "protected branch"):
-		hint = "a branch protection rule or ruleset rejected the push to the working branch"
+		hint = "a branch protection rule or ruleset rejected the push to the workspace's branch"
 	}
 	if hint == "" {
 		return fmt.Errorf("%s: %w", op, err)

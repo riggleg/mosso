@@ -223,13 +223,14 @@ func (l *Log) LastSessionID() string {
 }
 
 // OpenTask returns the ID of the task whose events have not reached a
-// terminal event yet, or "".
+// terminal event yet, or "". A tool call's result can be recorded after
+// its task ended (the server answered late), so it does not reopen one.
 func (l *Log) OpenTask() string {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	for i := len(l.events) - 1; i >= 0; i-- {
 		e := l.events[i]
-		if e.TaskID == "" {
+		if e.TaskID == "" || e.Type == EventToolResult {
 			continue
 		}
 		if e.Terminal() {
@@ -238,4 +239,30 @@ func (l *Log) OpenTask() string {
 		return e.TaskID
 	}
 	return ""
+}
+
+// openCall is a tool call the log has no result for.
+type openCall struct{ id, task string }
+
+// OpenCalls returns the tool calls that have no result in the log.
+func (l *Log) OpenCalls() []openCall {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	var open []openCall
+	done := map[string]bool{}
+	for i := len(l.events) - 1; i >= 0; i-- {
+		e := l.events[i]
+		if e.Call == nil {
+			continue
+		}
+		switch e.Type {
+		case EventToolResult:
+			done[e.Call.ID] = true
+		case EventToolCall:
+			if !done[e.Call.ID] {
+				open = append(open, openCall{id: e.Call.ID, task: e.TaskID})
+			}
+		}
+	}
+	return open
 }

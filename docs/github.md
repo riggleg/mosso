@@ -22,7 +22,7 @@ paste into Mosso.
 2. Click **Open GitHub to create a token**. GitHub opens the token form with
    everything preselected:
 
-   <https://github.com/settings/personal-access-tokens/new?name=Mosso&description=GitHub+access+for+Mosso+coding+workspaces&expires_in=90&contents=write&pull_requests=write>
+   <https://github.com/settings/personal-access-tokens/new?name=Mosso&description=GitHub+access+for+Mosso+coding+workspaces&expires_in=90&contents=write&pull_requests=write&checks=read&statuses=read>
 
    | Setting           | Value |
    | ----------------- | ----- |
@@ -31,6 +31,8 @@ paste into Mosso.
    | Expiration        | 90 days |
    | Contents          | Read and write (clone, fetch, push the `mosso/*` branch) |
    | Pull requests     | Read and write (open and find the pull request) |
+   | Checks            | Read-only (only for Claude's `github_checks`) |
+   | Commit statuses   | Read-only (only for Claude's `github_checks`) |
    | Metadata          | Read (always included) |
 
 3. Under **Repository access**, choose **Only select repositories** and pick
@@ -111,8 +113,12 @@ repository you can. Avoid it.
    the new commits. When the base moved, the chat says so ("Fetched from
    GitHub: origin/main moved …"). Claude is told (in its system prompt) that
    it has no GitHub credentials, that `origin/*` is kept current for it, and
-   that Mosso pushes on publish. Claude can edit, commit, create and switch
-   branches, and rebase onto or merge `origin/<base>`, all locally.
+   that it can push and open pull requests with Mosso's GitHub tools, which
+   run on the Mosso server ([agent-github.md](agent-github.md)). Claude can
+   edit, commit, create and switch branches, and rebase onto or merge
+   `origin/<base>` locally; the tools fetch other branches, push the
+   workspace's own branches (fast-forward only) and open, read and update
+   their pull requests, into any base branch.
 3. **Publish** (`POST /workspaces/{name}/pull-request`):
    1. Mosso fetches from GitHub again and updates the sandbox's `origin/*`.
    2. In the sandbox, it refuses to continue while a rebase, merge,
@@ -148,9 +154,11 @@ has conflicts):
 
 Safety rules for pushes:
 
-- Mosso only ever pushes `HEAD` to the workspace's own `mosso/*` branch. It
-  never pushes to, force-pushes, or merges into the base branch or any other
-  branch.
+- Publishing only ever pushes `HEAD` to the workspace's own `mosso/*`
+  branch. Claude's `github_push` only pushes to the workspace's own
+  branches (`mosso/<id>` and `mosso/<id>-<suffix>`), and never force-pushes.
+  Mosso never pushes to, force-pushes, or merges into the base branch or any
+  other branch.
 - A fast-forward is a normal push.
 - A rewritten branch (rebase, amend, reset) is pushed only if the branch on
   GitHub is still exactly the commit Mosso last pushed from this workspace.
@@ -198,7 +206,7 @@ restart. It needs `git` on the machine running Mosso (on macOS:
 | `GET /github/auth`                           | `{"configured": true, "source": "keychain"\|"env"\|"memory", "login": "...", "expires_at": "...", "create_url": "https://github.com/settings/personal-access-tokens/new?...", "storage": "keychain"\|"memory"}`, plus `error` if GitHub rejects the token. Never returns the token. |
 | `POST /github/auth`                          | Body: `{"token": "github_pat_..."}`. Checks the token with GitHub, then stores it (Keychain, or memory without one) for all workspaces. `200` with the status above; `400` malformed; `422` GitHub rejected it; `500` the Keychain refused. |
 | `POST /workspaces`                           | Body: `{"repo": "owner/repo", "base": "main", "model": "claude-opus-5-5", "prompt": "...", "image": "...", "setup_script": "...", "section_id": 3, "instructions": "...", "timeout_seconds": 1800}`. With `section_id`, the section's configuration replaces the defaults below and the request's fields override it (see [sections.md](sections.md#how-the-configuration-is-chosen)); `instructions` are added to Claude's system prompt on every turn. `base` defaults to the repository's default branch; `model` to the default model (see [models.md](models.md)); `image` and `setup_script` to the default sandbox environment (see [sandbox-environment.md](sandbox-environment.md)); `timeout_seconds` defaults to 1800 (max 2700). `prompt`, optional, is the first message: it is in the chat while the workspace is set up, and Claude starts on it as soon as the workspace is ready (the response then has `"status": "working"`), even if the client has disconnected; with a prompt, `503` if there is no Claude token, checked before a sandbox is created. Clones, runs the setup script, installs Claude Code and returns `201` with the workspace, once it is saved; `500` if it could not be saved (the sandbox is then destroyed). Setup continues if the client disconnects. |
-| `GET /workspaces`, `GET /workspaces/{name}`  | Every saved workspace with its `status`, including ones still being created, terminated ones kept as history (`"status": "terminated"`) and archived ones (`archived_at` is set), and `pull_request` once one exists. |
+| `GET /workspaces`, `GET /workspaces/{name}`  | Every saved workspace with its `status`, including ones still being created, terminated ones kept as history (`"status": "terminated"`) and archived ones (`archived_at` is set), `pull_request` (the working branch's into the base branch) once one exists, and `pull_requests`: all of the workspace's pull requests, by you or Claude. |
 | `POST /workspaces/{name}/claude/messages`    | Same body and response as `POST /sandboxes/{name}/claude/messages`, run in the checkout after syncing `origin/*`. The turn is also recorded in the workspace's chat. |
 | `POST /workspaces/{name}/chat`, `GET /workspaces/{name}/events` | Asynchronous chat with streamed progress, used by the web UI; see [web-ui.md](web-ui.md#api-used-by-the-ui). |
 | `POST /workspaces/{name}/pull-request`       | Body (all optional): `{"title": "...", "body": "...", "draft": false}`. `201` when it opened the pull request, `200` when it already existed. |
@@ -217,6 +225,10 @@ Workspace:
   "sandbox": {"name": "mosso-1a2b3c4d5e6f", "session_id": "sbx_…", "status": "running", "created_at": "…"},
   "expires_at": "…",
   "pull_request": {"number": 12, "url": "https://github.com/you/project/pull/12"},
+  "pull_requests": [
+    {"number": 12, "url": "https://github.com/you/project/pull/12", "head": "mosso/0a1b2c3d4e5f", "base": "main", "by": "user"},
+    {"number": 13, "url": "https://github.com/you/project/pull/13", "head": "mosso/0a1b2c3d4e5f-uat", "base": "uat", "by": "agent"}
+  ],
   "status": "ready"
 }
 ```
@@ -255,7 +267,8 @@ of uncompressed new content checked for credentials, and 64 MiB per sync.
 | *repository … was not found, or the GitHub token cannot access it* | Wrong `owner/repo`, or the token does not include the repository (GitHub answers 404 for private repositories a token cannot see). |
 | *GitHub refused the push because it changes files in .github/workflows* | Expected without the Workflows permission. Ask Claude to drop those changes, or push them yourself. |
 | *the working branch on GitHub has commits that are not in the workspace* | Someone pushed to the `mosso/*` branch. Mosso fetched it as `origin/<branch>`; ask Claude to rebase onto or merge it, then publish again. |
-| *the branch changed on GitHub while Mosso was pushing* | Another push won the race; publish again. |
+| *the branch changed on GitHub while Mosso was pushing; try again* | Another push won the race; publish (or push) again. |
+| *the push is not a fast-forward … Mosso does not force-push for agents* | Claude's push would replace commits on GitHub. Claude should rebase onto or merge `origin/<branch>`; for the working branch you can also click **Update PR**, which may replace a branch Mosso pushed. |
 | *a rebase, merge, cherry-pick or revert is in progress* / *unresolved merge conflicts* | Ask Claude to finish (or abort) it, then publish. |
 | *a branch protection rule or ruleset rejected the push* | A ruleset covers `mosso/*` branches; adjust it or exempt them. |
 | *refusing to push …: it contains one of Mosso's credentials* | A token is in a file or commit message, possibly in an earlier commit. Ask Claude to remove it from history (for example by rebasing), and revoke and rotate the credential if it may have left the sandbox. |
@@ -337,10 +350,9 @@ MOSSO_E2E=1 MOSSO_E2E_GITHUB_REPO=you/mosso-playground \
 - It uses a little of your Claude subscription and Vercel usage.
 
 Agent instructions (from a section, see [sections.md](sections.md)) can ask
-Claude to work towards several pull requests, but Claude cannot push or open
-pull requests itself: [sections.md](sections.md#github-capabilities-what-the-agent-can-do-today)
-lists what the agent can do today and recommends a minimal, Mosso-mediated
-way to close the gap.
+Claude to open several pull requests, for example into `master` and `uat`;
+Claude does it with Mosso's GitHub tools. See [agent-github.md](agent-github.md)
+for the tools, how a call reaches the Mosso server, and the security model.
 
 ## Security model and limitations
 
@@ -354,8 +366,9 @@ way to close the gap.
 - **Fetches and pushes run on the Mosso server**, so Claude, its child
   processes, hooks and repository code in the sandbox never see the GitHub
   token, and cannot push, open pull requests or reach other repositories by
-  themselves. Only Mosso pushes, when you publish, and only to the
-  workspace's `mosso/*` branch.
+  themselves. Only Mosso pushes: when you publish, or when Claude asks with
+  its GitHub tools, and only to the workspace's own `mosso/*` branches (see
+  [agent-github.md](agent-github.md#security)).
 - **Public repositories are cloned anonymously**, so the token never enters
   their sandbox.
 - **Private repositories need the token for the initial clone.** It is in the

@@ -50,6 +50,10 @@ type Server struct {
 	// operations on this server; replaced in tests.
 	gitSync    func(*github.Mirror, context.Context, github.Token) (github.Synced, error)
 	gitPublish func(*github.Mirror, context.Context, *github.Client, github.PublishOptions) (*github.Published, error)
+	// gitPush and gitFetch run the agent's pushes and fetches (see
+	// tools.go); replaced in tests.
+	gitPush  func(*github.Mirror, context.Context, github.Token, github.PushOptions) (*github.Pushed, error)
+	gitFetch func(*github.Mirror, context.Context, github.Token, ...string) (map[string]string, error)
 	// workerBinary returns the mosso-worker binary to upload into a
 	// sandbox; replaced in tests.
 	workerBinary func(context.Context) ([]byte, error)
@@ -94,6 +98,8 @@ type Server struct {
 
 	// cleanups tracks removal of workspaces' server-side Git repositories.
 	cleanups sync.WaitGroup
+	// tools tracks the agent's tool calls being run (see tools.go).
+	tools sync.WaitGroup
 }
 
 // New returns a Server. client may be nil, in which case sandbox endpoints
@@ -110,6 +116,8 @@ func New(client *vercel.Client) *Server {
 		saveGitHubToken: github.SaveToken,
 		gitSync:         (*github.Mirror).Sync,
 		gitPublish:      (*github.Mirror).Publish,
+		gitPush:         (*github.Mirror).Push,
+		gitFetch:        (*github.Mirror).Fetch,
 		workerBinary:    worker.Binary,
 		sandboxes:       map[string]vercel.Sandbox{},
 		claudeInstalled: map[string]bool{},
@@ -566,14 +574,18 @@ func (s *Server) dropWorkspaceLocked(name string) {
 // in the database, which is closed here. Plain sandboxes made with
 // POST /sandboxes are destroyed, as they are tracked in memory only.
 func (s *Server) Shutdown(ctx context.Context) error {
-	s.cancel() // stop following workers; cancel workspace setup and publishes
+	s.cancel() // stop following workers; cancel workspace setup, publishes and tool calls
 	defer s.closeStore()
 	defer s.cleanups.Wait()
+	s.mu.Lock()
+	s.closed = true
+	s.mu.Unlock()
+	// Tool calls save what they did on GitHub before the database closes.
+	s.tools.Wait()
 	if s.vercel == nil {
 		return nil
 	}
 	s.mu.Lock()
-	s.closed = true
 	pending := make([]vercel.Sandbox, 0, len(s.sandboxes))
 	for name, sb := range s.sandboxes {
 		ws, ok := s.workspaces[name]
