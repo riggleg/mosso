@@ -10,6 +10,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -19,8 +20,9 @@ import (
 )
 
 // Version identifies the worker protocol. 2 added Mosso's tools (calls.go,
-// mcp.go); the server replaces an idle worker of another version.
-const Version = "2"
+// mcp.go), 3 the image store (images.go); the server replaces an idle
+// worker of another version.
+const Version = "3"
 
 // followPing is how often a followed event stream sends a heartbeat.
 const followPing = 15 * time.Second
@@ -42,6 +44,8 @@ type Server struct {
 	mcp []string
 	// pickupTimeout and callTimeout bound how long a tool call waits.
 	pickupTimeout, callTimeout time.Duration
+	// images stores the images Claude's activity shows; nil records none.
+	images *imageStore
 
 	mu    sync.Mutex
 	cur   *task            // running task, if any
@@ -77,6 +81,25 @@ func (s *Server) SetRunner(r Runner) { s.run = r }
 // SetMCP gives Claude Code the command that runs the worker's MCP server
 // (for example the worker binary with "mcp"), so it can use Mosso's tools.
 func (s *Server) SetMCP(command ...string) { s.mcp = command }
+
+// SetImages makes the worker keep the images Claude's activity shows in
+// dir (see images.go). Image files are read only from under roots (and,
+// of the state directory, only its attachments); the files directly in
+// tmp, if set, are scanned for new images besides the working directory.
+func (s *Server) SetImages(dir, state, tmp string, roots ...string) {
+	// Files are compared by their resolved paths, so the roots are too.
+	resolve := func(p string) string {
+		if r, err := filepath.EvalSymlinks(p); err == nil {
+			return r
+		}
+		return filepath.Clean(p)
+	}
+	var resolved []string
+	for _, r := range roots {
+		resolved = append(resolved, resolve(r))
+	}
+	s.images = &imageStore{dir: dir, state: resolve(state), tmp: tmp, roots: resolved}
+}
 
 // SetCallTimeouts changes how long a tool call waits to be picked up by the
 // server, and in all; for tests.
@@ -222,8 +245,22 @@ func (s *Server) message(w http.ResponseWriter, r *http.Request) {
 func (s *Server) work(ctx context.Context, t *task) {
 	defer close(t.done)
 	defer t.cancel()
+	var images *taskImages
+	if s.images != nil {
+		images = s.images.task(t.msg.Dir, t.started)
+	}
 	emit := func(e Event) {
 		e.TaskID = t.id
+		if e.Event != nil {
+			// Image bytes go to the image store, never into the log.
+			ev := *e.Event
+			if images != nil {
+				images.add(&ev)
+			} else {
+				ev.Images = nil
+			}
+			e.Event = &ev
+		}
 		s.emit(e)
 	}
 	turn, err := s.run(ctx, t.msg, emit)

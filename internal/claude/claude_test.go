@@ -2,6 +2,7 @@ package claude
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -351,5 +352,60 @@ func TestModels(t *testing.T) {
 	}
 	if KnownModel("claude-retired-1") || !ValidModelID("claude-retired-1") {
 		t.Error("an unknown but well-formed ID should be valid but not known")
+	}
+}
+
+func TestParseStreamKeepsImages(t *testing.T) {
+	pngData := []byte("\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR rest of a png")
+	png64 := base64.StdEncoding.EncodeToString(pngData)
+	gif64 := base64.StdEncoding.EncodeToString([]byte("GIF89a\x01\x00\x01\x00"))
+	html64 := base64.StdEncoding.EncodeToString([]byte("<html><script>alert(1)</script></html>"))
+	big64 := base64.StdEncoding.EncodeToString(append(pngData, make([]byte, MaxImageBytes)...))
+	lines := []string{
+		// Claude Code's Read tool on an image (2.1.311): the image block, and
+		// the same data again in tool_use_result, which Mosso ignores.
+		`{"type":"user","message":{"content":[{"tool_use_id":"toolu_1","type":"tool_result","content":[{"type":"image","source":{"type":"base64","data":"` + png64 + `","media_type":"image/png"}}]}]},"tool_use_result":{"type":"image","file":{"base64":"` + png64 + `","type":"image/png"}}}`,
+		// An MCP tool (a browser screenshot): text and an image whose
+		// claimed type is wrong; the content decides.
+		`{"type":"user","message":{"content":[{"tool_use_id":"toolu_2","type":"tool_result","content":[{"type":"text","text":"Took a screenshot"},{"type":"image","source":{"type":"base64","data":"` + gif64 + `","media_type":"image/png"}}]}]}}`,
+		// Not kept: HTML posing as an image, a URL source, bad base64, too large.
+		`{"type":"user","message":{"content":[{"tool_use_id":"toolu_3","type":"tool_result","content":[{"type":"image","source":{"type":"base64","data":"` + html64 + `","media_type":"image/png"}},{"type":"image","source":{"type":"url","url":"https://example.com/a.png"}},{"type":"image","source":{"type":"base64","data":"!!!","media_type":"image/png"}},{"type":"image","source":{"type":"base64","data":"` + big64 + `","media_type":"image/png"}}]}]}}`,
+		// An image block outside a tool result.
+		`{"type":"assistant","message":{"content":[{"type":"text","text":"Look:"},{"type":"image","source":{"type":"base64","data":"` + png64 + `","media_type":"image/png"}}]}}`,
+		`{"type":"result","subtype":"success","result":"ok","session_id":"` + testSession + `"}`,
+	}
+	turn, err := ParseStream(strings.Join(lines, "\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ev := turn.Events
+	if len(ev) != 5 {
+		t.Fatalf("events: %+v", ev)
+	}
+	check := func(e Event, typ string, data []byte) {
+		t.Helper()
+		if len(e.Images) != 1 || e.Images[0].Type != typ || string(e.Images[0].Data) != string(data) || e.Images[0].Size != int64(len(data)) {
+			t.Fatalf("images of %+v", e)
+		}
+	}
+	if ev[0].Type != "tool_result" || ev[0].ToolUseID != "toolu_1" || ev[0].Content != "" {
+		t.Fatalf("read result: %+v", ev[0])
+	}
+	check(ev[0], "image/png", pngData)
+	if ev[1].Content != "Took a screenshot" {
+		t.Fatalf("mcp result: %+v", ev[1])
+	}
+	check(ev[1], "image/gif", []byte("GIF89a\x01\x00\x01\x00"))
+	if len(ev[2].Images) != 0 || ev[2].Content != "[image]\n[image]\n[image]\n[image]" {
+		t.Fatalf("rejected images: %+v", ev[2])
+	}
+	if ev[3].Type != "text" || ev[4].Type != "image" {
+		t.Fatalf("assistant blocks: %+v", ev[3:])
+	}
+	check(ev[4], "image/png", pngData)
+	// Image bytes never appear in an event's JSON.
+	b, _ := json.Marshal(turn)
+	if strings.Contains(string(b), png64[:20]) {
+		t.Fatal("image data in the turn's JSON")
 	}
 }

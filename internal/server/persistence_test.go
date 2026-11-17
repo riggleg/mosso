@@ -333,7 +333,8 @@ func TestSessionEndsWhileClaudeWorks(t *testing.T) {
 	events := openEvents(t, h.ts.URL, h.ws.Name, "")
 	h.chat("long task")
 	<-started
-	events.until("claude")
+	events.until("claude") // tool_use
+	events.until("claude") // tool_result: Claude is now blocked mid-task
 	h.fake.timeout(h.ws.Name)
 	notice := events.until("notice")
 	if last := notice[len(notice)-1]; !strings.HasPrefix(last.Text, "Interrupted") {

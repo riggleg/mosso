@@ -1,15 +1,22 @@
 package server
 
 import (
+	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
+	"image"
+	"image/color"
+	"image/png"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/signal"
 	"testing"
+
+	"github.com/riggleg/mosso/internal/claude"
 )
 
 // TestServeFakeForBrowser serves the real web UI and API over a fake
@@ -35,6 +42,11 @@ import (
 // sections and the New workspace dialog. MOSSO_FAKE_SCENARIO=github creates
 // a workspace in which Claude pushed and opened pull requests into master
 // and uat with Mosso's GitHub tools, and one push failed.
+// MOSSO_FAKE_SCENARIO=images creates a workspace in which Claude took a
+// screenshot, wrote a chart and a large image, and showed the screenshot
+// in its reply (next to a missing and a remote image); with
+// MOSSO_FAKE_STOP=1 the sandbox session then stops, so only the images
+// cached locally can be shown.
 func TestServeFakeForBrowser(t *testing.T) {
 	addr := os.Getenv("MOSSO_FAKE_ADDR")
 	if addr == "" {
@@ -118,6 +130,9 @@ func TestServeFakeForBrowser(t *testing.T) {
 	if scenario == "sections" {
 		fakeSections(t, srv.Handler())
 	}
+	if scenario == "images" {
+		fakeImages(t, srv, fake)
+	}
 	switch scenario {
 	case "novercel":
 		// The same database, opened by a server with no Vercel client.
@@ -178,4 +193,70 @@ func fakeSections(t *testing.T, h http.Handler) {
 			do(t, h, http.MethodDelete, "/workspaces/"+ws.Name, "")
 		}
 	}
+}
+
+// fakeImages fills a fake Mosso with a workspace whose chat shows images.
+func fakeImages(t *testing.T, srv *Server, fake *fakeVercel) {
+	shot := demoPNG(t, 640, 400)
+	big := noisePNG(t, 900, 800) // too large to cache locally
+	events := screenshotEvents()
+	events[1].Images[0] = claude.Image{Type: "image/png", Size: int64(len(shot)), Data: shot, Name: "home.png", Path: "/vercel/sandbox/widgets/screenshots/home.png"}
+	events[3].Images[1] = claude.Image{Type: "image/png", Size: int64(len(big)), Data: big, Name: "big.png"}
+	events = append(events, claude.Event{Type: "text",
+		Text:   "Here is the home page:\n\n![Home page](screenshots/home.png)\n\nNot found: ![old](screenshots/old.png). Remote: ![logo](https://example.com/logo.png).",
+		Images: []claude.Image{{Type: "image/png", Size: int64(len(shot)), Data: shot, Name: "home.png", Path: "/vercel/sandbox/widgets/screenshots/home.png", Ref: "screenshots/home.png"}}})
+	fake.claude.mu.Lock()
+	fake.claude.events = events
+	fake.claude.mu.Unlock()
+	rec := do(t, srv.Handler(), http.MethodPost, "/workspaces", `{"repo":"octo/widgets"}`)
+	var ws testWorkspace
+	_ = json.Unmarshal(rec.Body.Bytes(), &ws)
+	do(t, srv.Handler(), http.MethodPost, "/workspaces/"+ws.Name+"/claude/messages", `{"prompt":"Take a screenshot of the home page with Playwright"}`)
+	fake.claude.mu.Lock()
+	fake.claude.events = nil
+	fake.claude.mu.Unlock()
+	if os.Getenv("MOSSO_FAKE_STOP") == "1" {
+		srv.imageFetches.Wait() // cached first, as while following a running sandbox
+		fake.timeout(ws.Name)
+	}
+	t.Logf("workspace %s", ws.Name)
+}
+
+// demoPNG draws a page-like picture: a header bar and some text lines.
+func demoPNG(t *testing.T, w, h int) []byte {
+	img := image.NewRGBA(image.Rect(0, 0, w, h))
+	for y := 0; y < h; y++ {
+		for x := 0; x < w; x++ {
+			c := color.RGBA{250, 250, 250, 255}
+			switch {
+			case y < 56:
+				c = color.RGBA{37, 99, 235, 255}
+			case y > 90 && y%40 < 12 && x > 40 && x < w-40-(y%120):
+				c = color.RGBA{200, 205, 215, 255}
+			}
+			img.Set(x, y, c)
+		}
+	}
+	var b bytes.Buffer
+	if err := png.Encode(&b, img); err != nil {
+		t.Fatal(err)
+	}
+	return b.Bytes()
+}
+
+// noisePNG is a PNG of random pixels, which compresses badly.
+func noisePNG(t *testing.T, w, h int) []byte {
+	img := image.NewRGBA(image.Rect(0, 0, w, h))
+	_, _ = rand.Read(img.Pix)
+	for i := 3; i < len(img.Pix); i += 4 {
+		img.Pix[i] = 255
+	}
+	var b bytes.Buffer
+	if err := png.Encode(&b, img); err != nil {
+		t.Fatal(err)
+	}
+	if b.Len() <= maxCachedImageBytes {
+		t.Fatalf("noisePNG is only %d bytes", b.Len())
+	}
+	return b.Bytes()
 }

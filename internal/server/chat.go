@@ -348,6 +348,7 @@ func (s *Server) applyEvent(ws *workspace, e worker.Event) {
 	case worker.EventClaude:
 		if e.Event != nil {
 			c.add(chatEntry{Type: "claude", Event: e.Event, Seq: e.Seq, Time: e.Time})
+			s.cacheImagesLocked(ws, e.Event.Images)
 			if run != nil {
 				if run.turn == nil {
 					run.turn = &claude.Turn{Events: []claude.Event{}}

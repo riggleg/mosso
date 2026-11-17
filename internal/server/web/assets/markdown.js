@@ -4,8 +4,14 @@
 // limited to http(s) URLs.
 //
 // Supported: paragraphs, headings, fenced code, lists, block quotes, tables,
-// horizontal rules, `code`, **bold**, *italic*, [links](https://…) and bare
-// URLs. Anything else is shown as plain text.
+// horizontal rules, `code`, **bold**, *italic*, [links](https://…), bare
+// URLs and ![images](…). Anything else is shown as plain text.
+//
+// Images never load from the reference Claude wrote: renderMarkdown(text,
+// { image(ref, alt) }) asks the caller for a node to show instead (Mosso
+// serves the images the sandbox worker resolved). Without one, an http(s)
+// image becomes a link and anything else (file:, data:, javascript:, a
+// path that was not found) is shown as its alt text.
 "use strict";
 
 (function () {
@@ -37,9 +43,33 @@
       "\\*([^*\\s](?:[^*\\n]*[^*\\s])?)\\*", // 7: italic
       "(?<![\\w])_([^_\\s](?:[^_\\n]*[^_\\s])?)_(?![\\w])", // 8: italic
       "(https?:\\/\\/[^\\s<>()\\[\\]]*[^\\s<>()\\[\\].,;:!?'\"])", // 9: bare URL
+      '!\\[([^\\]\\n]*)\\]\\(\\s*(<[^>\\n]+>|[^)\\s]+)(?:\\s+"[^"\\n]*")?\\s*\\)', // 10,11: image
     ].join("|"),
     "g",
   );
+
+  // options are the current render's options (see renderMarkdown).
+  let options = {};
+
+  // image shows ![alt](ref): what the caller provides, else a link for an
+  // http(s) reference, else the alt text. It never sets an image source.
+  function image(alt, ref, parent) {
+    ref = ref.replace(/^<(.*)>$/, "$1");
+    const node = options.image ? options.image(ref, alt) : null;
+    if (node) {
+      parent.appendChild(node);
+      return;
+    }
+    const href = safeURL(ref);
+    if (href) {
+      parent.appendChild(link(href, alt || href));
+      return;
+    }
+    const span = el("span", "md-img-missing");
+    span.textContent = "[image" + (alt ? ": " + alt : "") + "]";
+    span.title = ref;
+    parent.appendChild(span);
+  }
 
   function inline(text, parent) {
     let last = 0;
@@ -71,6 +101,8 @@
         parent.appendChild(i);
       } else if (m[9] !== undefined) {
         parent.appendChild(link(m[9], m[9]));
+      } else if (m[11] !== undefined) {
+        image(m[10], m[11], parent);
       }
       last = re.lastIndex;
     }
@@ -251,5 +283,15 @@
     return list;
   }
 
-  window.renderMarkdown = render;
+  function renderMarkdown(text, opts) {
+    const saved = options;
+    options = opts || {};
+    try {
+      return render(text);
+    } finally {
+      options = saved;
+    }
+  }
+
+  window.renderMarkdown = renderMarkdown;
 })();

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"path/filepath"
 	"strconv"
 	"time"
 
@@ -92,6 +93,7 @@ func (s *Server) Restore(ctx context.Context, dbPath, legacyDir string) error {
 	}
 	s.mu.Lock()
 	s.store = st
+	s.imageCache = filepath.Join(filepath.Dir(dbPath), "images")
 	s.defaultImage, s.defaultSetupScript = image, script
 	// Deleting a section clears the setting; anything else unreadable
 	// means no default.

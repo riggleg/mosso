@@ -28,6 +28,6 @@ Workspaces are grouped into **sections** in the sidebar, Conductor-style: a sect
 
 Claude can also **push and open pull requests itself**, when you or a section's instructions ask (for example "create pull requests targeting both master and uat"): Mosso gives it GitHub tools through a small MCP server in the sandbox, and runs them on the Mosso server with your token, for the workspace's repository and its own `mosso/*` branches only, fast-forward only. The token still never enters the sandbox, and **Create PR** works as before. See [docs/agent-github.md](docs/agent-github.md).
 
-Chat messages can carry screenshots and files: paste with Cmd+V, drag them in or use the paperclip; Claude sees images visually. See [docs/attachments.md](docs/attachments.md) for how it works and the browser clipboard limitations.
+Chat messages can carry screenshots and files: paste with Cmd+V, drag them in or use the paperclip; Claude sees images visually. See [docs/attachments.md](docs/attachments.md) for how it works and the browser clipboard limitations. Images Claude produces (screenshots, charts, images its tools return or its replies refer to) show in the chat too, with a preview and download, and stay visible while a sandbox is stopped when they are small; see [docs/images.md](docs/images.md).
 
 See [docs/mup.md](docs/mup.md) for the first milestone and [SECURITY.md](SECURITY.md) for credential handling rules. Pull requests are reviewed automatically by Claude Code; see [docs/claude-review.md](docs/claude-review.md) for setup.

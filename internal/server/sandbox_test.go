@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path"
 	"path/filepath"
 	"slices"
@@ -330,6 +331,14 @@ func (f *fakeVercel) readFile(w http.ResponseWriter, r *http.Request, session st
 	_ = json.NewDecoder(r.Body).Decode(&body)
 	f.mu.Lock()
 	data, ok := f.files[session][body.Path]
+	if id, isImage := strings.CutPrefix(body.Path, worker.ImagesDir+"/"); isImage && !ok {
+		// The worker's image store is in its state directory.
+		if fw := f.workers[f.sessions[session]]; fw != nil {
+			var err error
+			data, err = os.ReadFile(filepath.Join(fw.dir, "images", id))
+			ok = err == nil
+		}
+	}
 	f.mu.Unlock()
 	if !ok {
 		w.WriteHeader(http.StatusNotFound)
@@ -535,6 +544,7 @@ func (fw *fakeWorker) start() bool {
 	}
 	fw.log = l
 	fw.w = worker.New(l, "/nonexistent/claude")
+	fw.w.SetImages(filepath.Join(fw.dir, "images"), fw.dir, "", fw.dir)
 	h := fw.w.Handler()
 	if fw.version != "" {
 		// A worker from an earlier Mosso: same API, older protocol.
@@ -665,6 +675,9 @@ type fakeClaudeRunner struct {
 	toolCalls []worker.CallRequest
 	gate      chan struct{}
 	answers   []toolAnswer
+	// events, if set, are emitted after the first tool result, for
+	// example tool results carrying images.
+	events []claude.Event
 }
 
 // toolAnswer is what one tool call returned to the fake Claude.
@@ -717,7 +730,7 @@ func call(name, args string) worker.CallRequest {
 func (fc *fakeClaudeRunner) run(ctx context.Context, msg worker.Message, emit func(worker.Event), workerURL string) (*claude.Turn, error) {
 	fc.mu.Lock()
 	fc.tasks = append(fc.tasks, msg)
-	block, started, fail, calls, gate := fc.block, fc.started, fc.fail, fc.toolCalls, fc.gate
+	block, started, fail, calls, gate, extra := fc.block, fc.started, fc.fail, fc.toolCalls, fc.gate, fc.events
 	fc.mu.Unlock()
 	if started != nil {
 		started <- struct{}{}
@@ -729,6 +742,9 @@ func (fc *fakeClaudeRunner) run(ctx context.Context, msg worker.Message, emit fu
 	emit(worker.Event{Type: worker.EventSession, SessionID: sid})
 	emit(worker.Event{Type: worker.EventClaude, Event: &claude.Event{Type: "tool_use", ToolUseID: "toolu_1", Name: "Bash", Input: json.RawMessage(`{"command":"ls"}`)}})
 	emit(worker.Event{Type: worker.EventClaude, Event: &claude.Event{Type: "tool_result", ToolUseID: "toolu_1", Content: "README.md"}})
+	for _, e := range extra {
+		emit(worker.Event{Type: worker.EventClaude, Event: &e})
+	}
 	if gate != nil && len(calls) > 0 {
 		select {
 		case <-gate:
@@ -826,7 +842,7 @@ func newServerOver(t *testing.T, fake *fakeVercel, api *httptest.Server, dataDir
 	if err := srv.Restore(context.Background(), filepath.Join(dataDir, "mosso.db"), filepath.Join(dataDir, "workspaces")); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { srv.cancel() })
+	t.Cleanup(func() { srv.cancel(); srv.imageFetches.Wait() })
 	return srv
 }
 
