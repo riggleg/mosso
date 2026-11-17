@@ -165,6 +165,9 @@ type turnRun struct {
 	// userIdx is the index of the turn's user entry in the chat.
 	userIdx int
 	stopped bool // the user asked to stop it; guarded by Server.mu
+	// queued is the queued message the turn sends, if it is one. Its chat
+	// entry is added when the worker has it, and it leaves the queue then.
+	queued *queuedMessage
 	// turn and err are how it ended, for the synchronous endpoint.
 	turn *claude.Turn
 	err  error
@@ -184,20 +187,29 @@ func (s *Server) startTurn(ws *workspace, token claude.Token, prompt string, att
 	if !s.acquire(ws.Name) {
 		return nil, false
 	}
-	run := &turnRun{done: make(chan struct{}), userIdx: userIdx}
-	c := ws.chat
 	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.beginTurnLocked(ws, token, prompt, atts, sessionID, userIdx, nil), true
+}
+
+// beginTurnLocked is startTurn once the workspace is marked busy. With
+// queued, the turn sends that queued message: no chat entry is added until
+// the worker has it, and the worker runs it once however often it is sent
+// (see worker.Message.Key). Call with s.mu held.
+func (s *Server) beginTurnLocked(ws *workspace, token claude.Token, prompt string, atts []attachment, sessionID *string, userIdx int, queued *queuedMessage) *turnRun {
+	run := &turnRun{done: make(chan struct{}), userIdx: userIdx, queued: queued}
+	c := ws.chat
 	sid := c.sessionID
 	if sessionID != nil {
 		sid = *sessionID
 	}
 	c.running, c.err = run, ""
 	ws.taskRunning = true
-	if run.userIdx < 0 {
+	if run.userIdx < 0 && queued == nil {
 		run.userIdx = c.add(chatEntry{Type: "user", Text: prompt, Attachments: atts}).ID
 	}
 	s.persistLocked(ws)
-	s.mu.Unlock()
+	c.notify() // the status, and a queued message now being sent
 
 	go func() {
 		ctx, cancel := context.WithTimeout(s.ctx, setupTimeout)
@@ -208,19 +220,33 @@ func (s *Server) startTurn(ws *workspace, token claude.Token, prompt string, att
 			if ws.sandboxState == sandboxTerminated {
 				return // terminating the workspace ended the turn
 			}
+			if s.ctx.Err() != nil {
+				// Mosso is stopping. The turn stays saved as running, and the
+				// next start finds out from the worker whether it got the
+				// message (a queued one is sent again if not).
+				run.err = err
+				close(run.done)
+				return
+			}
 			if run.stopped {
 				c.add(chatEntry{Type: "notice", Text: "Stopped. Send a message to continue the conversation."})
+				s.pauseQueueLocked(ws, queueStopped)
 			} else {
 				// Prompt text is deliberately not logged.
 				log.Printf("claude in workspace %s: %v", ws.Name, err)
 				c.err = err.Error()
-				c.add(chatEntry{Type: "error", Text: err.Error()})
+				if queued != nil {
+					c.add(chatEntry{Type: "error", Text: "Could not send the queued message: " + err.Error()})
+				} else {
+					c.add(chatEntry{Type: "error", Text: err.Error()})
+				}
+				s.pauseQueueLocked(ws, queueFailed)
 			}
 			run.err = err
 			s.finishTurnLocked(ws, run)
 		}
 	}()
-	return run, true
+	return run
 }
 
 // submitTurn gets the sandbox and worker ready and hands them the message.
@@ -253,7 +279,7 @@ func (s *Server) submitTurn(ctx context.Context, ws *workspace, run *turnRun, to
 	if len(atts) == 0 {
 		attsJSON = nil
 	}
-	acc, err := s.workerSubmit(ctx, session, worker.Message{
+	msg := worker.Message{
 		Text:         prompt,
 		Attachments:  attsJSON,
 		Prompt:       claudePrompt(prompt, atts),
@@ -262,7 +288,11 @@ func (s *Server) submitTurn(ctx context.Context, ws *workspace, run *turnRun, to
 		SystemPrompt: workspacePrompt(ws),
 		Model:        ws.Model,
 		Token:        token.Reveal(),
-	})
+	}
+	if run.queued != nil {
+		msg.Key = run.queued.ID
+	}
+	acc, err := s.workerSubmit(ctx, session, msg)
 	if err != nil {
 		return err
 	}
@@ -273,10 +303,27 @@ func (s *Server) submitTurn(ctx context.Context, ws *workspace, run *turnRun, to
 	}
 	run.taskID = acc.TaskID
 	ws.queuedPrompt = false // the worker has it
-	// The follower may already have delivered the worker's user event.
-	if acc.Seq > ws.lastSeq {
+	switch {
+	case acc.Duplicate:
+		// The worker already had this queued message (Mosso sent it before
+		// a restart, or its answer was lost). Its events that Mosso has not
+		// applied yet come through the follower, which takes the message
+		// off the queue and ends the turn.
+		if acc.Seq <= ws.lastSeq {
+			removeQueued(ws, run.queued.ID)
+		}
+		if acc.EndSeq != 0 && acc.EndSeq <= ws.lastSeq {
+			// It ended, and that is recorded: nothing more will come.
+			s.finishTurnLocked(ws, run)
+			return nil
+		}
+	case acc.Seq > ws.lastSeq:
+		// The follower has not delivered the worker's user event yet.
 		ws.lastSeq = acc.Seq
-		if run.userIdx >= 0 && run.userIdx < len(ws.chat.entries) {
+		switch {
+		case run.queued != nil:
+			s.queuedSentLocked(ws, run, acc.Seq, time.Now().UTC())
+		case run.userIdx >= 0 && run.userIdx < len(ws.chat.entries):
 			ws.chat.entries[run.userIdx].Seq = acc.Seq
 		}
 	}
@@ -340,7 +387,22 @@ func (s *Server) applyEvent(ws *workspace, e worker.Event) {
 		}
 		var atts []attachment
 		_ = json.Unmarshal(e.Attachments, &atts)
-		c.add(chatEntry{Type: "user", Text: e.Text, Attachments: atts, Seq: e.Seq, Time: e.Time})
+		entry := chatEntry{Type: "user", Text: e.Text, Attachments: atts, Seq: e.Seq, Time: e.Time}
+		var idx int
+		if e.Key != "" && removeQueued(ws, e.Key) {
+			// A queued message the worker has: it leaves the queue.
+			idx = s.addWithStateLocked(ws, entry)
+		} else {
+			idx = c.add(entry).ID
+		}
+		if e.Key != "" {
+			if run != nil && run.queued != nil && run.queued.ID == e.Key {
+				run.userIdx = idx
+				if run.taskID == "" {
+					run.taskID = e.TaskID
+				}
+			}
+		}
 	case worker.EventSession:
 		if e.SessionID != "" {
 			c.sessionID = e.SessionID
@@ -365,11 +427,16 @@ func (s *Server) applyEvent(ws *workspace, e worker.Event) {
 			c.sessionID = e.SessionID
 		}
 		log.Printf("claude in workspace %s: session %s, is_error=%t", ws.Name, c.sessionID, r.IsError)
+		if run != nil && run.stopped {
+			// Stopped as it finished: the queue still waits, as for a stop.
+			s.pauseQueueLocked(ws, queueStopped)
+		}
 		if r.IsError {
 			c.err = "Claude Code reported an error"
 			if r.Text != "" {
 				c.err = r.Text
 			}
+			s.pauseQueueLocked(ws, queueFailed)
 		}
 		c.add(chatEntry{Type: "result", Seq: e.Seq, Time: e.Time, Result: &turnResult{
 			Text: r.Text, IsError: r.IsError, Subtype: r.Subtype,
@@ -388,6 +455,7 @@ func (s *Server) applyEvent(ws *workspace, e worker.Event) {
 		log.Printf("claude in workspace %s: %s", ws.Name, e.Text)
 		c.err = e.Text
 		c.add(chatEntry{Type: "error", Text: e.Text, Seq: e.Seq, Time: e.Time})
+		s.pauseQueueLocked(ws, queueFailed)
 		if run != nil {
 			run.err = errors.New(e.Text)
 		}
@@ -395,6 +463,7 @@ func (s *Server) applyEvent(ws *workspace, e worker.Event) {
 	case worker.EventStopped:
 		log.Printf("claude in workspace %s: stopped by the user", ws.Name)
 		c.add(chatEntry{Type: "notice", Text: "Stopped. Send a message to continue the conversation.", Seq: e.Seq, Time: e.Time})
+		s.pauseQueueLocked(ws, queueStopped)
 		if run != nil {
 			run.err = errors.New("stopped by the user")
 		}
@@ -421,9 +490,10 @@ func (s *Server) applyEvent(ws *workspace, e worker.Event) {
 	}
 }
 
-// finishTurnLocked frees the workspace once its turn has ended. run is nil
-// when the turn was started by an earlier Mosso process; if another turn is
-// in progress then, the event was about an earlier task and nothing ends.
+// finishTurnLocked frees the workspace once its turn has ended, and sends
+// the next queued message if there is one. run is nil when the turn was
+// started by an earlier Mosso process; if another turn is in progress
+// then, the event was about an earlier task and nothing ends.
 func (s *Server) finishTurnLocked(ws *workspace, run *turnRun) {
 	if run == nil && ws.chat.running != nil {
 		return
@@ -431,6 +501,12 @@ func (s *Server) finishTurnLocked(ws *workspace, run *turnRun) {
 	delete(s.busy, ws.Name)
 	ws.taskRunning = false
 	ws.chat.running = nil
+	for i := range ws.Queue {
+		ws.Queue[i].Sending = false // not sent, if still here: it goes again
+	}
+	if len(ws.Queue) > 0 {
+		go s.dispatchQueue(ws)
+	}
 	if run != nil {
 		select {
 		case <-run.done:
@@ -451,18 +527,18 @@ func claudePrompt(prompt string, atts []attachment) string {
 	return prompt + attachmentNote(atts)
 }
 
-// startTurnWithAttachments resolves a message's attachments and starts its
-// turn, or writes an error.
-func (s *Server) startTurnWithAttachments(w http.ResponseWriter, name string, token claude.Token, req messageRequest, sessionID *string) (*turnRun, bool) {
+// acceptMessage finds the workspace a message is for and resolves its
+// attachments, or writes an error if the workspace cannot take messages.
+func (s *Server) acceptMessage(w http.ResponseWriter, name string, req messageRequest) (*workspace, []attachment, bool) {
 	live, ok := s.workspaceByName(name)
 	if !ok {
 		writeError(w, http.StatusNotFound, "unknown workspace")
-		return nil, false
+		return nil, nil, false
 	}
 	atts, err := s.takeAttachments(live, req.Attachments)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
-		return nil, false
+		return nil, nil, false
 	}
 	s.mu.Lock()
 	gone := noSandbox(live.sandboxState)
@@ -470,10 +546,28 @@ func (s *Server) startTurnWithAttachments(w http.ResponseWriter, name string, to
 	s.mu.Unlock()
 	if gone != "" {
 		writeError(w, http.StatusGone, gone)
-		return nil, false
+		return nil, nil, false
 	}
 	if creating {
 		writeError(w, http.StatusConflict, "the workspace is still being set up")
+		return nil, nil, false
+	}
+	return live, atts, true
+}
+
+// startTurnWithAttachments resolves a message's attachments and starts its
+// turn, or writes an error. It does not queue: while queued messages wait,
+// the workspace is busy for it.
+func (s *Server) startTurnWithAttachments(w http.ResponseWriter, name string, token claude.Token, req messageRequest, sessionID *string) (*turnRun, bool) {
+	live, atts, ok := s.acceptMessage(w, name, req)
+	if !ok {
+		return nil, false
+	}
+	s.mu.Lock()
+	waiting := len(live.Queue) > 0
+	s.mu.Unlock()
+	if waiting {
+		writeError(w, http.StatusConflict, "messages are queued in this workspace; they are sent first")
 		return nil, false
 	}
 	run, ok := s.startTurn(live, token, req.Prompt, atts, sessionID, -1)
@@ -595,7 +689,8 @@ How to work with them:
 
 // workspaceChat starts a Claude Code turn that continues the workspace's
 // conversation and returns immediately; follow its progress with
-// GET /workspaces/{name}/events.
+// GET /workspaces/{name}/events. While Claude is working, the message is
+// queued instead (see queue.go).
 func (s *Server) workspaceChat(w http.ResponseWriter, r *http.Request) {
 	ws, ok := s.lookupWorkspace(w, r)
 	if !ok {
@@ -609,10 +704,7 @@ func (s *Server) workspaceChat(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if _, ok := s.startTurnWithAttachments(w, ws.Name, token, req, nil); !ok {
-		return
-	}
-	writeJSON(w, http.StatusAccepted, map[string]string{"status": "working"})
+	s.sendOrQueue(w, ws.Name, token, req)
 }
 
 // workspaceStop stops the running Claude Code turn. The conversation so far
@@ -627,6 +719,12 @@ func (s *Server) workspaceStop(w http.ResponseWriter, r *http.Request) {
 		run, session, busy = ws.chat.running, ws.Sandbox.SessionID, s.busy[ws.Name] && ws.taskRunning
 		if run != nil {
 			run.stopped = true
+		}
+		if run != nil || busy {
+			// Whatever ends the turn now, the queue waits for the user.
+			s.pauseQueueLocked(ws, queueStopped)
+			s.persistLocked(ws)
+			ws.chat.notify()
 		}
 	}
 	s.mu.Unlock()

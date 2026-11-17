@@ -182,6 +182,8 @@ func (s *Server) Handler() http.Handler {
 	// Images can be served from the local cache without Vercel.
 	mux.HandleFunc("GET /workspaces/{name}/images/{id}", s.serveImage)
 	mux.HandleFunc("POST /workspaces/{name}/chat/stop", s.requireVercel(s.workspaceStop))
+	mux.HandleFunc("DELETE /workspaces/{name}/queue/{id}", s.cancelQueued)
+	mux.HandleFunc("POST /workspaces/{name}/queue/resume", s.requireVercel(s.resumeQueue))
 	mux.HandleFunc("POST /workspaces/{name}/connect", s.requireVercel(s.workspaceConnect))
 	mux.HandleFunc("GET /github/repos", s.githubRepos)
 	mux.HandleFunc("GET /github/repos/{owner}/{repo}/branches", s.githubBranches)
@@ -521,7 +523,13 @@ func (s *Server) release(name string) {
 	s.mu.Lock()
 	delete(s.busy, name)
 	s.changedLocked(name)
+	ws, ok := s.workspaces[name]
+	queued := ok && len(ws.Queue) > 0
 	s.mu.Unlock()
+	if queued {
+		// Messages queued during a publish go on now.
+		go s.dispatchQueue(ws)
+	}
 }
 
 // changedLocked wakes the event streams of a workspace whose status changed.

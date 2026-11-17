@@ -208,7 +208,8 @@ func TestWorkspaceChatRejectsConcurrentAndStops(t *testing.T) {
 		t.Fatalf("chat status = %d", resp.StatusCode)
 	}
 	<-started
-	for _, path := range []string{"/chat", "/claude/messages", "/pull-request"} {
+	// (A message sent to /chat now is queued; see queue_test.go.)
+	for _, path := range []string{"/claude/messages", "/pull-request"} {
 		if resp := postJSON(t, ts.URL+"/workspaces/"+ws.Name+path, `{"prompt":"again"}`); resp.StatusCode != http.StatusConflict {
 			t.Fatalf("%s while busy: status = %d, want 409", path, resp.StatusCode)
 		}

@@ -487,3 +487,59 @@ func TestListenAndServeRefusesNonLoopback(t *testing.T) {
 		t.Fatal("expected an error")
 	}
 }
+
+// TestKeyedMessageRunsOnce: a message sent again with the same key, while
+// it runs or after it ended, is not run again; the answer names the task
+// that has it.
+func TestKeyedMessageRunsOnce(t *testing.T) {
+	_, ts, _, argsFile := newTestWorker(t)
+	dir := t.TempDir()
+	msg := Message{Text: "queued slow", Prompt: "queued slow", Dir: dir, Token: testToken, Key: "q_1"}
+	resp := post(t, ts.URL+"/messages", msg)
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("status = %d", resp.StatusCode)
+	}
+	var first Accepted
+	_ = json.NewDecoder(resp.Body).Decode(&first)
+
+	// Again while it runs: the same task, still running.
+	resp = post(t, ts.URL+"/messages", msg)
+	var again Accepted
+	_ = json.NewDecoder(resp.Body).Decode(&again)
+	if resp.StatusCode != http.StatusOK || !again.Duplicate || again.EndSeq != 0 || again.TaskID != first.TaskID || again.Seq != first.Seq {
+		t.Fatalf("resend while running: %d %+v, want the first task %+v", resp.StatusCode, again, first)
+	}
+	ran := func() int { b, _ := os.ReadFile(argsFile); return strings.Count(string(b), "\n") }
+	waitFor(t, func() bool { return ran() == 1 })
+	post(t, ts.URL+"/stop", nil)
+	waitFor(t, func() bool { return getStatus(t, ts.URL).State == "idle" })
+
+	// Again after it ended: still the same task, not running.
+	resp = post(t, ts.URL+"/messages", msg)
+	again = Accepted{}
+	_ = json.NewDecoder(resp.Body).Decode(&again)
+	if resp.StatusCode != http.StatusOK || !again.Duplicate || again.EndSeq <= first.Seq || again.TaskID != first.TaskID {
+		t.Fatalf("resend after the end: %d %+v", resp.StatusCode, again)
+	}
+	users := 0
+	for _, e := range getEvents(t, ts.URL, 0) {
+		if e.Type == EventUser {
+			users++
+			if e.Key != "q_1" {
+				t.Fatalf("user event key = %q", e.Key)
+			}
+		}
+	}
+	if users != 1 {
+		t.Fatalf("user events = %d, want 1", users)
+	}
+	if n := ran(); n != 1 {
+		t.Fatalf("claude ran %d times", n)
+	}
+
+	// Another key is a new message.
+	resp = post(t, ts.URL+"/messages", Message{Text: "next", Prompt: "next", Dir: dir, Token: testToken, Key: "q_2"})
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("new key: status = %d", resp.StatusCode)
+	}
+}

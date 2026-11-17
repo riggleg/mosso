@@ -222,6 +222,35 @@ func (l *Log) LastSessionID() string {
 	return ""
 }
 
+// UserEvent returns the latest user event recorded with the key; none for
+// an empty key.
+func (l *Log) UserEvent(key string) (Event, bool) {
+	if key == "" {
+		return Event{}, false
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for i := len(l.events) - 1; i >= 0; i-- {
+		if e := l.events[i]; e.Type == EventUser && e.Key == key {
+			return e, true
+		}
+	}
+	return Event{}, false
+}
+
+// TaskEnd returns the sequence number of the task's terminal event, 0 if
+// it has none (yet).
+func (l *Log) TaskEnd(taskID string) int64 {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for i := len(l.events) - 1; i >= 0; i-- {
+		if e := l.events[i]; e.TaskID == taskID && e.Terminal() {
+			return e.Seq
+		}
+	}
+	return 0
+}
+
 // OpenTask returns the ID of the task whose events have not reached a
 // terminal event yet, or "". A tool call's result can be recorded after
 // its task ended (the server answered late), so it does not reopen one.

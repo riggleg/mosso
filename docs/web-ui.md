@@ -141,8 +141,9 @@ browser ──POST /workspaces/{name}/chat──▶ Mosso ──POST /messages (
   sends the workspace (status, error, pull request) whenever it changes, and
   a keep-alive comment every 15 seconds.
 - **Busy workspaces.** Claude turns, publishes and setup share the existing
-  per-sandbox lock, so a second message or a publish while Claude works is
-  rejected with `409`. The UI also disables the composer and buttons.
+  per-sandbox lock, so a publish while Claude works is rejected with `409`.
+  A message sent while Claude works is queued and sent when it finishes;
+  see [queue.md](queue.md).
 
 ## API used by the UI
 
@@ -155,7 +156,8 @@ These come in addition to the endpoints in [github.md](github.md) and
 
 | Method & path                              | Description |
 | ------------------------------------------ | ----------- |
-| `POST /workspaces/{name}/chat`             | Body: `{"prompt": "...", "attachments": ["<id>"]}` (`attachments` optional; `prompt` may then be empty). Starts a Claude Code turn that continues the workspace's conversation and returns `202 {"status":"working"}`. `409` if the workspace is busy, `503` if there is no Claude token. |
+| `POST /workspaces/{name}/chat`             | Body: `{"prompt": "...", "attachments": ["<id>"]}` (`attachments` optional; `prompt` may then be empty). Starts a Claude Code turn that continues the workspace's conversation and returns `202 {"status":"working"}`. While the workspace is busy (or earlier queued messages wait), queues the message instead: `202 {"status":"queued","id":"q_…"}`; see [queue.md](queue.md). `409` while the workspace is being set up, `503` if there is no Claude token. |
+| `DELETE /workspaces/{name}/queue/{id}`, `POST /workspaces/{name}/queue/resume` | Cancel a queued message; resume a paused queue. See [queue.md](queue.md#api). |
 | `POST /workspaces/{name}/attachments`      | Multipart upload into the sandbox; see [attachments.md](attachments.md). `GET /workspaces/{name}/attachments/{id}` reads one back. |
 | `POST /workspaces/{name}/chat/stop`        | Stops the running turn (`202`); `409` if Claude is not running. |
 | `POST /workspaces/{name}/connect`          | Resumes a stopped sandbox, restarts the worker and catches up on events; returns the workspace. `410` if the sandbox is gone or the workspace was terminated. |
