@@ -19,6 +19,8 @@ const state = {
   sending: false,
   publishing: false,
   resuming: false,
+  stoppingSandbox: false,
+  savingIdle: false,
   archiving: false,
   showArchived: false, // the sidebar's Archived section is open
   repos: null,
@@ -166,10 +168,16 @@ async function loadChecks() {
   if (ghOK && days !== null && days < 14) ghDetail += days < 0 ? " · expired" : ` · expires in ${days}d`;
   const ghButton = h("button", { type: "button", class: "small check-action", text: github.configured ? "Replace" : "Connect", onclick: openGitHub });
   list.replaceChildren(
-    item("Vercel", !noVercel(), noVercel() ? "not configured · read-only" : ""),
+    item("Vercel", !noVercel(), noVercel() ? "not configured · read-only" : Lifecycle.planSummary(vercel)),
     item("Claude", claude.configured, claude.configured ? claude.source : "run mosso auth claude"),
     item("GitHub", ghOK, ghDetail, ghButton),
   );
+  const vercelItem = list.firstChild;
+  if (vercel && vercel.configured) {
+    vercelItem.title =
+      "Detected from your Vercel team (checked hourly, and again when a workspace asks for more). Sessions longer than 45 minutes need Pro or Enterprise." +
+      (vercel.plan_error ? "\n\n" + vercel.plan_error : "");
+  }
   const ghItem = list.lastChild;
   if (settings) {
     const modelButton = h("button", { type: "button", class: "small check-action", text: "Change", onclick: openSettings });
@@ -567,22 +575,7 @@ function shortDate(iso) {
 }
 
 function statusLabel(ws) {
-  switch (ws.status) {
-    case "creating":
-      return "Setting up";
-    case "connecting":
-      return "Connecting";
-    case "working":
-      return "Working";
-    case "stopped":
-      return "Stopped";
-    case "terminated":
-      return ws.archived_at ? "Archived" : "Terminated";
-    case "error":
-      return ws.sandbox_state === "gone" ? "Gone" : "Error";
-    default:
-      return "Ready";
-  }
+  return Lifecycle.statusLabel(ws);
 }
 
 // sandboxGone reports whether the workspace has no sandbox any more: it was
@@ -625,7 +618,7 @@ function renderHeader() {
       h("a", { class: "pr-link", href: pr.url, target: "_blank", rel: "noopener noreferrer", text: pr.label, title: pr.title }),
     ),
   );
-  const busy = ws.status === "working" || ws.status === "creating" || ws.status === "connecting";
+  const busy = isWorking();
   // History is read-only: it can only be archived (or brought back).
   const past = isTerminated(ws);
   const archive = $("archive");
@@ -646,9 +639,15 @@ function renderHeader() {
   terminateBtn.title = noVercel() ? vercelHelp : past ? "The sandbox is deleted, but that could not be saved. Try saving it again." : "";
   if (!terminateBtn.disabled) terminateBtn.textContent = past ? "Save again" : "Terminate";
   const resume = $("resume");
-  resume.classList.toggle("hidden", ws.status !== "stopped");
-  resume.disabled = state.resuming || noVercel();
-  resume.textContent = state.resuming ? "Resuming…" : "Resume sandbox";
+  resume.classList.toggle("hidden", ws.status !== "stopped" && ws.status !== "resuming");
+  resume.disabled = state.resuming || noVercel() || ws.status === "resuming";
+  resume.textContent = state.resuming || ws.status === "resuming" ? "Resuming…" : "Resume sandbox";
+  // Stop is offered while the sandbox runs and nothing runs in it.
+  const stopSb = $("stop-sandbox");
+  stopSb.classList.toggle("hidden", past || sandboxGone(ws) || !["ready", "error", "stopping"].includes(ws.status) || ws.sandbox_state !== "running");
+  stopSb.disabled = state.stoppingSandbox || ws.status === "stopping" || noVercel();
+  stopSb.textContent = state.stoppingSandbox || ws.status === "stopping" ? "Stopping…" : "Stop sandbox";
+  renderIdleSelect(ws);
 
   const err = $("ws-error");
   if (ws.error && ws.status === "error") {
@@ -702,6 +701,60 @@ async function moveWorkspace() {
   }
 }
 
+// renderIdleSelect shows the workspace's idle timeout, where choosing
+// another changes it.
+function renderIdleSelect(ws) {
+  const sel = $("ws-idle");
+  const hide = isTerminated(ws) || sandboxGone(ws);
+  sel.classList.toggle("hidden", hide);
+  if (hide) return;
+  const value = ws.idle_timeout_seconds || 0;
+  const sig = String(value);
+  if (sel.dataset.sig !== sig) {
+    sel.replaceChildren(
+      ...Lifecycle.idleOptions(value).map((o) => h("option", { value: String(o.value), text: o.value === 0 ? "Idle stop: never" : "Idle stop: " + Lifecycle.duration(o.value) })),
+    );
+    sel.dataset.sig = sig;
+  }
+  sel.value = String(value);
+  sel.disabled = state.savingIdle || ws.status === "creating" || noVercel();
+}
+
+async function changeIdleTimeout() {
+  const ws = state.ws;
+  if (!ws) return;
+  const seconds = Number($("ws-idle").value);
+  if (seconds === (ws.idle_timeout_seconds || 0)) return;
+  state.savingIdle = true;
+  render();
+  try {
+    state.ws = await api("PATCH", wsPath(ws.name), { idle_timeout_seconds: seconds });
+  } catch (e) {
+    showBanner("Could not change the idle timeout: " + e.message);
+  } finally {
+    state.savingIdle = false;
+    render();
+  }
+}
+
+// stopSandbox stops the selected workspace's sandbox session now, keeping
+// the workspace, its files and the conversation.
+async function stopSandbox() {
+  const ws = state.ws;
+  if (!ws || state.stoppingSandbox) return;
+  state.stoppingSandbox = true;
+  render();
+  try {
+    state.ws = await api("POST", wsPath(ws.name) + "/sandbox/stop", {});
+    hideBanner();
+  } catch (e) {
+    showBanner("Could not stop the sandbox: " + e.message);
+  } finally {
+    state.stoppingSandbox = false;
+    refreshList();
+  }
+}
+
 function renderExpiry() {
   const ws = state.ws;
   const el = $("ws-expiry");
@@ -724,6 +777,12 @@ function renderExpiry() {
     el.title = "The sandbox was deleted or its snapshot expired. The conversation is kept; terminate the workspace to move it to the history.";
     return;
   }
+  if (ws.status === "stopping" || ws.status === "resuming") {
+    el.textContent = ws.status === "stopping" ? "Stopping the sandbox…" : "Resuming the sandbox…";
+    el.className = "muted";
+    el.title = Lifecycle.settingsText(ws);
+    return;
+  }
   if (ws.status === "connecting") {
     el.textContent = "Checking the sandbox…";
     el.className = "muted";
@@ -733,7 +792,10 @@ function renderExpiry() {
   if (!ws.expires_at || ws.status === "stopped") {
     el.textContent = "Sandbox stopped";
     el.className = "muted";
-    el.title = "The sandbox session ended (sessions last up to 45 minutes). Its files and the conversation are saved; sending a message or clicking Resume starts a new session.";
+    el.title =
+      "The sandbox session ended: it was stopped (when idle, or with Stop sandbox) or reached its session length. Its files and the conversation are saved; sending a message or clicking Resume starts a new session.\n\n" +
+      Lifecycle.settingsText(ws) +
+      ".";
     return;
   }
   const left = new Date(ws.expires_at).getTime() - Date.now();
@@ -741,14 +803,26 @@ function renderExpiry() {
     el.textContent = "Session ended";
     el.className = "muted";
   } else {
-    el.textContent = "Session ends in " + (left < 60000 ? "under a minute" : Math.floor(left / 60000) + " min");
+    const mins = Math.floor(left / 60000);
+    el.textContent = "Session ends in " + (left < 60000 ? "under a minute" : mins < 120 ? mins + " min" : Math.floor(mins / 60) + " h " + (mins % 60) + " min");
     el.className = left < 5 * 60000 ? "soon" : "muted";
+    const idle = Lifecycle.idleText(ws, Date.now());
+    if (idle) el.textContent += " · " + idle.charAt(0).toLowerCase() + idle.slice(1);
   }
-  el.title = "Vercel stops the sandbox session at " + new Date(ws.expires_at).toLocaleTimeString() + ". Claude's work is saved in the sandbox and resumes with your next message.";
+  el.title =
+    "Vercel stops the sandbox session at " +
+    new Date(ws.expires_at).toLocaleTimeString() +
+    " at the latest. " +
+    (ws.idle_timeout_seconds
+      ? "Mosso stops it sooner once nothing has run in it for " + Lifecycle.duration(ws.idle_timeout_seconds) + " (while Mosso is running; a browser tab does not need to be open). "
+      : "Idle shutdown is off for this workspace. ") +
+    "Claude's work is saved in the sandbox and resumes with your next message.\n\n" +
+    Lifecycle.settingsText(ws) +
+    ".";
 }
 
 function isWorking() {
-  return state.ws && (state.ws.status === "working" || state.ws.status === "creating" || state.ws.status === "connecting");
+  return state.ws && ["working", "creating", "connecting", "stopping", "resuming"].includes(state.ws.status);
 }
 
 function lastEntryOf(types) {
@@ -789,6 +863,8 @@ function renderWorking() {
       if (lastEntryOf(["user"])) text += " Claude starts on your message when it is ready.";
     }
     else if (ws.status === "connecting") text = "Reconnecting to the sandbox after a restart…";
+    else if (ws.status === "stopping") text = "Stopping the sandbox (its files are snapshotted)…";
+    else if (ws.status === "resuming") text = "Resuming the sandbox from its snapshot…";
     else if (running) {
       text = "Claude is working…";
       since = lastEntryOf(["user"]);
@@ -799,7 +875,7 @@ function renderWorking() {
     $("working-text").textContent = text;
     $("working-time").textContent = since ? fmtDuration(Date.now() - new Date(since.time).getTime()) : "";
     // Nothing runs until the workspace is set up, so there is nothing to stop.
-    $("stop").classList.toggle("hidden", !running || ws.status === "creating");
+    $("stop").classList.toggle("hidden", !running || ["creating", "stopping", "resuming"].includes(ws.status));
   }
 
   const prompt = $("prompt");
@@ -1523,6 +1599,7 @@ async function openCreate(sectionId) {
   sel.value = String(sectionId || 0);
   sel.closest("label").classList.toggle("hidden", !state.sections.length);
   fillCreate();
+  fillSession();
   $("create-env").open = false;
   $("create-instr").open = false;
   $("create-error").classList.add("hidden");
@@ -1543,6 +1620,36 @@ async function openCreate(sectionId) {
       /* typing a repository still works */
     }
   }
+}
+
+// fillSession offers the session lengths the Vercel plan allows and the
+// idle timeouts, with the defaults selected, and says which plan Mosso
+// detected. The plan is checked again in the background.
+function fillSession() {
+  const fill = () => {
+    const sel = $("create-session");
+    const keep = Number(sel.value) || Lifecycle.DEFAULT_SESSION;
+    sel.replaceChildren(...Lifecycle.sessionOptions(state.vercel, keep).map((o) => h("option", { value: String(o.value), text: o.label })));
+    sel.value = String(Lifecycle.sessionOptions(state.vercel).some((o) => o.value === keep) ? keep : Lifecycle.DEFAULT_SESSION);
+    const idle = $("create-idle");
+    if (!idle.options.length) {
+      idle.replaceChildren(...Lifecycle.idleOptions().map((o) => h("option", { value: String(o.value), text: o.label })));
+      idle.value = String(Lifecycle.DEFAULT_IDLE);
+    }
+    const v = state.vercel;
+    $("create-plan").textContent =
+      "Vercel plan: " +
+      Lifecycle.planSummary(v) +
+      ". The session length is the most one sandbox session lasts before Vercel stops it; idle shutdown stops it sooner, once nothing has run in it for the chosen time, while Mosso runs. A stopped sandbox keeps its files and resumes on your next message." +
+      (v && v.plan === "hobby" ? " Longer sessions need a Pro or Enterprise plan; Mosso notices an upgrade by itself." : "");
+  };
+  fill();
+  api("GET", "/vercel/auth")
+    .then((v) => {
+      state.vercel = v;
+      fill();
+    })
+    .catch(() => {});
 }
 
 // createSection is the section chosen in the New workspace dialog, or null.
@@ -1637,6 +1744,8 @@ function setCreating(on) {
   $("create-setup").disabled = on;
   $("create-section").disabled = on;
   $("create-instructions").disabled = on;
+  $("create-session").disabled = on;
+  $("create-idle").disabled = on;
 }
 
 // createSeq identifies the dialog's current use: each create request and
@@ -1681,6 +1790,8 @@ async function submitCreate(ev) {
     // What the dialog shows, the section's values and defaults included:
     // empty means none.
     const body = Sections.createBody(sec ? sec.id : null, { ...values, prompt }, !!state.settings);
+    body.timeout_seconds = Number($("create-session").value) || Lifecycle.DEFAULT_SESSION;
+    body.idle_timeout_seconds = Number($("create-idle").value);
     const ws = await api("POST", "/workspaces", body);
     if (!sec) localStorage.setItem("mosso.lastRepo", repo);
     if (!current()) {
@@ -1755,6 +1866,8 @@ function init() {
   $("terminate").addEventListener("click", terminate);
   $("archive").addEventListener("click", toggleArchive);
   $("resume").addEventListener("click", resumeSandbox);
+  $("stop-sandbox").addEventListener("click", stopSandbox);
+  $("ws-idle").addEventListener("change", changeIdleTimeout);
   $("empty-connect").addEventListener("click", openGitHub);
   $("github-form").addEventListener("submit", submitGitHub);
   $("settings-form").addEventListener("submit", submitSettings);

@@ -64,6 +64,19 @@ type fakeVercel struct {
 	claude    *fakeClaudeRunner
 	// snapshotLost makes resuming fail with snapshot_not_found.
 	snapshotLost map[string]bool
+	// plan is the team's billing plan GET /v2/teams/{id} reports; "" answers
+	// 404, planFail 500. planReads counts the requests.
+	plan      string
+	planFail  bool
+	planReads int
+	// atCapacity makes creating and resuming sandboxes fail with 429, like
+	// an account at its concurrency limit. failStop makes stopping a
+	// session fail. resumeTimeout, if set, is the timeout (ms) of resumed
+	// sessions. extended records extend-timeout requests (ms).
+	atCapacity    bool
+	failStop      bool
+	resumeTimeout int64
+	extended      []int64
 }
 
 type fakeSandbox struct {
@@ -100,8 +113,12 @@ func (f *fakeVercel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		f.getSandbox(w, r, parts[3])
 	case r.Method == http.MethodDelete && strings.HasPrefix(p, "/v2/sandboxes/") && len(parts) == 4:
 		f.deleteSandbox(w, r, parts[3])
+	case r.Method == http.MethodGet && strings.HasPrefix(p, "/v2/teams/"):
+		f.team(w)
 	case r.Method == http.MethodPost && strings.HasSuffix(p, "/stop"):
 		f.stopSession(w, parts[4])
+	case r.Method == http.MethodPost && strings.HasSuffix(p, "/extend-timeout"):
+		f.extendTimeout(w, r, parts[4])
 	case strings.HasPrefix(p, "/v2/sandboxes/sessions/"):
 		if !f.sessionRunning(w, parts[4]) {
 			return
@@ -149,6 +166,10 @@ func (f *fakeVercel) createSandbox(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewDecoder(r.Body).Decode(&body)
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.atCapacity {
+		tooMany(w)
+		return
+	}
 	// Like Vercel: v2 boots runtimes, v3 boots images.
 	if (r.URL.Path == "/v3/sandboxes") != (body.Image != "") || (body.Image != "" && body.Runtime != "") {
 		w.WriteHeader(http.StatusBadRequest)
@@ -185,6 +206,13 @@ func (f *fakeVercel) getSandbox(w http.ResponseWriter, r *http.Request, name str
 			_, _ = io.WriteString(w, `{"error":{"code":"snapshot_not_found","message":"the snapshot is gone"}}`)
 			return
 		}
+		if f.atCapacity {
+			tooMany(w)
+			return
+		}
+		if f.resumeTimeout > 0 {
+			sb.timeout = f.resumeTimeout
+		}
 		old := sb.session
 		sb.sessions++
 		sb.session = fmt.Sprintf("sbx_%s_%d", sb.name, sb.sessions)
@@ -217,9 +245,66 @@ func (f *fakeVercel) deleteSandbox(w http.ResponseWriter, r *http.Request, name 
 	_, _ = io.WriteString(w, `{"sandbox":{}}`)
 }
 
+func tooMany(w http.ResponseWriter) {
+	w.WriteHeader(http.StatusTooManyRequests)
+	_, _ = io.WriteString(w, `{"error":{"code":"too_many_requests","message":"The concurrency limit has been exceeded."}}`)
+}
+
+func (f *fakeVercel) team(w http.ResponseWriter) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.planReads++
+	switch {
+	case f.planFail:
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = io.WriteString(w, `{"error":{"code":"internal","message":"try again"}}`)
+	case f.plan == "":
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = io.WriteString(w, `{"error":{"code":"not_found","message":"team not found"}}`)
+	default:
+		_, _ = fmt.Fprintf(w, `{"id":"team","slug":"team","billing":{"plan":%q}}`, f.plan)
+	}
+}
+
+func (f *fakeVercel) extendTimeout(w http.ResponseWriter, r *http.Request, session string) {
+	var body struct {
+		Duration int64 `json:"duration"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&body)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.extended = append(f.extended, body.Duration)
+	if sb := f.sandboxes[f.sessions[session]]; sb != nil {
+		sb.timeout += body.Duration
+	}
+	_, _ = io.WriteString(w, `{"session":{}}`)
+}
+
+// setPlan changes the team's plan, like an upgrade on vercel.com.
+func (f *fakeVercel) setPlan(plan string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.plan = plan
+}
+
+// state returns the sandbox's state: running, stopped or deleted.
+func (f *fakeVercel) state(name string) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if sb := f.sandboxes[name]; sb != nil {
+		return sb.state
+	}
+	return ""
+}
+
 func (f *fakeVercel) stopSession(w http.ResponseWriter, session string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.failStop {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = io.WriteString(w, `{"error":{"code":"internal_error","message":"stop failed"}}`)
+		return
+	}
 	f.stopped = append(f.stopped, session)
 	if name, ok := f.sessions[session]; ok {
 		f.stopLocked(name)
@@ -963,50 +1048,5 @@ func TestCreateAfterShutdownIsDestroyed(t *testing.T) {
 	}
 	if len(fake.created) != 1 || len(fake.deleted) != 1 || fake.deleted[0] != fake.created[0] {
 		t.Fatalf("created=%v deleted=%v, want the late sandbox destroyed", fake.created, fake.deleted)
-	}
-}
-
-func TestSandboxLimit(t *testing.T) {
-	srv, fake := newTestServer(t)
-	h := srv.Handler()
-	var last vercel.Sandbox
-	for i := 0; i < maxSandboxes; i++ {
-		rec := do(t, h, http.MethodPost, "/sandboxes", "")
-		if rec.Code != http.StatusCreated {
-			t.Fatalf("create %d: status = %d", i, rec.Code)
-		}
-		_ = json.Unmarshal(rec.Body.Bytes(), &last)
-	}
-	if rec := do(t, h, http.MethodPost, "/sandboxes", ""); rec.Code != http.StatusTooManyRequests {
-		t.Fatalf("create over limit: status = %d, want 429", rec.Code)
-	}
-	if len(fake.created) != maxSandboxes {
-		t.Fatalf("Vercel saw %d creates, want %d", len(fake.created), maxSandboxes)
-	}
-	// Destroying one frees a slot.
-	if rec := do(t, h, http.MethodDelete, "/sandboxes/"+last.Name, ""); rec.Code != http.StatusNoContent {
-		t.Fatalf("destroy status = %d", rec.Code)
-	}
-	if rec := do(t, h, http.MethodPost, "/sandboxes", ""); rec.Code != http.StatusCreated {
-		t.Fatalf("create after destroy: status = %d", rec.Code)
-	}
-}
-
-func TestSandboxLimitConcurrent(t *testing.T) {
-	srv, fake := newTestServer(t)
-	h := srv.Handler()
-	var wg sync.WaitGroup
-	for i := 0; i < 3*maxSandboxes; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			do(t, h, http.MethodPost, "/sandboxes", "")
-		}()
-	}
-	wg.Wait()
-	fake.mu.Lock()
-	defer fake.mu.Unlock()
-	if len(fake.created) > maxSandboxes {
-		t.Fatalf("Vercel saw %d creates, want at most %d", len(fake.created), maxSandboxes)
 	}
 }

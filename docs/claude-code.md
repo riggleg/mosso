@@ -126,7 +126,7 @@ Response from `POST …/claude/messages`:
   failed, `503` Vercel or the Claude token is not configured.
 - The request blocks until Claude finishes. If the client disconnects, Mosso
   asks Vercel to stop the run. The sandbox timeout (default 10 minutes, max
-  45) bounds every run, so create the sandbox with a larger `timeout_seconds`
+  45 on Hobby and 24 hours on Pro and Enterprise) bounds every run, so create the sandbox with a larger `timeout_seconds`
   for longer tasks.
 
 ## Try it

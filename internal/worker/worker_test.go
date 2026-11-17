@@ -487,3 +487,46 @@ func TestListenAndServeRefusesNonLoopback(t *testing.T) {
 		t.Fatal("expected an error")
 	}
 }
+
+func TestStatusReportsWhenTheWorkerBecameIdle(t *testing.T) {
+	_, ts, _, _ := newTestWorker(t)
+	st := getStatus(t, ts.URL)
+	if st.State != "idle" || st.IdleSince == nil || time.Since(*st.IdleSince) > time.Minute {
+		t.Fatalf("a new worker: status = %+v, want idle since about now", st)
+	}
+	before := time.Now().UTC()
+	post(t, ts.URL+"/messages", Message{Text: "hi", Prompt: "hi", Dir: t.TempDir(), Token: testToken})
+	waitFor(t, func() bool { return getStatus(t, ts.URL).State == "idle" })
+	st = getStatus(t, ts.URL)
+	if st.IdleSince == nil || st.IdleSince.Before(before) {
+		t.Fatalf("after a task: idle_since = %v, want after %v", st.IdleSince, before)
+	}
+	// While a task runs there is no idle_since: the server must not count
+	// a running task as idle.
+	post(t, ts.URL+"/messages", Message{Text: "slow", Prompt: "slow", Dir: t.TempDir(), Token: testToken})
+	if st := getStatus(t, ts.URL); st.State != "running" || st.IdleSince != nil {
+		t.Fatalf("while running: status = %+v", st)
+	}
+	post(t, ts.URL+"/stop", nil)
+	waitFor(t, func() bool { return getStatus(t, ts.URL).State == "idle" })
+}
+
+func TestIdleSinceSurvivesARestart(t *testing.T) {
+	// A worker restarted (for example after the sandbox resumed) counts
+	// from its log's last event, not from its own start.
+	path := filepath.Join(t.TempDir(), "events.jsonl")
+	old := time.Now().UTC().Add(-2 * time.Hour).Truncate(time.Millisecond)
+	line, _ := json.Marshal(Event{Seq: 1, Time: old, Type: EventResult, TaskID: "task_a", Result: &Result{Text: "done"}})
+	if err := os.WriteFile(path, append(line, '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	l, err := OpenLog(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	st := New(l, "/nonexistent/claude").Status()
+	if st.IdleSince == nil || !st.IdleSince.Equal(old) {
+		t.Fatalf("idle_since = %v, want %v", st.IdleSince, old)
+	}
+}

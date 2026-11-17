@@ -118,6 +118,10 @@ type Status struct {
 	// TaskID and StartedAt describe the running task.
 	TaskID    string     `json:"task_id,omitempty"`
 	StartedAt *time.Time `json:"started_at,omitempty"`
+	// IdleSince is when the worker became idle (its last task ended, or it
+	// started with nothing to do), while it is idle; the server's idle
+	// shutdown counts from it. Workers before protocol 3 do not report it.
+	IdleSince *time.Time `json:"idle_since,omitempty"`
 	// Version identifies the worker build.
 	Version string `json:"version"`
 	PID     int    `json:"pid"`

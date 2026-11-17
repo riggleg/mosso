@@ -397,6 +397,13 @@ func TestWorkspaceShowsCreatingWhileCloning(t *testing.T) {
 
 func TestWorkspaceExpiredStatus(t *testing.T) {
 	srv, _, _, ws := newChatServer(t)
+	// Let the connect that follows creating the workspace finish first: it
+	// would resume an expired session.
+	waitFor(t, func() bool {
+		srv.mu.Lock()
+		defer srv.mu.Unlock()
+		return srv.workspaces[ws.Name].follower != nil
+	})
 	srv.mu.Lock()
 	srv.workspaces[ws.Name].ExpiresAt = time.Now().Add(-time.Second)
 	srv.mu.Unlock()

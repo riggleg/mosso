@@ -6,8 +6,10 @@ the worker and reads back what Claude did, by sequence number. So you can
 start a task, close the laptop or stop Mosso, let Claude finish in the
 sandbox, start Mosso later and read everything that happened. Workspaces are
 saved on your machine and their sandboxes are **persistent**: when a sandbox
-session ends (Vercel stops it after at most 45 minutes), its filesystem is
-snapshotted and resumed on your next message.
+session ends (Mosso stops it when idle, or Vercel at the workspace's session
+length), its filesystem is snapshotted and resumed on your next message.
+Session length, idle shutdown and the plan limits are described in
+[idle-shutdown.md](idle-shutdown.md).
 
 The code lives in `internal/worker` (shared types, the event log, the
 worker's HTTP API and its Claude Code runner), `cmd/mosso-worker` (the
@@ -94,16 +96,19 @@ conversation stay in the database as read-only history, which can be
 archived (see [history.md](history.md)). The branch and pull request stay on
 GitHub. This is the only way a workspace's sandbox is deleted.
 
-## The 45-minute session
+## The end of a session
 
-Vercel stops a session at its timeout (45 minutes is the Hobby maximum and
-Mosso's default for workspaces). Persistence makes this an interruption
-rather than a loss:
+Vercel stops a session at its timeout, the workspace's session length (45
+minutes by default; up to 24 hours on Pro and Enterprise). Mosso stops it
+sooner once it has been idle for the workspace's idle timeout, never while
+Claude works (see [idle-shutdown.md](idle-shutdown.md)). Persistence makes
+the end of a session an interruption rather than a loss:
 
 - **Claude finishes before the timeout.** The worker records the result in
   the sandbox; Mosso shows it as soon as it is connected (right away, or on
-  the next start). The session then idles until the timeout and stops; the
-  snapshot keeps everything.
+  the next start). Idle shutdown then stops the session after the idle
+  timeout (if Mosso is running; otherwise it idles until the session
+  length); the snapshot keeps everything.
 - **The session ends while Claude is working.** Claude Code is killed with
   the VM. Everything recorded before that (its text, tool calls and results
   so far) is in the snapshot; the result is not. Mosso's follower notices
@@ -177,7 +182,7 @@ token) travel in the command's environment, never in its arguments.
 
 | Method & path | Description |
 | --- | --- |
-| `GET /status` | `{"state":"idle"\|"running","seq":N,"session_id":"…","task_id":"…","started_at":"…","version":"2","pid":…,"pending_calls":["call_…"]}` |
+| `GET /status` | `{"state":"idle"\|"running","seq":N,"session_id":"…","task_id":"…","started_at":"…","idle_since":"…","version":"3","pid":…,"pending_calls":["call_…"]}`. `idle_since`, while idle: when the last task ended (after a restart, the time of the log's last event); idle shutdown counts from it. |
 | `GET /events?after=N[&follow=1]` | The events with a sequence number greater than N, one JSON object per line. With `follow`, the stream stays open, sends new events as they are recorded and a `{"type":"ping"}` line every 15 s. |
 | `POST /messages` | `{"text","attachments","prompt","session_id","dir","system_prompt","model","token"}`. `model`, if set, is passed to `claude --model`. Records the `user` event and starts Claude Code. `202 {"task_id","seq"}`; `409` if a task is running. |
 | `POST /stop` | Interrupts the running task (`202`); `409` if idle. |
@@ -190,7 +195,8 @@ same shape as in [claude-code.md](claude-code.md)), `result` (`result`,
 (`call`: `id`, `name`, `arguments`) and `tool_result` (`call`: `id`,
 `result` or `error`).
 
-The worker reports protocol `version` 2. When Mosso finds an idle worker of
+The worker reports protocol `version` 3 (2 added Mosso's tools, 3
+`idle_since`). When Mosso finds an idle worker of
 another version in a sandbox (started by an earlier Mosso), it stops it and
 starts its own, over the same event log.
 
@@ -217,7 +223,11 @@ last sequence number it applied, so a reconnect never duplicates an entry.
 - `GET …/attachments/{id}` answers `410` while the sandbox is stopped (it
   does not boot a sandbox to serve a thumbnail).
 - Chat entries carry `seq`, the worker event they came from.
-- The default workspace session length is now 45 minutes.
+- The default workspace session length is now 45 minutes; it can be chosen
+  per workspace up to the plan's maximum, and `status` gains `stopping` and
+  `resuming`. `POST /workspaces/{name}/sandbox/stop` stops the session and
+  `PATCH /workspaces/{name}` changes the idle timeout; see
+  [idle-shutdown.md](idle-shutdown.md).
 
 ## Security
 

@@ -126,6 +126,13 @@ type workspaceState struct {
 	// Branches are the extra branches the workspace's mirror keeps in
 	// sync (see workspace.branches).
 	Branches []string `json:"branches,omitempty"`
+	// SessionSeconds is the most a sandbox session may last; 0 for
+	// workspaces from before it could be chosen (45 minutes).
+	// IdleTimeoutSeconds is how long the sandbox may idle before Mosso
+	// stops it, 0 for never; nil for workspaces from before idle shutdown,
+	// which get the default. See idle.go.
+	SessionSeconds     int64  `json:"session_seconds,omitempty"`
+	IdleTimeoutSeconds *int64 `json:"idle_timeout_seconds,omitempty"`
 }
 
 // store keeps workspaces and their chats in a SQLite database. It is the

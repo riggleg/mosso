@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"testing"
+	"time"
 )
 
 // TestServeFakeForBrowser serves the real web UI and API over a fake
@@ -35,6 +36,10 @@ import (
 // sections and the New workspace dialog. MOSSO_FAKE_SCENARIO=github creates
 // a workspace in which Claude pushed and opened pull requests into master
 // and uat with Mosso's GitHub tools, and one push failed.
+// MOSSO_FAKE_SCENARIO=idle creates a workspace with one finished turn that
+// idle shutdown stopped, and a running one with a 5-minute idle timeout,
+// to look at idle shutdown. MOSSO_FAKE_PLAN (hobby, pro, enterprise or any
+// other name) is the Vercel plan the fake reports; unset, it is unknown.
 func TestServeFakeForBrowser(t *testing.T) {
 	addr := os.Getenv("MOSSO_FAKE_ADDR")
 	if addr == "" {
@@ -45,6 +50,18 @@ func TestServeFakeForBrowser(t *testing.T) {
 	gh := &fakeGitHubAPI{remote: map[string]string{"uat": "5555555555555555555555555555555555555555"}}
 	withGitHub(t, srv, gh)
 	fake.stdoutFor = fakeRepoSandbox()
+	fake.setPlan(os.Getenv("MOSSO_FAKE_PLAN"))
+	if os.Getenv("MOSSO_FAKE_SCENARIO") == "idle" {
+		rec := do(t, srv.Handler(), http.MethodPost, "/workspaces", `{"repo":"octo/widgets"}`)
+		var ws testWorkspace
+		_ = json.Unmarshal(rec.Body.Bytes(), &ws)
+		do(t, srv.Handler(), http.MethodPost, "/workspaces/"+ws.Name+"/claude/messages", `{"prompt":"Add a README badge"}`)
+		srv.checkIdle(time.Now().Add(16 * time.Minute))
+		t.Logf("workspace %s: stopped by idle shutdown", ws.Name)
+		rec = do(t, srv.Handler(), http.MethodPost, "/workspaces", `{"repo":"octo/widgets","idle_timeout_seconds":300}`)
+		_ = json.Unmarshal(rec.Body.Bytes(), &ws)
+		t.Logf("workspace %s: running, stops after 5 idle minutes", ws.Name)
+	}
 	if os.Getenv("MOSSO_FAKE_SCENARIO") == "github" {
 		rec := do(t, srv.Handler(), http.MethodPost, "/workspaces", `{"repo":"octo/widgets","base":"main","instructions":"Run the relevant tests. When done, create pull requests targeting both main and uat."}`)
 		var ws testWorkspace

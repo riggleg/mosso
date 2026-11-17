@@ -181,7 +181,9 @@ type turnRun struct {
 // userIdx is the chat entry already showing the prompt, or -1 to add one:
 // a workspace created with a first message shows it while it is set up.
 func (s *Server) startTurn(ws *workspace, token claude.Token, prompt string, atts []attachment, sessionID *string, userIdx int) (*turnRun, bool) {
-	if !s.acquire(ws.Name) {
+	// If the sandbox is being stopped right now, wait: the turn then
+	// resumes it.
+	if !s.acquireWaiting(ws) {
 		return nil, false
 	}
 	run := &turnRun{done: make(chan struct{}), userIdx: userIdx}
@@ -217,6 +219,7 @@ func (s *Server) startTurn(ws *workspace, token claude.Token, prompt string, att
 				c.add(chatEntry{Type: "error", Text: err.Error()})
 			}
 			run.err = err
+			s.touchLocked(ws)
 			s.finishTurnLocked(ws, run)
 		}
 	}()
@@ -307,6 +310,11 @@ func (s *Server) applyEvent(ws *workspace, e worker.Event) {
 		return
 	}
 	ws.lastSeq = e.Seq
+	// Worker activity postpones idle shutdown; by the worker's clock, so
+	// events caught up after Mosso was away count from when they happened.
+	if e.Time.After(ws.lastActive) {
+		ws.lastActive = e.Time
+	}
 	c := ws.chat
 	// run is the turn in progress, if the event belongs to it. Events of an
 	// earlier task (for example the worker's "interrupted" marker for a

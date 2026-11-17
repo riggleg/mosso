@@ -452,10 +452,10 @@ func TestTerminateDeletesTheSandboxAndKeepsTheHistory(t *testing.T) {
 	terminated()
 	// It does not hold a sandbox slot.
 	h.srv.mu.Lock()
-	tracked, active := len(h.srv.sandboxes), h.srv.activeSandboxesLocked()
+	tracked := len(h.srv.sandboxes)
 	h.srv.mu.Unlock()
-	if tracked != 0 || active != 0 {
-		t.Fatalf("sandboxes tracked = %d, active = %d after terminate", tracked, active)
+	if tracked != 0 {
+		t.Fatalf("sandboxes tracked = %d after terminate", tracked)
 	}
 
 	h.stop()
@@ -644,18 +644,6 @@ func TestRestoredWorkspaceRemembersPublishedHead(t *testing.T) {
 	h.srv.mu.Unlock()
 	if rec := h.record(); rec.Pushed != testCommitSHA {
 		t.Fatalf("record after a restart and a save: pushed = %q", rec.Pushed)
-	}
-}
-
-// TestStoppedWorkspacesDoNotCountTowardsTheSandboxLimit.
-func TestStoppedWorkspacesDoNotCountTowardsTheSandboxLimit(t *testing.T) {
-	h := newPersistentHarness(t)
-	h.fake.timeout(h.ws.Name)
-	h.waitStatus("stopped")
-	for i := 0; i < maxSandboxes; i++ {
-		if rec := do(t, h.srv.Handler(), http.MethodPost, "/sandboxes", ""); rec.Code != http.StatusCreated {
-			t.Fatalf("create %d: status = %d (a stopped workspace should not count)", i, rec.Code)
-		}
 	}
 }
 
