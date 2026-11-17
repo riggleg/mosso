@@ -54,9 +54,23 @@ func isolatedEnv() []string {
 			env = append(env, kv)
 		}
 	}
-	return append(env, "HOME="+isolatedHome, "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null",
+	env = append(env, "HOME="+isolatedHome, "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null",
 		"GIT_AUTHOR_NAME=Test", "GIT_AUTHOR_EMAIL=test@example.com",
 		"GIT_COMMITTER_NAME=Test", "GIT_COMMITTER_EMAIL=test@example.com")
+	return append(env, noBackgroundGit...)
+}
+
+// noBackgroundGit turns off Git's automatic maintenance and garbage
+// collection. Commands such as commit, fetch and cherry-pick otherwise
+// start "git maintenance run --auto --detach" (and receive-pack "git gc
+// --auto"), which can outlive the test and still be writing in a
+// repository when t.TempDir removes it ("unlinkat …/objects/pack:
+// directory not empty").
+var noBackgroundGit = []string{
+	"GIT_CONFIG_COUNT=3",
+	"GIT_CONFIG_KEY_0=maintenance.auto", "GIT_CONFIG_VALUE_0=false",
+	"GIT_CONFIG_KEY_1=gc.auto", "GIT_CONFIG_VALUE_1=0",
+	"GIT_CONFIG_KEY_2=receive.autogc", "GIT_CONFIG_VALUE_2=false",
 }
 
 func requireGit(t *testing.T) string {
@@ -201,6 +215,12 @@ func newFakeGitHub(t *testing.T, backend, token string, private bool) *fakeGitHu
 		t.Fatal(err)
 	}
 	runGit(t, bare, "", "init", "--quiet", "--bare", "--initial-branch=main")
+	// Pushes into it over the local transport drop the GIT_CONFIG_*
+	// variables of noBackgroundGit on the receiving side, so it keeps the
+	// same settings in its own configuration.
+	for _, kv := range [][2]string{{"maintenance.auto", "false"}, {"gc.auto", "0"}, {"receive.autogc", "false"}} {
+		runGit(t, bare, "", "config", kv[0], kv[1])
+	}
 	work := t.TempDir()
 	runGit(t, work, "", "init", "--quiet", "--initial-branch=main")
 	writeFile(t, filepath.Join(work, "README.md"), "# widgets\n")
@@ -214,7 +234,7 @@ func newFakeGitHub(t *testing.T, backend, token string, private bool) *fakeGitHu
 	f := &fakeGitHub{t: t, bare: bare, token: token}
 	gitHandler := &cgi.Handler{
 		Path: backend,
-		Env:  []string{"GIT_PROJECT_ROOT=" + root, "GIT_HTTP_EXPORT_ALL=1", "GIT_CONFIG_NOSYSTEM=1", "HOME=" + isolatedHome},
+		Env:  append([]string{"GIT_PROJECT_ROOT=" + root, "GIT_HTTP_EXPORT_ALL=1", "GIT_CONFIG_NOSYSTEM=1", "HOME=" + isolatedHome}, noBackgroundGit...),
 	}
 	f.git = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Like GitHub, pushes always need the token.

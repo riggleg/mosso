@@ -1012,6 +1012,11 @@ func (m *Mirror) command(ctx context.Context, tok Token, args ...string) *exec.C
 	full := append([]string{
 		"--git-dir=" + m.local,
 		"-c", "core.hooksPath=/dev/null",
+		// The repository is a throwaway cache that Close deletes: no
+		// background maintenance or gc, which could still be writing in
+		// it then.
+		"-c", "maintenance.auto=false",
+		"-c", "gc.auto=0",
 		"-c", "credential.helper=",
 		"-c", "credential.helper=" + credentialHelper,
 	}, args...)
