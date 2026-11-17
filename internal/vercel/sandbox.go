@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -190,6 +191,25 @@ func InTransition(err error) bool {
 	var apiErr *APIError
 	return errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusUnprocessableEntity &&
 		(apiErr.Code == "sandbox_stopping" || apiErr.Code == "sandbox_snapshotting")
+}
+
+// Transient reports whether err may be a passing failure, so that the
+// request can be retried: a network error or timeout (the request may or
+// may not have reached Vercel), a 429, or a Vercel 5xx other than 501.
+// Cancellation and other API errors (bad credentials, bad requests,
+// missing sandboxes or snapshots) are not transient.
+func Transient(err error) bool {
+	if err == nil || errors.Is(err, context.Canceled) {
+		return false
+	}
+	var apiErr *APIError
+	if errors.As(err, &apiErr) {
+		code := apiErr.StatusCode
+		return code == http.StatusTooManyRequests || (code >= 500 && code != http.StatusNotImplemented)
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr) || errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.EOF)
 }
 
 // CommandResult is the outcome of a finished command.

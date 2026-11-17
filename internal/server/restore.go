@@ -380,20 +380,7 @@ func (s *Server) connect(ctx context.Context, ws *workspace) error {
 // from the last snapshot; the worker is started again by connect.
 func (s *Server) resume(ctx context.Context, ws *workspace) error {
 	s.addEntry(ws.chat, chatEntry{Type: "notice", Text: "Resuming the sandbox from its last snapshot…"})
-	var sb *vercel.Sandbox
-	var err error
-	for attempt := 0; ; attempt++ {
-		sb, err = s.vercel.Get(ctx, ws.Name, true)
-		if err == nil || !vercel.InTransition(err) || attempt >= 20 {
-			break
-		}
-		// Stopping or snapshotting: wait for it.
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(3 * time.Second):
-		}
-	}
+	sb, err := s.resumeSandbox(ctx, ws.Name)
 	switch {
 	case vercel.IsNotFound(err) || vercel.SnapshotGone(err):
 		s.markGone(ws)
@@ -430,6 +417,83 @@ func (s *Server) resume(ctx context.Context, ws *workspace) error {
 	}
 	s.persistLocked(ws)
 	return nil
+}
+
+// Resuming retries failures that may pass (vercel.Transient) up to
+// resumeAttempts times in all, waiting resumeBackoff before the first
+// retry and twice as long before each next one. Each request may take
+// resumeAttemptTimeout, so that a hung one is retried within resumeTimeout.
+// Variables so that tests can shorten them.
+var (
+	resumeAttempts       = 3
+	resumeBackoff        = 2 * time.Second
+	resumeAttemptTimeout = 45 * time.Second
+)
+
+// resumeSandbox asks Vercel to resume the sandbox. It waits while the
+// sandbox is stopping or snapshotting, and retries transient failures with
+// exponential backoff. A failed request may still have resumed the
+// sandbox (a timeout, a gateway error), so after one it first looks at the
+// sandbox and uses its session if it is running. It only ever looks the
+// sandbox up: it never creates a replacement nor deletes anything.
+func (s *Server) resumeSandbox(ctx context.Context, name string) (*vercel.Sandbox, error) {
+	failures, transitions := 0, 0
+	var lastErr error
+	for {
+		actx, cancel := context.WithTimeout(ctx, resumeAttemptTimeout)
+		sb, err := s.vercel.Get(actx, name, true)
+		cancel()
+		var wait time.Duration
+		switch {
+		case err == nil:
+			return sb, nil
+		case ctx.Err() != nil:
+			return nil, ctxError(ctx, lastErr)
+		case vercel.InTransition(err) && transitions < 20:
+			// Stopping or snapshotting: wait for it.
+			transitions++
+			wait = 3 * time.Second
+		case vercel.Transient(err):
+			failures++
+			if errors.Is(err, context.DeadlineExceeded) {
+				err = fmt.Errorf("vercel did not answer within %s", resumeAttemptTimeout)
+			}
+			lastErr = err
+			cctx, cancel := context.WithTimeout(ctx, resumeAttemptTimeout)
+			cur, cerr := s.vercel.Get(cctx, name, false)
+			cancel()
+			switch {
+			case cerr == nil && cur.Running():
+				log.Printf("workspace %s: resuming the sandbox failed (%v), but it did resume", name, err)
+				return cur, nil
+			case vercel.IsNotFound(cerr):
+				return nil, cerr
+			case ctx.Err() != nil:
+				return nil, ctxError(ctx, lastErr)
+			}
+			if failures >= resumeAttempts {
+				return nil, fmt.Errorf("%w (gave up after %d attempts)", err, failures)
+			}
+			wait = resumeBackoff << (failures - 1)
+			log.Printf("workspace %s: resuming the sandbox failed: %v (retrying in %s)", name, err, wait)
+		default:
+			return nil, err
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctxError(ctx, lastErr)
+		case <-time.After(wait):
+		}
+	}
+}
+
+// ctxError is ctx's error, with the last failure that was being retried
+// when it ended, if any.
+func ctxError(ctx context.Context, last error) error {
+	if last == nil {
+		return ctx.Err()
+	}
+	return fmt.Errorf("%w (after: %v)", ctx.Err(), last)
 }
 
 // follow reads the worker's events for the session and records them, for

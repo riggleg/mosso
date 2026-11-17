@@ -629,3 +629,48 @@ func TestRunStreamKillsCommandWhenContextEnds(t *testing.T) {
 		t.Fatal("command was not killed")
 	}
 }
+
+func TestTransient(t *testing.T) {
+	timeout, cancel := context.WithTimeout(context.Background(), 0)
+	defer cancel()
+	<-timeout.Done()
+	for _, tc := range []struct {
+		err  error
+		want bool
+	}{
+		{nil, false},
+		{&APIError{StatusCode: 500}, true},
+		{fmt.Errorf("get sandbox: %w", &APIError{StatusCode: 503}), true},
+		{&APIError{StatusCode: 504}, true},
+		{&APIError{StatusCode: 429}, true},
+		{&APIError{StatusCode: 501}, false},
+		{&APIError{StatusCode: 400}, false},
+		{&APIError{StatusCode: 401}, false},
+		{&APIError{StatusCode: 403}, false},
+		{&APIError{StatusCode: 404}, false},
+		{&APIError{StatusCode: 410, Code: "snapshot_not_found"}, false},
+		{timeout.Err(), true},
+		{context.Canceled, false},
+		{fmt.Errorf("decode response: %w", io.ErrUnexpectedEOF), true},
+		{errors.New("response did not include a session id"), false},
+	} {
+		if got := Transient(tc.err); got != tc.want {
+			t.Errorf("Transient(%v) = %t, want %t", tc.err, got, tc.want)
+		}
+	}
+}
+
+func TestTransientNetworkErrors(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	srv.Close() // connection refused
+	c := NewClient(Config{Token: testToken, TeamID: "t", ProjectID: "p", BaseURL: srv.URL})
+	_, err := c.Get(context.Background(), "sb", true)
+	if err == nil || !Transient(err) {
+		t.Fatalf("connection refused: err = %v, transient = %t", err, Transient(err))
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := c.Get(ctx, "sb", true); Transient(err) {
+		t.Fatalf("cancelled: err = %v is transient", err)
+	}
+}
