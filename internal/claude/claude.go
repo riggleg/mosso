@@ -9,9 +9,11 @@ package claude
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"regexp"
 	"strings"
 	"unicode/utf8"
@@ -34,6 +36,9 @@ const (
 	maxEventBytes = 16 << 20
 	// maxToolResultBytes caps each tool result returned to API callers.
 	maxToolResultBytes = 16 << 10
+	// MaxImageBytes caps one image Claude's activity carries (decoded).
+	// Larger ones are left out, with a placeholder in the text.
+	MaxImageBytes = 10 << 20
 )
 
 // installScript installs Claude Code with the official native installer
@@ -117,7 +122,8 @@ type Turn struct {
 
 // Event is a piece of Claude's activity during a turn.
 type Event struct {
-	// Type is "text", "tool_use" or "tool_result".
+	// Type is "text", "tool_use", "tool_result" or "image" (an image
+	// block outside a tool result).
 	Type string `json:"type"`
 	Text string `json:"text,omitempty"`
 	// ToolUseID links a tool_result to its tool_use.
@@ -128,6 +134,49 @@ type Event struct {
 	IsError   bool            `json:"is_error,omitempty"`
 	// ParentToolUseID is set for activity inside a subagent.
 	ParentToolUseID string `json:"parent_tool_use_id,omitempty"`
+	// Images are the images of an "image" event or a tool result (for
+	// example a screenshot a tool returned), and, once the sandbox worker
+	// has looked, image files a tool created and images a "text" event
+	// refers to in Markdown.
+	Images []Image `json:"images,omitempty"`
+}
+
+// Image is an image in Claude's activity. The parser fills in Type and
+// Data; the sandbox worker stores Data in the sandbox and records the
+// rest, so events never carry image bytes.
+type Image struct {
+	// ID names the stored image: the first 32 hex digits of the SHA-256
+	// of its content.
+	ID string `json:"id,omitempty"`
+	// Type is the MIME type, decided by the content.
+	Type string `json:"type"`
+	Size int64  `json:"size,omitempty"`
+	// Name is a file name for downloads; Path is the sandbox file the
+	// image was found at, if it came from one.
+	Name string `json:"name,omitempty"`
+	Path string `json:"path,omitempty"`
+	// Ref is the reference a "text" event's Markdown used for it, as
+	// written: ![…](Ref).
+	Ref string `json:"ref,omitempty"`
+	// Data is the image itself, until it is stored.
+	Data []byte `json:"-"`
+}
+
+// RasterTypes are the image types Claude Code passes around (and browsers
+// show inline): PNG, JPEG, GIF and WebP.
+var RasterTypes = map[string]bool{"image/png": true, "image/jpeg": true, "image/gif": true, "image/webp": true}
+
+// RasterType returns the MIME type of a PNG, JPEG, GIF or WebP image,
+// judged by its content, or "" for anything else.
+func RasterType(data []byte) string {
+	if len(data) > 512 {
+		data = data[:512]
+	}
+	t := http.DetectContentType(data)
+	if RasterTypes[t] {
+		return t
+	}
+	return ""
 }
 
 // Send runs one Claude Code turn in the sandbox and waits for it to finish.
@@ -245,6 +294,7 @@ type streamMessage struct {
 
 type contentBlock struct {
 	Type      string          `json:"type"`
+	Source    *imageSource    `json:"source"`
 	Text      string          `json:"text"`
 	ID        string          `json:"id"`
 	Name      string          `json:"name"`
@@ -252,6 +302,34 @@ type contentBlock struct {
 	ToolUseID string          `json:"tool_use_id"`
 	Content   json.RawMessage `json:"content"`
 	IsError   bool            `json:"is_error"`
+}
+
+// imageSource is the source of an image content block. Claude Code sends
+// images it read or a tool returned as base64; other kinds (URLs) are not
+// fetched.
+type imageSource struct {
+	Type      string `json:"type"`
+	MediaType string `json:"media_type"`
+	Data      string `json:"data"`
+}
+
+// image decodes an image block. It fails for anything but a base64 PNG,
+// JPEG, GIF or WebP of at most MaxImageBytes; the type comes from the
+// content, not from the block's claim.
+func (b contentBlock) image() (Image, bool) {
+	src := b.Source
+	if src == nil || src.Type != "base64" || base64.StdEncoding.DecodedLen(len(src.Data)) > MaxImageBytes+2 {
+		return Image{}, false
+	}
+	data, err := base64.StdEncoding.DecodeString(src.Data)
+	if err != nil || len(data) == 0 || len(data) > MaxImageBytes {
+		return Image{}, false
+	}
+	typ := RasterType(data)
+	if typ == "" {
+		return Image{}, false
+	}
+	return Image{Type: typ, Size: int64(len(data)), Data: data}, true
 }
 
 // ParseStream turns `claude -p --output-format stream-json --verbose` output
@@ -354,8 +432,15 @@ func contentEvents(raw json.RawMessage, parent string) []Event {
 			e.ToolUseID, e.Name, e.Input = b.ID, b.Name, b.Input
 		case "tool_result":
 			e.ToolUseID, e.IsError = b.ToolUseID, b.IsError
-			e.Content = truncate(toolResultText(b.Content), maxToolResultBytes)
-		default: // thinking, images, etc.
+			text, images := toolResultContent(b.Content)
+			e.Content, e.Images = truncate(text, maxToolResultBytes), images
+		case "image":
+			img, ok := b.image()
+			if !ok {
+				continue
+			}
+			e.Images = []Image{img}
+		default: // thinking, etc.
 			continue
 		}
 		events = append(events, e)
@@ -363,26 +448,36 @@ func contentEvents(raw json.RawMessage, parent string) []Event {
 	return events
 }
 
-// toolResultText flattens tool_result content, which is either a string or
-// an array of content blocks.
-func toolResultText(raw json.RawMessage) string {
+// toolResultContent flattens tool_result content, which is either a string
+// or an array of content blocks, into text and the images it holds. An
+// image that cannot be kept (unsupported, malformed or too large), and any
+// other kind of block, leaves a placeholder in the text.
+func toolResultContent(raw json.RawMessage) (string, []Image) {
 	var s string
 	if json.Unmarshal(raw, &s) == nil {
-		return s
+		return s, nil
 	}
 	var blocks []contentBlock
 	if json.Unmarshal(raw, &blocks) != nil {
-		return ""
+		return "", nil
 	}
 	var parts []string
+	var images []Image
 	for _, b := range blocks {
-		if b.Type == "text" {
+		switch {
+		case b.Type == "text":
 			parts = append(parts, b.Text)
-		} else if b.Type != "" {
+		case b.Type == "image":
+			if img, ok := b.image(); ok {
+				images = append(images, img)
+			} else {
+				parts = append(parts, "[image]")
+			}
+		case b.Type != "":
 			parts = append(parts, "["+b.Type+"]")
 		}
 	}
-	return strings.Join(parts, "\n")
+	return strings.Join(parts, "\n"), images
 }
 
 func truncate(s string, n int) string {

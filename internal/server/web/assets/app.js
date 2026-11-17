@@ -1043,10 +1043,18 @@ function container(ev) {
 
 function renderEvent(ev) {
   const where = container(ev);
+  const images = (ev.images || []).filter((img) => img.id);
   if (ev.type === "text") {
     const div = h("div", { class: "entry md" });
-    div.appendChild(window.renderMarkdown(ev.text));
+    // Markdown images show what the worker found at the reference.
+    const image = (ref, alt) => {
+      const img = images.find((i) => i.ref === ref);
+      return img ? imageFigure(img, alt) : null;
+    };
+    div.appendChild(window.renderMarkdown(ev.text, { image }));
     where.appendChild(div);
+  } else if (ev.type === "image") {
+    if (images.length) where.appendChild(imageGallery(images));
   } else if (ev.type === "tool_use") {
     const input = ev.input || {};
     const stateEl = h("span", { class: "tool-state pending", text: "running" });
@@ -1070,15 +1078,21 @@ function renderEvent(ev) {
     state.tools.set(ev.tool_use_id, { details, state: stateEl, body, children });
   } else if (ev.type === "tool_result") {
     const tool = state.tools.get(ev.tool_use_id);
-    const pre = h("pre", { class: ev.is_error ? "failed" : "", text: ev.content || "(no output)" });
+    const pre = h("pre", { class: ev.is_error ? "failed" : "", text: ev.content || (images.length ? "(image)" : "(no output)") });
+    // Images a tool returned or wrote show under the tool, outside its
+    // collapsed details.
+    const gallery = images.length ? imageGallery(images) : null;
     if (!tool) {
-      where.appendChild(h("details", { class: "entry tool" }, h("summary", {}, h("span", { class: "tool-name", text: "Tool result" })), h("div", { class: "tool-body" }, pre)));
+      const details = h("details", { class: "entry tool" }, h("summary", {}, h("span", { class: "tool-name", text: "Tool result" })), h("div", { class: "tool-body" }, pre));
+      where.appendChild(details);
+      if (gallery) where.appendChild(gallery);
       return;
     }
     tool.state.className = "tool-state " + (ev.is_error ? "failed" : "ok");
     tool.state.textContent = ev.is_error ? "failed" : "✓";
     tool.body.appendChild(h("span", { class: "label", text: ev.is_error ? "Error" : "Result" }));
     tool.body.appendChild(pre);
+    if (gallery) tool.details.after(gallery);
   }
 }
 
@@ -1180,6 +1194,61 @@ function toolInput(name, input, body) {
 // ---------- attachments ----------
 
 const attachmentURL = (ws, id) => wsPath(ws) + "/attachments/" + encodeURIComponent(id);
+const imageURL = (ws, id) => wsPath(ws) + "/images/" + encodeURIComponent(id);
+
+// ---------- images in Claude's activity ----------
+
+// imageGallery shows images a tool returned or wrote.
+function imageGallery(images) {
+  return h("div", { class: "entry shots" }, ...images.map((img) => imageFigure(img)));
+}
+
+// imageFigure shows one image Mosso serves: a thumbnail that opens the
+// preview, its file name or caption, and a download button. An image that
+// cannot be loaded (the sandbox is stopped and it is not cached, or it is
+// gone) says so.
+function imageFigure(img, alt) {
+  const url = imageURL(state.selected, img.id);
+  const name = img.name || "Image";
+  const caption = alt || (img.path ? relPath(img.path) : name);
+  const label = caption + (img.size ? " (" + Attach.formatSize(img.size) + ")" : "");
+  const pic = h("img", { alt: alt || name, loading: "lazy" });
+  pic.src = url;
+  const status = h("span", { class: "sub" });
+  const thumb = h("button", { class: "shot-img", type: "button", title: "Preview " + caption, "aria-label": "Preview " + label, onclick: () => openPreview(url, label, { name, url }) }, pic);
+  const fig = h(
+    "span",
+    { class: "shot" },
+    thumb,
+    h(
+      "span",
+      { class: "shot-caption" },
+      h("span", { class: "fname", text: caption, title: img.path || name }),
+      h("button", { class: "retry", type: "button", title: "Download", "aria-label": "Download " + name, text: "⤓", onclick: () => downloadAttachment({ name }, url, status, fig) }),
+    ),
+    status,
+  );
+  pic.addEventListener("error", async () => {
+    fig.classList.add("gone");
+    thumb.disabled = true;
+    thumb.replaceChildren(h("span", { class: "shot-missing", text: "Image unavailable" }));
+    // The server says why: 410 for a stopped or gone sandbox, 404 for an
+    // image no longer in it; otherwise the browser could not display it.
+    let code = 0;
+    try {
+      code = (await fetch(url, { method: "HEAD" })).status;
+    } catch (e) {}
+    status.textContent =
+      code === 410
+        ? "Not available while the sandbox is stopped or gone; resume it and reload"
+        : code === 404
+          ? "The image is no longer in the sandbox"
+          : code === 200
+            ? "Cannot be displayed; download it instead"
+            : "Could not load the image";
+  });
+  return fig;
+}
 let nextAttachmentKey = 0;
 
 const pendingFor = (name) => {
@@ -1204,7 +1273,7 @@ function attachmentChip(a, opts) {
       visual.disabled = true;
       sub.textContent = "Not available while the sandbox is stopped or gone; resume it and reload";
     });
-    visual = h("button", { class: "thumb", type: "button", title: "Preview " + a.name, "aria-label": "Preview " + label, onclick: () => openPreview(preview, label) }, img);
+    visual = h("button", { class: "thumb", type: "button", title: "Preview " + a.name, "aria-label": "Preview " + label, onclick: () => openPreview(preview, label, item ? null : { name: a.name, url: preview }) }, img);
   } else {
     visual = h("span", { class: "file-icon", "aria-hidden": "true", text: Attach.extension(a.name) });
   }
@@ -1228,10 +1297,16 @@ function attachmentChip(a, opts) {
   return li;
 }
 
-function openPreview(src, label) {
+// previewDownload is what the preview's Download button saves: { name,
+// url } of a file Mosso serves, or null.
+let previewDownload = null;
+
+function openPreview(src, label, download) {
   $("preview-img").src = src;
   $("preview-img").alt = label;
   $("preview-name").textContent = label;
+  previewDownload = download || null;
+  $("preview-download").classList.toggle("hidden", !previewDownload);
   $("preview-dialog").showModal();
 }
 
@@ -1808,6 +1883,7 @@ function init() {
     if (hasFiles(e)) onDrop(e);
   });
   $("preview-close").addEventListener("click", () => $("preview-dialog").close());
+  $("preview-download").addEventListener("click", () => previewDownload && downloadAttachment(previewDownload, previewDownload.url, $("preview-name"), $("preview-dialog")));
   $("preview-dialog").addEventListener("click", (e) => e.target === $("preview-dialog") && $("preview-dialog").close());
   $("preview-dialog").addEventListener("close", () => $("preview-img").removeAttribute("src"));
   $("prompt").addEventListener("input", (e) => {

@@ -80,3 +80,68 @@ func TestAttachmentVisionEndToEnd(t *testing.T) {
 		t.Errorf("Claude answered %q, want orange: it did not see the image", turn.Result)
 	}
 }
+
+// TestImageResultsEndToEnd checks, with real accounts, that Mosso finds the
+// image in real Claude Code output: Claude reads a PNG with its Read tool,
+// and the tool result must carry it as an image (not an "[image]"
+// placeholder). Opt in with:
+//
+//	MOSSO_E2E=1 go test ./internal/server -run TestImageResultsEndToEnd -v -timeout 20m
+func TestImageResultsEndToEnd(t *testing.T) {
+	if os.Getenv("MOSSO_E2E") != "1" {
+		t.Skip("set MOSSO_E2E=1 to run against real Vercel and Claude accounts")
+	}
+	cfg, err := vercel.ConfigFromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	token, _, err := claude.LoadToken(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	vc := vercel.NewClient(cfg)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
+	defer cancel()
+	sb, err := vc.Create(ctx, vercel.NewSandboxName(), vercel.CreateOptions{Timeout: 20 * time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		dctx, c := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer c()
+		if err := vc.Destroy(dctx, *sb); err != nil {
+			t.Errorf("destroy sandbox %s: %v (check the Vercel dashboard)", sb.Name, err)
+		}
+	})
+	if _, err := claude.Install(ctx, vc, sb.SessionID); err != nil {
+		t.Fatal(err)
+	}
+	img := image.NewRGBA(image.Rect(0, 0, 64, 64))
+	draw.Draw(img, img.Bounds(), &image.Uniform{color.RGBA{B: 255, A: 255}}, image.Point{}, draw.Src)
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, img); err != nil {
+		t.Fatal(err)
+	}
+	if err := vc.WriteFiles(ctx, sb.SessionID, "/vercel/sandbox", []vercel.File{{Name: "blue.png", Data: buf.Bytes()}}); err != nil {
+		t.Fatal(err)
+	}
+	turn, err := claude.Send(ctx, vc, sb.SessionID, token, claude.Request{
+		Prompt: "Use the Read tool to open /vercel/sandbox/blue.png, then reply with only its color.",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, e := range turn.Events {
+		if e.Type == "tool_result" && len(e.Images) > 0 {
+			found = true
+			t.Logf("tool result image: %s, %d bytes; text %q", e.Images[0].Type, e.Images[0].Size, e.Content)
+			if claude.RasterType(e.Images[0].Data) == "" {
+				t.Errorf("the image is not a PNG, JPEG, GIF or WebP")
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("no tool result carried an image; events: %+v", turn.Events)
+	}
+}

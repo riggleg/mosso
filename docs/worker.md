@@ -40,7 +40,8 @@ API and starts it detached (`setsid nohup … &`), with the environment from
 start loads it too. The worker listens on
 `127.0.0.1:7777` inside the sandbox and keeps its state in
 `/vercel/sandbox/.mosso/`: `events.jsonl` (the event log), `worker.log`,
-and `attachments/`. The server saves the workspace record and starts
+`attachments/` and `images/` (images Claude's activity showed, by content
+hash; see [images.md](images.md)). The server saves the workspace record and starts
 following the worker's events.
 
 **Message.** `POST /workspaces/{name}/chat` records your prompt, then in the
@@ -190,7 +191,10 @@ same shape as in [claude-code.md](claude-code.md)), `result` (`result`,
 (`call`: `id`, `name`, `arguments`) and `tool_result` (`call`: `id`,
 `result` or `error`).
 
-The worker reports protocol `version` 2. When Mosso finds an idle worker of
+A `claude` event's `images` lists the images it shows, as references into
+`images/` (`id`, `type`, `size`, `name`, `path`, `ref`), never their bytes.
+
+The worker reports protocol `version` 3 (3 added the image store). When Mosso finds an idle worker of
 another version in a sandbox (started by an earlier Mosso), it stops it and
 starts its own, over the same event log.
 

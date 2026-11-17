@@ -16,7 +16,7 @@ Claude Code's own tools.
 All three end in the same code. Each file uploads as soon as it is added, with
 a progress bar; you can remove it, or retry it if it failed. Send is disabled
 until every upload has finished. A message may be attachments only. Click a
-thumbnail to see it larger. In the history, images show as thumbnails and
+thumbnail to see it larger; the preview has a Download button. In the history, images show as thumbnails and
 other files download from the workspace's sandbox. A refresh, and a Mosso
 restart, keep them; while the sandbox is stopped a thumbnail turns into a
 notice that it is not available until the sandbox resumes.

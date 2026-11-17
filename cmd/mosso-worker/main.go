@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"syscall"
 
+	"github.com/riggleg/mosso/internal/claude"
 	"github.com/riggleg/mosso/internal/worker"
 )
 
@@ -38,6 +39,10 @@ func main() {
 	}
 	defer l.Close()
 	srv := worker.New(l, *claudePath)
+	// Images Claude shows are kept in the state directory; files are read
+	// from the workspace (and attachments) and the temporary directory.
+	tmp := os.TempDir()
+	srv.SetImages(filepath.Join(*state, "images"), *state, tmp, claude.WorkDir, tmp)
 	// Claude Code starts this binary as its MCP server for Mosso's tools.
 	if exe, err := os.Executable(); err == nil {
 		srv.SetMCP(exe, "mcp", "-worker", "http://"+*listen)

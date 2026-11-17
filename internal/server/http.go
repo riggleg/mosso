@@ -100,6 +100,12 @@ type Server struct {
 	cleanups sync.WaitGroup
 	// tools tracks the agent's tool calls being run (see tools.go).
 	tools sync.WaitGroup
+	// imageCache is the directory images are cached in (see images.go),
+	// "" for none; imageFetches tracks the background fetches that fill
+	// it, imageSem bounds how many run at once.
+	imageCache   string
+	imageFetches sync.WaitGroup
+	imageSem     chan struct{}
 }
 
 // New returns a Server. client may be nil, in which case sandbox endpoints
@@ -124,6 +130,7 @@ func New(client *vercel.Client) *Server {
 		busy:            map[string]bool{},
 		workspaces:      map[string]*workspace{},
 		defaultModel:    claude.DefaultModel,
+		imageSem:        make(chan struct{}, 2),
 	}
 	s.githubClient = s.loadGitHubClient
 	return s
@@ -172,6 +179,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /workspaces/{name}/chat", s.requireVercel(s.workspaceChat))
 	mux.HandleFunc("POST /workspaces/{name}/attachments", s.requireVercel(s.uploadAttachments))
 	mux.HandleFunc("GET /workspaces/{name}/attachments/{id}", s.requireVercel(s.downloadAttachment))
+	// Images can be served from the local cache without Vercel.
+	mux.HandleFunc("GET /workspaces/{name}/images/{id}", s.serveImage)
 	mux.HandleFunc("POST /workspaces/{name}/chat/stop", s.requireVercel(s.workspaceStop))
 	mux.HandleFunc("POST /workspaces/{name}/connect", s.requireVercel(s.workspaceConnect))
 	mux.HandleFunc("GET /github/repos", s.githubRepos)
@@ -582,6 +591,7 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	s.mu.Unlock()
 	// Tool calls save what they did on GitHub before the database closes.
 	s.tools.Wait()
+	s.imageFetches.Wait()
 	if s.vercel == nil {
 		return nil
 	}
