@@ -58,8 +58,9 @@ func newQueueID() string {
 	return "q_" + hex.EncodeToString(b[:])
 }
 
-// queueWaitingLocked says queued messages wait to be sent, so a new
-// message must go behind them.
+// queueWaitingLocked says queued messages are ready to be sent: the queue
+// is not empty and not paused. Only sending depends on the pause: a new
+// message joins the end of any nonempty queue.
 func queueWaitingLocked(ws *workspace) bool {
 	return len(ws.Queue) > 0 && ws.QueuePaused == ""
 }
@@ -162,8 +163,8 @@ func (s *Server) dispatchQueue(ws *workspace) {
 }
 
 // sendOrQueue starts a turn for the message if the workspace is free, and
-// queues it if Claude (or a publish) is busy or earlier queued messages are
-// waiting to be sent. A queued message is saved before the answer, and is
+// queues it if Claude (or a publish) is busy or earlier messages are queued,
+// paused or not, so the order holds. A queued message is saved before the answer, and is
 // not queued if it cannot be.
 func (s *Server) sendOrQueue(w http.ResponseWriter, name string, token claude.Token, req messageRequest) {
 	ws, atts, ok := s.acceptMessage(w, name, req)
@@ -172,7 +173,7 @@ func (s *Server) sendOrQueue(w http.ResponseWriter, name string, token claude.To
 	}
 	for {
 		s.mu.Lock()
-		if s.busy[ws.Name] || queueWaitingLocked(ws) {
+		if s.busy[ws.Name] || len(ws.Queue) > 0 {
 			q := queuedMessage{ID: newQueueID(), Text: req.Prompt, Attachments: atts, Time: time.Now().UTC()}
 			ws.Queue = append(ws.Queue, q)
 			unsaved := ws.unsaved
@@ -188,7 +189,7 @@ func (s *Server) sendOrQueue(w http.ResponseWriter, name string, token claude.To
 			// Sending to a stopped sandbox resumes it, queued or not; connect
 			// then sends the queue. Otherwise, the workspace may have become
 			// free meanwhile.
-			resume := !s.busy[ws.Name] && ws.sandboxState == sandboxStopped
+			resume := !s.busy[ws.Name] && ws.QueuePaused == "" && ws.sandboxState == sandboxStopped
 			s.mu.Unlock()
 			if resume {
 				go s.resumeForQueue(ws)

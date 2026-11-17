@@ -52,11 +52,11 @@ const Queue = (() => {
   }
 
   // queuesNext says a message sent now is queued rather than sent: Claude
-  // (or a publish) is busy, or earlier queued messages wait to be sent.
+  // (or a publish) is busy, or messages are queued, paused or not.
   function queuesNext(ws) {
     if (!ws || gone(ws)) return false;
     if (ws.status === "working") return true;
-    return !!(ws.queue && ws.queue.length && !ws.queue_paused);
+    return !!(ws.queue && ws.queue.length);
   }
 
   return { view, queuesNext };

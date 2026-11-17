@@ -70,8 +70,8 @@ test("a message is queued while Claude works or while others wait", () => {
   assert.strictEqual(Queue.queuesNext({ status: "working" }), true);
   assert.strictEqual(Queue.queuesNext({ status: "ready" }), false);
   assert.strictEqual(Queue.queuesNext({ status: "stopped", queue: [q("q_1", "one")] }), true);
-  // Paused: a message sent while Claude is idle goes at once.
-  assert.strictEqual(Queue.queuesNext({ status: "ready", queue_paused: "failed", queue: [q("q_1", "one")] }), false);
+  // Paused: a new message still joins the end of the queue.
+  assert.strictEqual(Queue.queuesNext({ status: "ready", queue_paused: "failed", queue: [q("q_1", "one")] }), true);
   assert.strictEqual(Queue.queuesNext({ status: "error", sandbox_state: "gone", queue: [q("q_1", "one")] }), false);
   assert.strictEqual(Queue.queuesNext(null), false);
 });

@@ -338,8 +338,8 @@ func TestQueuedMessageNotSentBeforeRestartIsSent(t *testing.T) {
 }
 
 // TestQueuePausesWhenClaudeFails: a failed turn keeps the queue but pauses
-// it; a message sent while it is paused and Claude is idle goes at once;
-// resuming sends the queued ones.
+// it; a message sent while it is paused joins the end of the queue;
+// resuming sends them in order.
 func TestQueuePausesWhenClaudeFails(t *testing.T) {
 	h := newPersistentHarness(t)
 	fc := h.fake.claude
@@ -363,20 +363,64 @@ func TestQueuePausesWhenClaudeFails(t *testing.T) {
 		t.Fatalf("saved = %q %+v", rec.QueuePaused, rec.Queue)
 	}
 
-	if st, _ := h.send("direct"); st != "working" {
-		t.Fatalf("send while paused and idle = %s, want working", st)
+	if st, _ := h.send("direct"); st != "queued" {
+		t.Fatalf("send while paused and idle = %s, want queued", st)
 	}
-	waitFor(t, func() bool { return h.queue().Status == "ready" && fc.count() == 2 })
-	if q := h.queue(); len(q.Queue) != 1 || q.QueuePaused != queueFailed {
-		t.Fatalf("queue = %+v", q)
+	time.Sleep(100 * time.Millisecond)
+	if q := h.queue(); len(q.Queue) != 2 || q.QueuePaused != queueFailed || fc.count() != 1 {
+		t.Fatalf("queue = %+v, ran %q", q, fc.ran())
 	}
 
 	if resp := postJSON(t, h.ts.URL+"/workspaces/"+h.ws.Name+"/queue/resume", `{}`); resp.StatusCode != http.StatusOK {
 		t.Fatalf("resume = %d", resp.StatusCode)
 	}
-	h.waitRan("long task", "direct", "queued")
+	h.waitRan("long task", "queued", "direct")
 	if q := h.queue(); q.QueuePaused != "" {
 		t.Fatalf("still paused: %+v", q)
+	}
+}
+
+// TestMessagesSentWhilePausedJoinTheQueue: with A and B queued and the
+// queue paused by a stop, C joins the end of the queue (the synchronous
+// API is refused) and nothing runs until the queue is resumed; then A, B
+// and C run in order.
+func TestMessagesSentWhilePausedJoinTheQueue(t *testing.T) {
+	h := newPersistentHarness(t)
+	fc := h.fake.claude
+	started, release := fc.blockRuns()
+	h.send("long task")
+	<-started
+	h.waitSubmitted()
+	h.send("A")
+	h.send("B")
+	if resp := postJSON(t, h.ts.URL+"/workspaces/"+h.ws.Name+"/chat/stop", `{}`); resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("stop = %d", resp.StatusCode)
+	}
+	waitFor(t, func() bool { q := h.queue(); return q.QueuePaused == queueStopped && q.Status == "ready" })
+	close(release)
+
+	if st, _ := h.send("C"); st != "queued" {
+		t.Fatalf("send while paused = %s, want queued", st)
+	}
+	if resp := postJSON(t, h.ts.URL+"/workspaces/"+h.ws.Name+"/claude/messages", `{"prompt":"sync"}`); resp.StatusCode != http.StatusConflict {
+		t.Fatalf("claude/messages while paused = %d, want 409", resp.StatusCode)
+	}
+	time.Sleep(200 * time.Millisecond)
+	q := h.queue()
+	var texts []string
+	for _, m := range q.Queue {
+		texts = append(texts, m.Text)
+	}
+	if !slices.Equal(texts, []string{"A", "B", "C"}) || q.QueuePaused != queueStopped || fc.count() != 1 {
+		t.Fatalf("while paused: queue %q (%s), ran %q", texts, q.QueuePaused, fc.ran())
+	}
+
+	if resp := postJSON(t, h.ts.URL+"/workspaces/"+h.ws.Name+"/queue/resume", `{}`); resp.StatusCode != http.StatusOK {
+		t.Fatalf("resume = %d", resp.StatusCode)
+	}
+	h.waitRan("long task", "A", "B", "C")
+	if got := userTexts(h.history()); !slices.Equal(got, []string{"long task", "A", "B", "C"}) {
+		t.Fatalf("chat users = %q", got)
 	}
 }
 

@@ -122,8 +122,8 @@ Response from `POST …/claude/messages`:
 - Tool results are truncated to 16 KiB each. Events from subagents carry
   `parent_tool_use_id`.
 - `400` invalid input, `404` unknown sandbox, `409` another message is still
-  running in this sandbox (one at a time), or messages queued in the web UI
-  are waiting to be sent ([queue.md](queue.md)), `502` the sandbox or Vercel API
+  running in this sandbox (one at a time), or messages are queued in the
+  web UI, paused or not ([queue.md](queue.md)), `502` the sandbox or Vercel API
   failed, `503` Vercel or the Claude token is not configured.
 - The request blocks until Claude finishes. If the client disconnects, Mosso
   asks Vercel to stop the run. The sandbox timeout (default 10 minutes, max

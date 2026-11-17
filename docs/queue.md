@@ -28,9 +28,9 @@ Claude while it is still working on the previous one.
 | Mosso stopped or restarted | Kept in the database. After the restart Mosso catches up with the worker and goes on when Claude is done. |
 | The sandbox is gone or the workspace terminated | Kept, shown as **Not sent**. |
 
-While messages are paused and Claude is idle, a message you send goes at
-once, as usual; it does not lift the pause. While they wait for Claude or
-the sandbox, a new message joins the end of the queue so the order holds.
+While anything is queued, paused or not, a new message joins the end of
+the queue so the order holds; sending it does not lift a pause. Only
+sending the queue waits for **Resume queue**.
 
 ## Never twice
 
@@ -45,8 +45,8 @@ the sandbox, a new message joins the end of the queue so the order holds.
   message is either still queued or in the chat, never both or neither.
 - Only one Claude turn runs per workspace: the queue uses the same
   per-workspace lock as messages and publishes. The synchronous
-  `POST …/claude/messages` answers `409` while queued messages wait, so it
-  cannot jump the queue.
+  `POST …/claude/messages` answers `409` while anything is queued (paused or
+  not), so it cannot jump the queue.
 - A message being sent can no longer be cancelled (`409`).
 
 ## Storage
@@ -59,7 +59,7 @@ see [history.md](history.md)), so no migration was needed. Each entry has
 
 | Method & path | Description |
 | --- | --- |
-| `POST /workspaces/{name}/chat` | As before; while Claude (or a publish) is busy, or earlier queued messages wait, the message is queued and saved instead: `202 {"status":"queued","id":"q_…"}`. `500` if it could not be saved (it is then not queued). |
+| `POST /workspaces/{name}/chat` | As before; while Claude (or a publish) is busy, or anything is queued (paused or not), the message is queued and saved instead: `202 {"status":"queued","id":"q_…"}`. `500` if it could not be saved (it is then not queued). |
 | `DELETE /workspaces/{name}/queue/{id}` | Cancels a queued message; returns the workspace. `404` if it was sent or cancelled already; `409` while it is being sent. Works without Vercel. |
 | `POST /workspaces/{name}/queue/resume` | Lifts a pause and sends the next message when the workspace is free, resuming a stopped sandbox; returns the workspace. `410` if the sandbox is gone. |
 

@@ -564,7 +564,7 @@ func (s *Server) startTurnWithAttachments(w http.ResponseWriter, name string, to
 		return nil, false
 	}
 	s.mu.Lock()
-	waiting := queueWaitingLocked(live)
+	waiting := len(live.Queue) > 0
 	s.mu.Unlock()
 	if waiting {
 		writeError(w, http.StatusConflict, "messages are queued in this workspace; they are sent first")
