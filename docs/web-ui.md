@@ -84,6 +84,19 @@ conversation is still there; sending a message, publishing, or clicking
 seconds. If Claude was interrupted by the session ending, the chat says so;
 ask it to continue.
 
+Resuming rides out a passing Vercel hiccup by itself (`resumeSandbox` in
+`internal/server/restore.go`): a failed connection, a request that times
+out (after 30 seconds), a 429 or a 5xx is retried, up to 3 attempts in all,
+2 then 4 seconds apart. A failed request may still have resumed the
+sandbox, so before retrying Mosso looks the sandbox up (for at most 10
+seconds) and, if it is running, uses that session instead of resuming
+again. Even if Vercel hangs, all of this fits in the 3-minute limit on
+resuming and starting the worker. Retrying only ever asks Vercel to resume the same sandbox: it never
+creates a replacement or deletes a snapshot. Other errors (bad credentials,
+an invalid request, a missing sandbox or snapshot) are reported at once.
+Meanwhile the **Resume sandbox** button keeps saying *Resuming…*; the error
+is shown only when the last attempt fails.
+
 ## Limitations
 
 - **Sessions end after 45 minutes.** Claude is interrupted if it is still

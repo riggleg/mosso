@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -190,6 +191,36 @@ func InTransition(err error) bool {
 	var apiErr *APIError
 	return errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusUnprocessableEntity &&
 		(apiErr.Code == "sandbox_stopping" || apiErr.Code == "sandbox_snapshotting")
+}
+
+// Transient reports whether err may be a passing failure, so that the
+// request can be retried: a network error or timeout (the request may or
+// may not have reached Vercel), a 429, or a Vercel 5xx other than 501.
+// TLS failures, unknown hosts and invalid URLs are not.
+// Cancellation and other API errors (bad credentials, bad requests,
+// missing sandboxes or snapshots) are not transient.
+func Transient(err error) bool {
+	if err == nil || errors.Is(err, context.Canceled) {
+		return false
+	}
+	var apiErr *APIError
+	if errors.As(err, &apiErr) {
+		code := apiErr.StatusCode
+		return code == http.StatusTooManyRequests || (code >= 500 && code != http.StatusNotImplemented)
+	}
+	// Every error from http.Client.Do is a net.Error (*url.Error), even a
+	// bad certificate; only timeouts and failed connections count.
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return true
+	}
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) {
+		return !dnsErr.IsNotFound
+	}
+	var opErr *net.OpError
+	return errors.As(err, &opErr) || errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.EOF)
 }
 
 // CommandResult is the outcome of a finished command.

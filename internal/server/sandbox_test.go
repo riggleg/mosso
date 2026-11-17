@@ -65,6 +65,14 @@ type fakeVercel struct {
 	claude    *fakeClaudeRunner
 	// snapshotLost makes resuming fail with snapshot_not_found.
 	snapshotLost map[string]bool
+	// resumeFaults scripts how the next requests to resume a sandbox
+	// fail: an HTTP status ("503"), "hang" (no answer until the client
+	// gives up) or "resume-hang" (the sandbox resumes, but the answer
+	// never comes). resumes and lookups count the requests to resume and
+	// to look up a sandbox.
+	resumeFaults []string
+	resumes      int
+	lookups      int
 }
 
 type fakeSandbox struct {
@@ -172,7 +180,38 @@ func (f *fakeVercel) createSandbox(w http.ResponseWriter, r *http.Request) {
 
 func (f *fakeVercel) getSandbox(w http.ResponseWriter, r *http.Request, name string) {
 	f.mu.Lock()
+	fault := ""
+	if r.URL.Query().Get("resume") == "true" {
+		f.resumes++
+		if len(f.resumeFaults) > 0 {
+			fault, f.resumeFaults = f.resumeFaults[0], f.resumeFaults[1:]
+		}
+	} else {
+		f.lookups++
+	}
+	switch fault {
+	case "":
+	case "hang":
+		f.mu.Unlock()
+		<-r.Context().Done()
+		return
+	case "resume-hang":
+		f.getSandboxLocked(httptest.NewRecorder(), r, name)
+		f.mu.Unlock()
+		<-r.Context().Done()
+		return
+	default:
+		f.mu.Unlock()
+		code, _ := strconv.Atoi(fault)
+		w.WriteHeader(code)
+		_, _ = fmt.Fprintf(w, `{"error":{"code":"scripted","message":"scripted %d"}}`, code)
+		return
+	}
 	defer f.mu.Unlock()
+	f.getSandboxLocked(w, r, name)
+}
+
+func (f *fakeVercel) getSandboxLocked(w http.ResponseWriter, r *http.Request, name string) {
 	sb := f.sandboxes[name]
 	if sb == nil || sb.state == "deleted" {
 		w.WriteHeader(http.StatusNotFound)
