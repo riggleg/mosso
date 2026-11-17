@@ -417,17 +417,26 @@ type Check struct {
 // Checks are the CI results for a commit.
 type Checks struct {
 	Commit string `json:"commit"`
-	// State sums them up: "success", "failure", "pending", or "none" when
-	// nothing reported on the commit.
-	State  string  `json:"state"`
-	Checks []Check `json:"checks"`
-	// Missing says which kind of result could not be read, and why.
+	// State sums them up: "success", "failure", "pending", "none" when
+	// nothing reported on the commit, or "unknown" when not every result
+	// could be read and none of those read failed or is still running:
+	// what could not be read may have failed.
+	State string `json:"state"`
+	// Complete says both check runs and commit statuses were read. Only
+	// a complete result can show that every check passed.
+	Complete bool    `json:"complete"`
+	Checks   []Check `json:"checks"`
+	// Missing says which kind of result could not be read, and why; Note
+	// says what that means for State.
 	Missing []string `json:"missing,omitempty"`
+	Note    string   `json:"note,omitempty"`
 }
 
 // CommitChecks returns the check runs and commit statuses of commit sha in
 // repo. One kind failing to load (for example, a token without the Checks
-// permission) is reported in Missing; both failing is an error.
+// permission) is reported in Missing and makes the result incomplete: its
+// State is then never "success" or "none", since the results that could not
+// be read may have failed. Both failing is an error.
 func (c *Client) CommitChecks(ctx context.Context, repo, sha string) (*Checks, error) {
 	if !shaPattern.MatchString(sha) {
 		return nil, errors.New("checks: invalid commit")
@@ -483,6 +492,14 @@ func (c *Client) CommitChecks(ctx context.Context, repo, sha string) (*Checks, e
 		return nil, fmt.Errorf("read the checks of %s: %s; %s", sha[:12], out.Missing[0], out.Missing[1])
 	}
 	out.State = checksState(out.Checks)
+	out.Complete = runsErr == nil && statusErr == nil
+	if !out.Complete {
+		if out.State == "success" || out.State == "none" {
+			out.State = "unknown"
+		}
+		out.Note = "Not every CI result could be read (see missing), so this does not show that all checks passed. " +
+			"A failure or pending check listed here is real; anything else may have failed. Tell the user if it matters."
+	}
 	return out, nil
 }
 

@@ -309,7 +309,7 @@ func TestPullRequestDetailsUpdatesAndChecks(t *testing.T) {
 	}
 
 	checks, err := gh.CommitChecks(ctx, testRepo, p.Commit)
-	if err != nil || checks.State != "none" || len(checks.Missing) != 0 {
+	if err != nil || checks.State != "none" || !checks.Complete || len(checks.Missing) != 0 || checks.Note != "" {
 		t.Fatalf("no checks: %+v %v", checks, err)
 	}
 	e.gh.mu.Lock()
@@ -318,15 +318,40 @@ func TestPullRequestDetailsUpdatesAndChecks(t *testing.T) {
 		{"name": "lint", "status": "in_progress", "conclusion": nil},
 	}
 	e.gh.mu.Unlock()
-	if checks, _ = gh.CommitChecks(ctx, testRepo, p.Commit); checks.State != "pending" || len(checks.Checks) != 2 {
+	if checks, _ = gh.CommitChecks(ctx, testRepo, p.Commit); checks.State != "pending" || !checks.Complete || len(checks.Checks) != 2 {
 		t.Fatalf("pending: %+v", checks)
 	}
+	// Without the Commit statuses permission, what is visible can still
+	// be pending or failed, but never shows that everything passed.
 	e.gh.mu.Lock()
-	e.gh.checkRuns[1] = map[string]any{"name": "lint", "status": "completed", "conclusion": "failure", "output": map[string]any{"title": "2 problems"}}
 	e.gh.statusForbidden = true
 	e.gh.mu.Unlock()
+	if checks, _ = gh.CommitChecks(ctx, testRepo, p.Commit); checks.State != "pending" || checks.Complete {
+		t.Fatalf("pending, statuses unreadable: %+v", checks)
+	}
+	e.gh.mu.Lock()
+	e.gh.checkRuns[1] = map[string]any{"name": "lint", "status": "completed", "conclusion": "success"}
+	e.gh.mu.Unlock()
 	checks, err = gh.CommitChecks(ctx, testRepo, p.Commit)
-	if err != nil || checks.State != "failure" || checks.Checks[1].Summary != "2 problems" ||
+	if err != nil || checks.State != "unknown" || checks.Complete || len(checks.Checks) != 2 ||
+		len(checks.Missing) != 1 || !strings.Contains(checks.Missing[0], "Commit statuses: Read-only") ||
+		!strings.Contains(checks.Note, "does not show that all checks passed") {
+		t.Fatalf("passing check runs, statuses unreadable: %+v %v", checks, err)
+	}
+	e.gh.mu.Lock()
+	e.gh.checkRuns = nil
+	e.gh.mu.Unlock()
+	if checks, _ = gh.CommitChecks(ctx, testRepo, p.Commit); checks.State != "unknown" || checks.Complete {
+		t.Fatalf("no check runs, statuses unreadable: %+v", checks)
+	}
+	e.gh.mu.Lock()
+	e.gh.checkRuns = []map[string]any{
+		{"name": "test", "status": "completed", "conclusion": "success"},
+		{"name": "lint", "status": "completed", "conclusion": "failure", "output": map[string]any{"title": "2 problems"}},
+	}
+	e.gh.mu.Unlock()
+	checks, err = gh.CommitChecks(ctx, testRepo, p.Commit)
+	if err != nil || checks.State != "failure" || checks.Complete || checks.Checks[1].Summary != "2 problems" ||
 		len(checks.Missing) != 1 || !strings.Contains(checks.Missing[0], "Commit statuses: Read-only") {
 		t.Fatalf("failure: %+v %v", checks, err)
 	}

@@ -49,6 +49,9 @@ type fakeGitHubAPI struct {
 	fetches   [][]string
 	pushErr   error
 	checkRuns []map[string]any
+	// statusForbidden makes commit statuses unreadable, like a token
+	// without the Commit statuses permission.
+	statusForbidden bool
 }
 
 // pull returns pull request number n. Call with f.mu held.
@@ -146,6 +149,8 @@ func (f *fakeGitHubAPI) pullsAPI(w http.ResponseWriter, r *http.Request, reply f
 		reply(200, map[string]any{"object": map[string]any{"sha": sha}})
 	case strings.HasSuffix(p, "/check-runs"):
 		reply(200, map[string]any{"check_runs": f.checkRuns})
+	case strings.HasPrefix(p, repo+"/commits/") && strings.HasSuffix(p, "/status") && f.statusForbidden:
+		reply(403, map[string]string{"message": "Resource not accessible by personal access token"})
 	case strings.HasPrefix(p, repo+"/commits/") && strings.HasSuffix(p, "/status"):
 		reply(200, map[string]any{"state": "success", "statuses": []any{}})
 	default:

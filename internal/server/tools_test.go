@@ -132,7 +132,7 @@ func TestAgentOpensPullRequestsIntoTwoBases(t *testing.T) {
 	if api.pulls[1]["body"] != "Ported to uat." || api.pulls[1]["draft"] != false {
 		t.Fatalf("GitHub's pull request #2: %v", api.pulls[1])
 	}
-	if c := answers[9].result(t); c["state"] != "none" || c["commit"] != testCommitSHA {
+	if c := answers[9].result(t); c["state"] != "none" || c["complete"] != true || c["note"] != nil || c["commit"] != testCommitSHA {
 		t.Fatalf("checks: %v", c)
 	}
 	if c := answers[10].result(t); c["branch"] != "uat" || c["commit"] != strings.Repeat("5", 40) {
@@ -413,5 +413,28 @@ func TestOldWorkerIsReplacedWhenIdle(t *testing.T) {
 	answers[0].result(t)
 	if n := countTypes(h.history())["user"]; n != 2 {
 		t.Fatalf("history has %d user entries, want 2", n)
+	}
+}
+
+// TestChecksNeverClaimSuccessWhenIncomplete: with check runs all green but
+// commit statuses unreadable (a token without that permission), the agent
+// is told the result is incomplete, not that CI passed.
+func TestChecksNeverClaimSuccessWhenIncomplete(t *testing.T) {
+	srv, fake, api, ws := toolServer(t)
+	api.mu.Lock()
+	api.checkRuns = []map[string]any{{"name": "test", "status": "completed", "conclusion": "success"}}
+	api.statusForbidden = true
+	api.mu.Unlock()
+	answers := runTurn(t, srv, fake, ws.Name,
+		call(worker.ToolPush, `{}`),
+		call(worker.ToolCreatePR, `{"title":"Fix"}`),
+		call(worker.ToolChecks, `{"pr":1}`),
+	)
+	c := answers[2].result(t)
+	missing, _ := c["missing"].([]any)
+	note, _ := c["note"].(string)
+	if c["state"] != "unknown" || c["complete"] != false || len(missing) != 1 ||
+		!strings.Contains(missing[0].(string), "Commit statuses") || !strings.Contains(note, "does not show that all checks passed") {
+		t.Fatalf("checks: %v", c)
 	}
 }

@@ -28,7 +28,7 @@ argument.
 | `github_list_prs` | Lists the pull requests from the workspace's branches (`state`: `open`, `closed`, `all`). |
 | `github_get_pr` | Reads one of the workspace's pull requests: title, description, state, draft, merged, mergeable, head and base. |
 | `github_update_pr` | Changes the title, description or draft status of one of the workspace's open pull requests. |
-| `github_checks` | Reads the CI results (check runs and commit statuses) of one of the workspace's pull requests, or of a branch, with a summary: `success`, `failure`, `pending` or `none`. |
+| `github_checks` | Reads the CI results (check runs and commit statuses) of one of the workspace's pull requests, or of a branch, with a summary: `success`, `failure`, `pending`, `none` or `unknown`, and `complete`. If either kind of result cannot be read (`complete: false`, see `missing`), it never reports `success` or `none`: the state is `unknown` unless a visible check failed or is still running. |
 | `github_fetch` | Fetches a branch (for example `uat`) into the sandbox as `origin/<branch>`, and keeps it current before every turn. `git fetch` cannot do this in the sandbox for a private repository. Other workspaces' `mosso/*` branches are refused. |
 
 Errors are written for Claude to act on: each says what was refused or
@@ -223,8 +223,9 @@ knows it may later replace with `--force-with-lease` on Update PR.
 The same fine-grained token as before (Contents and Pull requests: Read
 and write). `github_checks` also needs **Checks: Read-only** and **Commit
 statuses: Read-only**; the token link in Mosso now preselects them. Without
-them, `github_checks` says which permission is missing and the other tools
-are unaffected. Changing the draft status uses GitHub's GraphQL API, which
+them, `github_checks` says which permission is missing, marks its result
+`complete: false` and reports `unknown` rather than `success`, since the
+results it cannot read may have failed; the other tools are unaffected. Changing the draft status uses GitHub's GraphQL API, which
 fine-grained tokens with Pull requests: Read and write can do.
 
 ## In the web UI

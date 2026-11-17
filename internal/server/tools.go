@@ -574,14 +574,14 @@ func (s *Server) toolChecks(ctx context.Context, e toolEnv, a worker.ChecksArgs)
 	if err != nil {
 		return nil, err
 	}
-	out := map[string]any{"commit": checks.Commit, "state": checks.State, "checks": checks.Checks}
+	out := map[string]any{"commit": checks.Commit, "state": checks.State, "complete": checks.Complete, "checks": checks.Checks}
 	if a.PR > 0 {
 		out["pr"] = a.PR
 	} else {
 		out["branch"] = a.Branch
 	}
 	if len(checks.Missing) > 0 {
-		out["missing"] = checks.Missing
+		out["missing"], out["note"] = checks.Missing, checks.Note
 	}
 	return out, nil
 }

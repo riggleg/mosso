@@ -118,7 +118,8 @@ var Tools = []Tool{
 		Name:  ToolChecks,
 		Title: "Read CI results",
 		Description: "Read the CI results (check runs and commit statuses) of the head commit of one of this workspace's pull requests, or of a branch. " +
-			"The summary state is success, failure, pending or none. Checks take time after a push: if pending, wait and ask again rather than polling quickly.",
+			"The summary state is success, failure, pending, none, or unknown. \"complete\": false means some results could not be read (see missing): then success is never claimed, and the state is unknown unless a failure or pending check is visible. " +
+			"Checks take time after a push: if pending, wait and ask again rather than polling quickly.",
 		InputSchema: json.RawMessage(`{
   "type": "object",
   "properties": {
