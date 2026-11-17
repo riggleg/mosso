@@ -46,9 +46,10 @@ checked November 2026):
 | Enterprise | 24 hours |
 
 - The plan is cached for an hour. When a workspace asks for a longer session
-  than the cached plan allows, Mosso checks again first, so an account
-  upgraded on vercel.com can use its new limit at once, with no restart or
-  configuration. `GET /vercel/auth?refresh=1` checks right away.
+  than the cached plan allows, Mosso checks again first (at most once a
+  minute), so an account upgraded on vercel.com can use its new limit, with
+  no restart or configuration. `GET /vercel/auth?refresh=1` checks again
+  too.
 - If the check fails, Mosso keeps the plan from the last successful check,
   or uses the Hobby limits if there was none. A plan Mosso does not know
   also gets the Hobby limits. The sidebar's Vercel line shows the plan and
@@ -123,7 +124,10 @@ resume waits for a stop in progress to end.
 
 **Stop sandbox** in the header (`POST /workspaces/{name}/sandbox/stop`)
 does the same at once, without waiting for the idle timeout. It is refused
-(`409`) while Claude or a publish is running: stop Claude first.
+(`409`) while Claude or a publish is running: stop Claude first. If Vercel
+refuses the stop, the request fails (`502`) and the sandbox keeps running;
+nothing is retried for you. Clicking Stop while an idle check is deciding
+waits for it, then stops the sandbox if the check did not.
 
 ## Workspace statuses
 

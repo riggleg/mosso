@@ -25,6 +25,9 @@ const (
 	planRetry = 5 * time.Minute
 	// planTimeout bounds one check.
 	planTimeout = 10 * time.Second
+	// planForceGap is how soon after a check a forced one may follow
+	// (Server.planForceGap; tests shorten it).
+	planForceGap = time.Minute
 )
 
 // planInfo is what Mosso knows about the Vercel plan, as GET /vercel/auth
@@ -55,8 +58,9 @@ type planInfo struct {
 func (p planInfo) maxSession() time.Duration { return vercel.LimitsFor(p.Plan).MaxSessionDuration }
 
 // vercelPlan returns the plan, from the cache unless it is stale or force
-// is set. A failed check keeps the plan from the last successful one, or
-// Hobby's limits if there was none. Checks run one at a time.
+// is set (a forced check still waits planForceGap after the last one). A
+// failed check keeps the plan from the last successful one, or Hobby's
+// limits if there was none. Checks run one at a time.
 func (s *Server) vercelPlan(ctx context.Context, force bool) planInfo {
 	s.planMu.Lock()
 	defer s.planMu.Unlock()
@@ -65,6 +69,9 @@ func (s *Server) vercelPlan(ctx context.Context, force bool) planInfo {
 	s.mu.Unlock()
 	fresh := !p.tried.IsZero() && time.Since(p.tried) < planRetry ||
 		p.PlanError == "" && !p.CheckedAt.IsZero() && time.Since(p.CheckedAt) < planTTL
+	if force && !p.tried.IsZero() && time.Since(p.tried) < s.planForceGap {
+		force = false // checked a moment ago
+	}
 	if s.vercel == nil || fresh && !force {
 		return p.withLimits()
 	}

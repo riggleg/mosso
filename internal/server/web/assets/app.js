@@ -717,7 +717,7 @@ function renderIdleSelect(ws) {
     sel.dataset.sig = sig;
   }
   sel.value = String(value);
-  sel.disabled = state.savingIdle || ws.status === "creating" || noVercel();
+  sel.disabled = state.savingIdle || ws.status === "creating";
 }
 
 async function changeIdleTimeout() {

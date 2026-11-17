@@ -97,8 +97,9 @@ type Server struct {
 
 	// plan is the Vercel plan as last checked (see plan.go); guarded by
 	// mu. planMu makes checks run one at a time.
-	plan   planInfo
-	planMu sync.Mutex
+	plan         planInfo
+	planMu       sync.Mutex
+	planForceGap time.Duration
 	// idleCheck is how often idle workspaces are looked for (see idle.go).
 	idleCheck time.Duration
 }
@@ -126,8 +127,12 @@ func New(client *vercel.Client) *Server {
 		workspaces:      map[string]*workspace{},
 		defaultModel:    claude.DefaultModel,
 		idleCheck:       idleCheckInterval,
+		planForceGap:    planForceGap,
 	}
 	s.githubClient = s.loadGitHubClient
+	if client != nil {
+		go s.idleLoop() // until Shutdown; see idle.go
+	}
 	return s
 }
 
@@ -303,7 +308,7 @@ func (s *Server) provision(ctx context.Context, opts vercel.CreateOptions) (*ver
 		}
 		if opts.Timeout > vercel.HobbyMaxTimeout {
 			// Perhaps the plan changed since it was checked.
-			s.vercelPlan(context.WithoutCancel(ctx), true)
+			go s.vercelPlan(context.WithoutCancel(ctx), true)
 		}
 		return nil, http.StatusBadGateway, err
 	}

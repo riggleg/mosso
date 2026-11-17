@@ -178,13 +178,17 @@ func (s *Server) acquireWaiting(ws *workspace) bool {
 		if s.acquire(ws.Name) {
 			return true
 		}
-		ctx, cancel := context.WithTimeout(s.ctx, stopTimeout)
 		s.mu.Lock()
 		stopping := ws.stopping
 		s.mu.Unlock()
+		if !stopping {
+			// Busy with something else, or a stop that ended just now.
+			return s.acquire(ws.Name)
+		}
+		ctx, cancel := context.WithTimeout(s.ctx, stopTimeout)
 		err := s.waitForStop(ctx, ws)
 		cancel()
-		if !stopping || err != nil {
+		if err != nil {
 			return false
 		}
 	}
@@ -224,8 +228,11 @@ func (s *Server) stopSandbox(ws *workspace, idle bool, now time.Time) error {
 		// No worker, so no Claude: the worker runs it, and a worker that
 		// starts again marks an unfinished turn interrupted.
 	case err != nil:
-		s.stopFailed(ws, err, now)
-		return fmt.Errorf("ask the sandbox worker before stopping: %w", err)
+		err = fmt.Errorf("ask the sandbox worker before stopping: %w", err)
+		if idle {
+			s.stopFailed(ws, err, now)
+		}
+		return err
 	case st.State != "idle" || len(st.PendingCalls) > 0:
 		s.mu.Lock()
 		ws.workerIdleSince = time.Time{}
@@ -243,28 +250,19 @@ func (s *Server) stopSandbox(ws *workspace, idle bool, now time.Time) error {
 		}
 	case idle && st.Seq > lastSeq:
 		// A worker that does not report when it became idle, with events
-		// Mosso has not seen: look again once they are applied.
+		// Mosso has not seen: look again in a minute, once they are applied.
+		s.mu.Lock()
+		ws.nextStopTry = now.Add(time.Minute)
+		s.mu.Unlock()
 		return errNotIdleYet
 	}
 
-	// Stop following first, so the follower does not take the end of the
-	// session for a timeout.
-	s.mu.Lock()
-	if ws.follower != nil && ws.Sandbox.SessionID == session {
-		ws.follower()
-		ws.follower = nil
-	}
-	s.mu.Unlock()
+	// The follower may see the session end before Stop returns; it leaves
+	// recording that to this function while the workspace is stopping.
 	if err := s.vercel.Stop(ctx, session); err != nil {
-		s.stopFailed(ws, err, now)
-		// Still running: follow it again (never resuming anything).
-		s.mu.Lock()
-		if ws.follower == nil && ws.Sandbox.SessionID == session && ws.sandboxState == sandboxRunning {
-			fctx, cancel := context.WithCancel(s.ctx)
-			ws.follower = cancel
-			go s.follow(fctx, ws, session)
+		if idle {
+			s.stopFailed(ws, err, now)
 		}
-		s.mu.Unlock()
 		return err
 	}
 	s.mu.Lock()
@@ -272,6 +270,10 @@ func (s *Server) stopSandbox(ws *workspace, idle bool, now time.Time) error {
 	ws.stopFailures, ws.nextStopTry = 0, time.Time{}
 	if ws.Sandbox.SessionID != session || ws.sandboxState != sandboxRunning {
 		return nil // terminated, or already stopped, meanwhile
+	}
+	if ws.follower != nil {
+		ws.follower()
+		ws.follower = nil
 	}
 	ws.sandboxState = sandboxStopped
 	ws.Sandbox.Status = "stopped"
@@ -289,8 +291,7 @@ func (s *Server) stopSandbox(ws *workspace, idle bool, now time.Time) error {
 	return nil
 }
 
-// stopFailed schedules the next attempt to stop the workspace's sandbox,
-// waiting longer after each failure (1, 2, 4, … up to 15 minutes). The
+// stopFailed schedules the next attempt at an idle shutdown, waiting longer after each failure (1, 2, 4, … up to 15 minutes). The
 // first failure in a row is shown in the chat.
 func (s *Server) stopFailed(ws *workspace, err error, now time.Time) {
 	s.mu.Lock()
@@ -315,7 +316,18 @@ func (s *Server) workspaceSandboxStop(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "unknown workspace")
 		return
 	}
-	s.mu.Lock()
+	for {
+		s.mu.Lock()
+		if !ws.stopping {
+			break // with s.mu held
+		}
+		s.mu.Unlock()
+		// An idle check is deciding; it may not stop the sandbox, so look
+		// again when it is done.
+		if err := s.waitForStop(r.Context(), ws); err != nil {
+			return
+		}
+	}
 	gone := noSandbox(ws.sandboxState)
 	switch {
 	case gone != "":
@@ -326,9 +338,6 @@ func (s *Server) workspaceSandboxStop(w http.ResponseWriter, r *http.Request) {
 		s.mu.Unlock()
 		writeError(w, http.StatusConflict, "the sandbox is being set up or resumed; try again in a moment")
 		return
-	case ws.stopping:
-		s.mu.Unlock()
-		_ = s.waitForStop(r.Context(), ws)
 	case ws.sandboxState == sandboxStopped:
 		s.mu.Unlock()
 	case s.busy[ws.Name] || ws.taskRunning:

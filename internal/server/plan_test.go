@@ -61,7 +61,7 @@ func TestVercelPlanDetection(t *testing.T) {
 func TestVercelPlanIsCached(t *testing.T) {
 	fake, api := newFakeVercel(t)
 	fake.plan = "pro"
-	srv := newServerOver(t, fake, api, t.TempDir())
+	srv := newServerOver(t, fake, api, t.TempDir(), func(srv *Server) { srv.planForceGap = 0 })
 	for range 3 {
 		vercelAuth(t, srv, "")
 	}
@@ -79,6 +79,13 @@ func TestVercelPlanIsCached(t *testing.T) {
 	if st := vercelAuth(t, srv, "?refresh=1"); st.Plan != "pro" || st.MaxSessionSeconds != 86400 || st.PlanError == "" {
 		t.Fatalf("after a failed check: %+v", st)
 	}
+	// Forced checks are at most one a minute.
+	srv.planForceGap = time.Minute
+	before := fake.planReads
+	vercelAuth(t, srv, "?refresh=1")
+	if fake.planReads != before {
+		t.Fatal("a forced check right after another one reached Vercel")
+	}
 }
 
 // TestAccountUpgradeIsNoticed: a Hobby account cannot ask for an hour; once
@@ -88,7 +95,10 @@ func TestAccountUpgradeIsNoticed(t *testing.T) {
 	fake, api := newFakeVercel(t)
 	fake.plan = "hobby"
 	fake.stdoutFor = fakeRepoSandbox()
-	srv := newServerOver(t, fake, api, t.TempDir(), func(srv *Server) { withGitHub(t, srv, &fakeGitHubAPI{}) })
+	srv := newServerOver(t, fake, api, t.TempDir(), func(srv *Server) {
+		withGitHub(t, srv, &fakeGitHubAPI{})
+		srv.planForceGap = 0
+	})
 	h := srv.Handler()
 	rec := do(t, h, http.MethodPost, "/workspaces", `{"repo":"octo/widgets","timeout_seconds":3600}`)
 	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "Hobby") {

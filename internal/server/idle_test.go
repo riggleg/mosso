@@ -3,6 +3,7 @@ package server
 import (
 	"encoding/json"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -446,5 +447,53 @@ func TestFmtDuration(t *testing.T) {
 		if got := fmtDuration(d); got != want {
 			t.Errorf("fmtDuration(%s) = %q, want %q", d, got, want)
 		}
+	}
+}
+
+// TestManualStopDuringAnIdleCheck: Stop clicked while an idle check is
+// deciding is not lost when the check decides not to stop.
+func TestManualStopDuringAnIdleCheck(t *testing.T) {
+	h := newPersistentHarness(t)
+	h.finishTask("first")
+	h.srv.mu.Lock()
+	ws := h.srv.workspaces[h.ws.Name]
+	h.srv.beginStopLocked(ws) // an idle check has started
+	h.srv.mu.Unlock()
+	answered := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		answered <- do(t, h.srv.Handler(), http.MethodPost, "/workspaces/"+h.ws.Name+"/sandbox/stop", `{}`)
+	}()
+	time.Sleep(100 * time.Millisecond)
+	// The idle check decides the sandbox has not been idle long enough.
+	if err := h.srv.stopSandbox(ws, true, time.Now()); err != errNotIdleYet {
+		t.Fatalf("idle check: %v, want errNotIdleYet", err)
+	}
+	rec := <-answered
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"status":"stopped"`) || h.stops() != 1 {
+		t.Fatalf("Stop after the idle check: %d %s, stops = %d", rec.Code, rec.Body, h.stops())
+	}
+}
+
+// TestManualStopFails: a failed Stop is reported to the user, and does not
+// delay idle shutdown or speak of an idle sandbox.
+func TestManualStopFails(t *testing.T) {
+	h := newPersistentHarness(t)
+	h.finishTask("first")
+	h.fake.mu.Lock()
+	h.fake.failStop = true
+	h.fake.mu.Unlock()
+	rec := do(t, h.srv.Handler(), http.MethodPost, "/workspaces/"+h.ws.Name+"/sandbox/stop", `{}`)
+	if rec.Code != http.StatusBadGateway || h.idle().Status != "ready" {
+		t.Fatalf("failed stop: %d %s, %+v", rec.Code, rec.Body, h.idle())
+	}
+	if h.notices("could not stop") != 0 {
+		t.Fatal("a failed manual stop was reported as an idle shutdown failure")
+	}
+	h.fake.mu.Lock()
+	h.fake.failStop = false
+	h.fake.mu.Unlock()
+	h.srv.checkIdle(time.Now().Add(16 * time.Minute))
+	if h.stops() != 1 {
+		t.Fatal("idle shutdown was delayed by a failed manual stop")
 	}
 }

@@ -132,7 +132,6 @@ func (s *Server) Restore(ctx context.Context, dbPath, legacyDir string) error {
 	for _, l := range active {
 		go s.reconnect(l.ws, l.rec.SandboxState, l.rec.TaskRunning)
 	}
-	go s.idleLoop()
 	return nil
 }
 
@@ -496,7 +495,12 @@ func (s *Server) follow(ctx context.Context, ws *workspace, session string) {
 			continue
 		}
 		if vercel.SessionOver(err) {
-			s.sessionEnded(ws, session)
+			s.mu.Lock()
+			stopping := ws.stopping
+			s.mu.Unlock()
+			if !stopping { // a stop in progress records the end itself
+				s.sessionEnded(ws, session)
+			}
 			return
 		}
 		log.Printf("workspace %s: follow the worker: %v (retrying in %s)", ws.Name, err, backoff)
@@ -698,6 +702,10 @@ func (s *Server) workspaceConnect(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, "the workspace is still being set up")
 		return
 	}
+	// Asking for the sandbox is activity: an idle stop must not start now.
+	s.mu.Lock()
+	s.touchLocked(ws)
+	s.mu.Unlock()
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), resumeTimeout)
 	defer cancel()
 	if err := s.connect(ctx, ws); err != nil {
