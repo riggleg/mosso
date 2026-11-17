@@ -77,18 +77,31 @@ Mosso or close the laptop at any time. Claude keeps working in the sandbox
 under the Mosso worker, and the conversation is replayed when you come back,
 including what happened while Mosso was away. See [worker.md](worker.md).
 
-When a sandbox's session has ended (Vercel stops sessions after 45 minutes)
-the header says **Sandbox stopped** and the sidebar dot turns grey. The
-conversation is still there; sending a message, publishing, or clicking
-**Resume sandbox** starts a new session from the saved snapshot in a few
-seconds. If Claude was interrupted by the session ending, the chat says so;
-ask it to continue.
+The New workspace dialog sets the workspace's **session length** (the most
+one sandbox session lasts before Vercel stops it: 15 minutes to 45 on Hobby,
+up to 24 hours on Pro and Enterprise; 45 minutes by default) and its **idle
+timeout** (Mosso stops the sandbox once nothing has run in it for 5, 15
+(default), 30 or 60 minutes, or never). The sidebar's Vercel line shows the
+plan Mosso detected. The header shows when the session ends and when an idle
+sandbox will be stopped, and has a menu to change the idle timeout and a
+**Stop sandbox** button. See [idle-shutdown.md](idle-shutdown.md).
+
+When a sandbox is stopped (idle shutdown, Stop sandbox, or the end of its
+session) the header says **Sandbox stopped** and the sidebar dot turns grey.
+The workspace stays with the active ones and the conversation is still
+there; sending a message, publishing, or clicking **Resume sandbox** starts
+a new session from the saved snapshot in a few seconds. If Claude was
+interrupted by the session ending, the chat says so; ask it to continue.
+Idle shutdown never stops Claude while it works.
 
 ## Limitations
 
-- **Sessions end after 45 minutes.** Claude is interrupted if it is still
-  working then; what it saved stays, and a follow-up continues the
-  conversation. Mosso does not extend or restart sessions by itself.
+- **Sessions end at their session length.** Claude is interrupted if it is
+  still working then; what it saved stays, and a follow-up continues the
+  conversation. Mosso does not restart sessions by itself.
+- **Idle shutdown needs Mosso running.** While Mosso is stopped or the Mac
+  sleeps, an idle sandbox runs until its session length; see
+  [idle-shutdown.md](idle-shutdown.md#when-mosso-is-not-running).
 - **Snapshots are Vercel's.** Resuming depends on the automatic snapshot
   Vercel takes when a session stops; see the durability caveats in
   [worker.md](worker.md#what-survives-what). The history Mosso has shown

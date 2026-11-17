@@ -144,7 +144,7 @@ select.compact { width: auto; max-width: 180px; padding: 3px 6px; font-size: 12.
 details.archived > summary:hover { color: var(--text); }
 .dot { width: 8px; height: 8px; border-radius: 50%; flex: none; background: var(--muted); }
 .dot.ready { background: var(--ok); }
-.dot.working, .dot.creating, .dot.connecting { background: var(--accent); animation: pulse 1.2s ease-in-out infinite; }
+.dot.working, .dot.creating, .dot.connecting, .dot.stopping, .dot.resuming { background: var(--accent); animation: pulse 1.2s ease-in-out infinite; }
 .dot.stopped { background: var(--muted); }
 .dot.error { background: var(--danger); }
 .dot.terminated { background: none; border: 1.5px solid var(--muted); }
@@ -187,7 +187,7 @@ dialog ol.steps li { margin-bottom: 4px; }
 .model { font-size: 12px; color: var(--muted); border: 1px solid var(--border); border-radius: 10px; padding: 1px 8px; white-space: nowrap; }
 .status { font-size: 12px; border-radius: 10px; padding: 1px 8px; background: var(--bg-soft); color: var(--muted); }
 .status.ready { color: var(--ok); }
-.status.working, .status.creating, .status.connecting { color: var(--accent); background: var(--accent-soft); }
+.status.working, .status.creating, .status.connecting, .status.stopping, .status.resuming { color: var(--accent); background: var(--accent-soft); }
 .status.stopped { color: var(--muted); background: var(--bg-soft); }
 .status.error { color: var(--danger); background: var(--danger-soft); }
 .ws-meta { display: flex; align-items: center; gap: 10px; }

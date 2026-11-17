@@ -185,8 +185,12 @@ stops a workspace from being restored.
 `state` holds what Mosso needs to continue a workspace and nobody needs to
 query: the checkout directory and base commit, the sandbox's current
 session, the Claude Code session ID, the last worker event applied, whether
-a task was running, the pull request, the last pushed commit and the
-attachment descriptions. Adding a field there needs no migration.
+a task was running, the pull request, the last pushed commit, the
+attachment descriptions, and the session length and idle timeout
+(`session_seconds`, `idle_timeout_seconds`; see
+[idle-shutdown.md](idle-shutdown.md)). Adding a field there needs no
+migration. A `stopped` workspace stays with the active ones: stopping keeps
+the sandbox and its snapshot.
 
 ## Migrations
 

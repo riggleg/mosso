@@ -151,6 +151,17 @@ func (s *Server) loadWorkspace(rec workspaceRecord) (*workspace, error) {
 		queuedPrompt: rec.QueuedPrompt,
 		PullRequests: rec.PullRequests,
 		branches:     rec.Branches,
+
+		// Workspaces from before these settings got 45-minute sessions;
+		// idle shutdown applies to them too.
+		sessionTimeout: defaultWorkspaceTimeout,
+		idleTimeout:    defaultIdleTimeout,
+	}
+	if rec.SessionSeconds > 0 {
+		ws.sessionTimeout = time.Duration(rec.SessionSeconds) * time.Second
+	}
+	if rec.IdleTimeoutSeconds != nil {
+		ws.idleTimeout = time.Duration(*rec.IdleTimeoutSeconds) * time.Second
 	}
 	if ws.PullRequest != nil && len(ws.PullRequests) == 0 {
 		// Saved before Mosso kept a list.
@@ -333,6 +344,10 @@ func queuedEntry(c *chat) int {
 // its session has ended, makes sure the worker runs, and follows the
 // worker's events from where Mosso left off. It is safe to call often.
 func (s *Server) connect(ctx context.Context, ws *workspace) error {
+	// A stop in progress ends first; the sandbox is then resumed.
+	if err := s.waitForStop(ctx, ws); err != nil {
+		return err
+	}
 	s.mu.Lock()
 	state := ws.sandboxState
 	expired := !ws.ExpiresAt.IsZero() && time.Now().After(ws.ExpiresAt)
@@ -367,8 +382,21 @@ func (s *Server) connect(ctx context.Context, ws *workspace) error {
 // resume boots a new session of the stopped persistent sandbox. The
 // filesystem (checkout, worker log, Claude Code transcripts) comes back
 // from the last snapshot; the worker is started again by connect.
+//
+// The new session is given the workspace's session length: if Vercel
+// started it with less, it is extended.
 func (s *Server) resume(ctx context.Context, ws *workspace) error {
-	s.addEntry(ws.chat, chatEntry{Type: "notice", Text: "Resuming the sandbox from its last snapshot…"})
+	s.mu.Lock()
+	ws.resuming = true
+	ws.chat.add(chatEntry{Type: "notice", Text: "Resuming the sandbox from its last snapshot…"})
+	want := ws.sessionTimeout
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		ws.resuming = false
+		ws.chat.notify()
+		s.mu.Unlock()
+	}()
 	var sb *vercel.Sandbox
 	var err error
 	for attempt := 0; ; attempt++ {
@@ -387,8 +415,18 @@ func (s *Server) resume(ctx context.Context, ws *workspace) error {
 	case vercel.IsNotFound(err) || vercel.SnapshotGone(err):
 		s.markGone(ws)
 		return errors.New(goneMessage)
+	case vercel.OverCapacity(err):
+		return fmt.Errorf("resume the sandbox: %w", capacityError(err))
 	case err != nil:
 		return fmt.Errorf("resume the sandbox: %w", err)
+	}
+	if short := want - sb.Timeout; sb.Running() && sb.Timeout > 0 && short > time.Minute {
+		if err := s.vercel.ExtendTimeout(ctx, sb.SessionID, short); err != nil {
+			log.Printf("workspace %s: extend the resumed session to %s: %v", ws.Name, want, err)
+			s.addEntry(ws.chat, chatEntry{Type: "notice", Text: fmt.Sprintf("Vercel started this sandbox session for %s instead of the workspace's %s, and did not extend it (%v). Sessions longer than %s need a Pro or Enterprise plan.", fmtDuration(sb.Timeout), fmtDuration(want), err, fmtDuration(vercel.HobbyMaxTimeout))})
+		} else {
+			sb.Timeout = want
+		}
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -404,6 +442,8 @@ func (s *Server) resume(ctx context.Context, ws *workspace) error {
 		ws.ExpiresAt = time.Now().Add(sb.Timeout)
 	}
 	ws.attachDirReady = false
+	ws.workerIdleSince = time.Time{}
+	s.touchLocked(ws) // a fresh session gets the full idle timeout
 	s.sandboxes[ws.Name] = *sb
 	delete(s.claudeInstalled, ws.Name) // the install script is idempotent and quick
 	if ws.git != nil {
@@ -455,7 +495,12 @@ func (s *Server) follow(ctx context.Context, ws *workspace, session string) {
 			continue
 		}
 		if vercel.SessionOver(err) {
-			s.sessionEnded(ws, session)
+			s.mu.Lock()
+			stopping := ws.stopping
+			s.mu.Unlock()
+			if !stopping { // a stop in progress records the end itself
+				s.sessionEnded(ws, session)
+			}
 			return
 		}
 		log.Printf("workspace %s: follow the worker: %v (retrying in %s)", ws.Name, err, backoff)
@@ -497,6 +542,16 @@ func (s *Server) reconcile(ws *workspace, st worker.Status) {
 	}
 	if st.SessionID != "" && ws.chat.sessionID == "" {
 		ws.chat.sessionID = st.SessionID
+	}
+	// When the worker became idle, for idle shutdown. A worker from before
+	// it said so counts as idle from now.
+	switch {
+	case st.State != "idle":
+		ws.workerIdleSince = time.Time{}
+	case st.IdleSince != nil:
+		ws.workerIdleSince = *st.IdleSince
+	case ws.lastActive.IsZero():
+		s.touchLocked(ws)
 	}
 }
 
@@ -599,6 +654,7 @@ func (s *Server) saveLocked(ws *workspace) error {
 			BaseSHA: ws.BaseSHA, Dir: ws.Dir, Sandbox: ws.Sandbox, ExpiresAt: ws.ExpiresAt, PullRequest: ws.PullRequest,
 			Pushed: ws.pushed, SessionID: ws.chat.sessionID, LastSeq: ws.lastSeq, TaskRunning: ws.taskRunning,
 			QueuedPrompt: ws.queuedPrompt, PullRequests: ws.PullRequests, Branches: ws.branches,
+			SessionSeconds: int64(ws.sessionTimeout.Seconds()), IdleTimeoutSeconds: new(int64(ws.idleTimeout.Seconds())),
 		},
 	}
 	for _, a := range ws.attachments {
@@ -646,6 +702,10 @@ func (s *Server) workspaceConnect(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, "the workspace is still being set up")
 		return
 	}
+	// Asking for the sandbox is activity: an idle stop must not start now.
+	s.mu.Lock()
+	s.touchLocked(ws)
+	s.mu.Unlock()
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), resumeTimeout)
 	defer cancel()
 	if err := s.connect(ctx, ws); err != nil {
@@ -653,6 +713,7 @@ func (s *Server) workspaceConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.mu.Lock()
+	s.touchLocked(ws)
 	snapshot := s.snapshotLocked(ws)
 	s.mu.Unlock()
 	writeJSON(w, http.StatusOK, snapshot)

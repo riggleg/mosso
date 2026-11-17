@@ -33,6 +33,8 @@ shell commands in it, and destroy it through its local HTTP API. The Go client i
    their conversations can still be read
    (see [history.md](history.md#without-vercel-credentials)).
    Credential values are never logged or returned by the API.
+   `GET /vercel/auth` also reports the detected plan and the longest session
+   it allows.
 
 ## Try it
 
@@ -53,7 +55,7 @@ curl -s -X DELETE localhost:8080/sandboxes/mosso-1a2b3c4d5e6f   # 204 No Content
 
 | Method & path                   | Description                                                                 |
 | ------------------------------- | --------------------------------------------------------------------------- |
-| `POST /sandboxes`               | Create a non-persistent `node22` sandbox. Body (optional): `timeout_seconds` (default 600, max 2700). |
+| `POST /sandboxes`               | Create a non-persistent `node22` sandbox. Body (optional): `timeout_seconds` (default 600, max 2700 on Hobby and 86400 on Pro and Enterprise; see below). |
 | `GET /sandboxes`                | List sandboxes created by this Mosso process that have not been destroyed. |
 | `POST /sandboxes/{name}/exec`   | Run `{"command": "..."}` with `bash -c`; waits and returns `exit_code`, `stdout`, `stderr` (each capped at 1 MiB). |
 | `DELETE /sandboxes/{name}`      | Stop the running session and delete the sandbox.                            |
@@ -78,12 +80,19 @@ to the caller verbatim, so avoid echoing secrets.
 Sandboxes are billed while running, so Mosso layers several safeguards:
 
 - **Vercel-side timeout**: every sandbox is created with a timeout (10 minutes by
-  default) after which Vercel stops it, even if Mosso crashes.
-  Mosso caps the timeout at 45 minutes, the Vercel Hobby plan maximum, so it
-  works on every plan; Pro/Enterprise allow longer, but Mosso does not request it.
-- **Limit**: at most 5 sandboxes run at once (stopped workspaces do not
-  count); further create requests get `429` until one is destroyed or
-  stops.
+  default for plain sandboxes, the workspace's session length, 45 minutes by
+  default, for workspaces) after which Vercel stops it, even if Mosso crashes.
+  Mosso detects the Vercel plan (`GET /v2/teams/{teamId}`) and allows up to
+  its documented maximum: 45 minutes on Hobby, 24 hours on Pro and
+  Enterprise, and 45 minutes when the plan cannot be read. See
+  [idle-shutdown.md](idle-shutdown.md#the-vercel-plan).
+- **Idle shutdown**: while Mosso runs, it stops a workspace's sandbox once
+  nothing has run in it for the workspace's idle timeout (15 minutes by
+  default), keeping its snapshot. See [idle-shutdown.md](idle-shutdown.md).
+- **Concurrency**: Vercel enforces each account's limit on concurrent
+  sandboxes (10 on Hobby, far more on Pro and Enterprise); Mosso has no
+  limit of its own. When Vercel refuses a sandbox, creating answers `429`
+  and says so. Stopped workspaces do not count.
 - **Non-persistent** plain sandboxes: `POST /sandboxes` creates them with
   `persistent: false`, so no snapshots are kept after they stop. Workspaces
   (`POST /workspaces`) are **persistent** on purpose: their filesystem is

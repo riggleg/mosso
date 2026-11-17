@@ -10,6 +10,7 @@
   <script src="/assets/attachments.js" defer></script>
   <script src="/assets/sections.js" defer></script>
   <script src="/assets/github.js" defer></script>
+  <script src="/assets/lifecycle.js" defer></script>
   <script src="/assets/app.js" defer></script>
 </head>
 <body>
@@ -21,7 +22,7 @@
     <nav id="workspace-list" aria-label="Workspaces"></nav>
     <footer id="sidebar-footer">
       <ul id="checks" aria-label="Configuration"></ul>
-      <p class="limitation">Workspaces and chats are saved on this machine and in each persistent sandbox. Claude keeps working in the sandbox when Mosso stops; Mosso catches up when it starts again. Sandbox sessions last up to 45 minutes and resume on your next message. Terminate deletes a workspace's sandbox; its conversation stays in the history and can be archived. Branches and pull requests stay on GitHub.</p>
+      <p class="limitation">Workspaces and chats are saved on this machine and in each persistent sandbox. Claude keeps working in the sandbox when Mosso stops; Mosso catches up when it starts again. A sandbox session lasts at most the workspace's session length; Mosso stops it sooner once it has been idle for the workspace's idle timeout (while Mosso is running). A stopped sandbox keeps its files and resumes on your next message. Terminate deletes a workspace's sandbox; its conversation stays in the history and can be archived. Branches and pull requests stay on GitHub.</p>
     </footer>
   </aside>
 
@@ -51,9 +52,11 @@
         </div>
         <div class="ws-meta">
           <span id="ws-expiry" class="muted"></span>
+          <select id="ws-idle" class="compact hidden" title="Idle shutdown: stop the sandbox after this long without activity (no Claude turn, tool call or publish running). Its files and the conversation are kept; your next message resumes it." aria-label="Idle shutdown"></select>
           <select id="ws-section" class="compact" title="Section: where this workspace is listed. Moving it keeps its configuration, sandbox and instructions." aria-label="Section"></select>
           <span id="ws-prs" class="pr-links"></span>
           <button id="resume" class="hidden" type="button" title="Start a new sandbox session from the saved snapshot and fetch what Claude did meanwhile">Resume sandbox</button>
+          <button id="stop-sandbox" class="hidden" type="button" title="Stop the sandbox session now. Compute stops; the files are snapshotted and the conversation is kept. Your next message, or Resume, starts it again.">Stop sandbox</button>
           <button id="publish" type="button">Create PR</button>
           <button id="terminate" class="danger" type="button">Terminate</button>
           <button id="archive" class="hidden" type="button">Archive</button>
@@ -124,6 +127,15 @@
         <textarea id="create-instructions" rows="5" spellcheck="true" placeholder="Persistent instructions added to Claude's system prompt on every turn, for example: Follow the repository's conventions and run the relevant tests."></textarea>
         <p class="muted small-text">Saved with this workspace and applied to every turn. They guide Claude; they do not replace your messages or lift Mosso's restrictions (Claude still cannot push or use GitHub credentials).</p>
       </details>
+      <div class="field-row">
+        <label>Session length
+          <select id="create-session"></select>
+        </label>
+        <label>Stop when idle for
+          <select id="create-idle"></select>
+        </label>
+      </div>
+      <p id="create-plan" class="muted small-text"></p>
       <details id="create-env" class="env-section">
         <summary>Sandbox environment <span id="create-env-summary" class="muted"></span></summary>
         <label>Image <span class="muted">(Vercel Container Registry)</span>
@@ -134,7 +146,7 @@
         </label>
         <p class="muted small-text">Prefilled from the section, or the defaults from Settings without one; changes apply to this workspace only. A failing setup script stops the creation and destroys the sandbox.</p>
       </details>
-      <p class="muted small-text">Mosso provisions a persistent sandbox (sessions of up to 45 minutes, resumed as needed), clones the base branch onto a new working branch, runs the setup script if there is one, and installs Claude Code and the Mosso worker. This takes about a minute plus the setup script; the workspace opens while it is set up, and Claude starts on your first message when it is ready, even if you close Mosso's page. The workspace keeps its model, image, setup script and instructions for its whole life, even if its section changes.</p>
+      <p class="muted small-text">Mosso provisions a persistent sandbox (resumed as needed), clones the base branch onto a new working branch, runs the setup script if there is one, and installs Claude Code and the Mosso worker. This takes about a minute plus the setup script; the workspace opens while it is set up, and Claude starts on your first message when it is ready, even if you close Mosso's page. The workspace keeps its model, image, setup script and instructions for its whole life, even if its section changes.</p>
       <p id="create-error" class="error-text hidden"></p>
       <div class="dialog-actions">
         <button id="create-cancel" type="button">Cancel</button>

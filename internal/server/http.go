@@ -25,11 +25,6 @@ import (
 // maxCommandBytes bounds the size of a command submitted to /exec.
 const maxCommandBytes = 64 * 1024
 
-// maxSandboxes caps how many sandboxes may run (or be in creation) at once,
-// bounding the cost of a runaway or buggy local client. Stopped workspaces
-// do not count: they cost nothing until resumed.
-const maxSandboxes = 5
-
 // Server serves Mosso's HTTP API and tracks the sandboxes it has created so
 // they can be destroyed on shutdown.
 type Server struct {
@@ -73,7 +68,6 @@ type Server struct {
 	// sandboxes are the sandboxes that exist, as far as Mosso knows; a
 	// terminated workspace has none.
 	sandboxes map[string]vercel.Sandbox
-	creating  int  // creates in flight, counted against maxSandboxes
 	closed    bool // set by Shutdown; later creates are destroyed immediately
 	// Per-sandbox state, keyed by sandbox name.
 	claudeInstalled map[string]bool
@@ -100,6 +94,14 @@ type Server struct {
 	cleanups sync.WaitGroup
 	// tools tracks the agent's tool calls being run (see tools.go).
 	tools sync.WaitGroup
+
+	// plan is the Vercel plan as last checked (see plan.go); guarded by
+	// mu. planMu makes checks run one at a time.
+	plan         planInfo
+	planMu       sync.Mutex
+	planForceGap time.Duration
+	// idleCheck is how often idle workspaces are looked for (see idle.go).
+	idleCheck time.Duration
 }
 
 // New returns a Server. client may be nil, in which case sandbox endpoints
@@ -124,8 +126,13 @@ func New(client *vercel.Client) *Server {
 		busy:            map[string]bool{},
 		workspaces:      map[string]*workspace{},
 		defaultModel:    claude.DefaultModel,
+		idleCheck:       idleCheckInterval,
+		planForceGap:    planForceGap,
 	}
 	s.githubClient = s.loadGitHubClient
+	if client != nil {
+		go s.idleLoop() // until Shutdown; see idle.go
+	}
 	return s
 }
 
@@ -174,6 +181,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /workspaces/{name}/attachments/{id}", s.requireVercel(s.downloadAttachment))
 	mux.HandleFunc("POST /workspaces/{name}/chat/stop", s.requireVercel(s.workspaceStop))
 	mux.HandleFunc("POST /workspaces/{name}/connect", s.requireVercel(s.workspaceConnect))
+	mux.HandleFunc("POST /workspaces/{name}/sandbox/stop", s.requireVercel(s.workspaceSandboxStop))
+	// The idle timeout is only saved, so it can be changed without Vercel.
+	mux.HandleFunc("PATCH /workspaces/{name}", s.updateWorkspace)
 	mux.HandleFunc("GET /github/repos", s.githubRepos)
 	mux.HandleFunc("GET /github/repos/{owner}/{repo}/branches", s.githubBranches)
 	ui := webUI()
@@ -250,13 +260,6 @@ func (s *Server) requireVercel(h http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-// vercelAuthStatus reports whether Vercel Sandbox credentials are
-// configured, so the web UI can say why workspaces are read-only. It never
-// returns them.
-func (s *Server) vercelAuthStatus(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{"configured": s.vercel != nil})
-}
-
 func (s *Server) listSandboxes(w http.ResponseWriter, _ *http.Request) {
 	s.mu.Lock()
 	list := make([]vercel.Sandbox, 0, len(s.sandboxes))
@@ -278,11 +281,12 @@ func (s *Server) createSandbox(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if maxSeconds := int(vercel.MaxTimeout.Seconds()); req.TimeoutSeconds < 0 || req.TimeoutSeconds > maxSeconds {
-		writeError(w, http.StatusBadRequest, fmt.Sprintf("timeout_seconds must be between 0 and %d", maxSeconds))
+	timeout := time.Duration(req.TimeoutSeconds) * time.Second
+	if plan := s.maxSessionFor(r.Context(), timeout); req.TimeoutSeconds < 0 || timeout > plan.maxSession() {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("timeout_seconds must be between 0 and %d, the longest session %s allows", plan.MaxSessionSeconds, planLabel(plan.Plan)))
 		return
 	}
-	sb, status, err := s.provision(r.Context(), vercel.CreateOptions{Timeout: time.Duration(req.TimeoutSeconds) * time.Second})
+	sb, status, err := s.provision(r.Context(), vercel.CreateOptions{Timeout: timeout})
 	if err != nil {
 		writeError(w, status, err.Error())
 		return
@@ -291,28 +295,24 @@ func (s *Server) createSandbox(w http.ResponseWriter, r *http.Request) {
 }
 
 // provision creates a sandbox and tracks it so it is destroyed on shutdown.
-// On error it returns the HTTP status to report.
+// On error it returns the HTTP status to report. How many sandboxes may
+// run at once is Vercel's to decide, per account: a refusal is reported as
+// 429 (see capacityError).
 func (s *Server) provision(ctx context.Context, opts vercel.CreateOptions) (*vercel.Sandbox, int, error) {
-	// Reserve a slot before calling Vercel so concurrent requests cannot
-	// exceed the limit.
-	s.mu.Lock()
-	if s.activeSandboxesLocked()+s.creating >= maxSandboxes {
-		s.mu.Unlock()
-		return nil, http.StatusTooManyRequests,
-			fmt.Errorf("sandbox limit reached (%d running); terminate or wait for one to stop before creating another", maxSandboxes)
-	}
-	s.creating++
-	s.mu.Unlock()
-
 	name := vercel.NewSandboxName()
 	sb, err := s.vercel.Create(ctx, name, opts)
-	s.mu.Lock()
-	s.creating--
 	if err != nil {
-		s.mu.Unlock()
 		log.Printf("create sandbox %s: %v", name, err)
+		if vercel.OverCapacity(err) {
+			return nil, http.StatusTooManyRequests, capacityError(err)
+		}
+		if opts.Timeout > vercel.HobbyMaxTimeout {
+			// Perhaps the plan changed since it was checked.
+			go s.vercelPlan(context.WithoutCancel(ctx), true)
+		}
 		return nil, http.StatusBadGateway, err
 	}
+	s.mu.Lock()
 	closed := s.closed
 	if !closed {
 		s.sandboxes[sb.Name] = *sb
@@ -331,17 +331,11 @@ func (s *Server) provision(ctx context.Context, opts vercel.CreateOptions) (*ver
 	return sb, 0, nil
 }
 
-// activeSandboxesLocked counts the sandboxes that are running, or whose
-// state is unknown.
-func (s *Server) activeSandboxesLocked() int {
-	n := 0
-	for name := range s.sandboxes {
-		if ws, ok := s.workspaces[name]; ok && (ws.sandboxState == sandboxStopped || ws.sandboxState == sandboxGone) {
-			continue
-		}
-		n++
-	}
-	return n
+// capacityError explains Vercel refusing to start a sandbox session because
+// the account runs as many sandboxes as its plan allows, or allocates them
+// too quickly.
+func capacityError(err error) error {
+	return fmt.Errorf("Vercel refused to start another sandbox: your account has reached its limit of concurrent sandboxes or how quickly they can be started (%w). Stop or terminate a workspace you are not using, or wait a minute, and try again", err)
 }
 
 func (s *Server) lookup(w http.ResponseWriter, r *http.Request) (vercel.Sandbox, bool) {
@@ -511,6 +505,9 @@ func (s *Server) acquire(name string) bool {
 func (s *Server) release(name string) {
 	s.mu.Lock()
 	delete(s.busy, name)
+	if ws, ok := s.workspaces[name]; ok {
+		s.touchLocked(ws) // a publish or setup just ended
+	}
 	s.changedLocked(name)
 	s.mu.Unlock()
 }

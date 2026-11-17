@@ -35,10 +35,10 @@ const (
 	// DefaultTimeout is how long Vercel keeps a sandbox alive before stopping
 	// it on its own. It is the backstop against abandoned, chargeable sandboxes.
 	DefaultTimeout = 10 * time.Minute
-	// MaxTimeout is the longest sandbox lifetime Mosso will request. It is the
-	// Vercel Hobby plan limit (Pro/Enterprise allow more), so requests work on
-	// every plan and a forgotten sandbox cannot run for hours.
-	MaxTimeout = 45 * time.Minute
+	// MaxTimeout is the longest session any Vercel plan allows (Pro and
+	// Enterprise: 24 hours). What an account may actually request depends
+	// on its plan; see LimitsFor.
+	MaxTimeout = 24 * time.Hour
 	// MaxOutputBytes caps how much stdout/stderr is kept per stream.
 	MaxOutputBytes = 1 << 20
 
@@ -213,6 +213,15 @@ func (e *APIError) Error() string {
 		return fmt.Sprintf("vercel api: status %d", e.StatusCode)
 	}
 	return fmt.Sprintf("vercel api: status %d: %s", e.StatusCode, e.Message)
+}
+
+// OverCapacity reports whether err is Vercel refusing to start a sandbox
+// session (create or resume) because the account is at its concurrency
+// limit or allocating sandboxes too quickly (429). Stopping or terminating
+// another sandbox, or waiting a minute, makes room.
+func OverCapacity(err error) bool {
+	var apiErr *APIError
+	return errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusTooManyRequests
 }
 
 // IsNotFound reports whether err is a 404 from the API.
@@ -400,6 +409,16 @@ func (c *Client) Stop(ctx context.Context, sessionID string) error {
 	path := "/v2/sandboxes/sessions/" + url.PathEscape(sessionID) + "/stop"
 	if err := c.doJSON(ctx, http.MethodPost, path, nil, nil, nil); err != nil && !SessionOver(err) {
 		return fmt.Errorf("stop session: %w", err)
+	}
+	return nil
+}
+
+// ExtendTimeout adds d to the running session's timeout. Vercel refuses
+// to extend a session past the plan's maximum session duration.
+func (c *Client) ExtendTimeout(ctx context.Context, sessionID string, d time.Duration) error {
+	path := "/v2/sandboxes/sessions/" + url.PathEscape(sessionID) + "/extend-timeout"
+	if err := c.doJSON(ctx, http.MethodPost, path, nil, map[string]int64{"duration": d.Milliseconds()}, nil); err != nil {
+		return fmt.Errorf("extend session timeout: %w", err)
 	}
 	return nil
 }

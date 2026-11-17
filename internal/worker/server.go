@@ -19,8 +19,9 @@ import (
 )
 
 // Version identifies the worker protocol. 2 added Mosso's tools (calls.go,
-// mcp.go); the server replaces an idle worker of another version.
-const Version = "2"
+// mcp.go); 3 added idle_since to the status, for idle shutdown. The server
+// replaces an idle worker of another version.
+const Version = "3"
 
 // followPing is how often a followed event stream sends a heartbeat.
 const followPing = 15 * time.Second
@@ -46,6 +47,11 @@ type Server struct {
 	mu    sync.Mutex
 	cur   *task            // running task, if any
 	calls map[string]*call // tool calls in flight, by ID
+	// idleSince is when the worker last became idle: the end of its last
+	// task, or, before any task, the time of the log's last event or the
+	// worker's start. It survives a worker restart through the log, so
+	// the server's idle shutdown is not postponed by one.
+	idleSince time.Time
 }
 
 // task is one message being worked on.
@@ -68,6 +74,10 @@ func New(l *Log, claudePath string) *Server {
 	s.run = s.runClaude
 	s.markOpenCalls()
 	s.markInterrupted()
+	s.idleSince = time.Now().UTC()
+	if last, ok := l.Last(); ok && !last.Time.IsZero() && last.Time.Before(s.idleSince) {
+		s.idleSince = last.Time
+	}
 	return s
 }
 
@@ -118,11 +128,14 @@ func (s *Server) Status() Status {
 	s.mu.Lock()
 	cur := s.cur
 	pending := s.pendingCallsLocked()
+	idle := s.idleSince
 	s.mu.Unlock()
 	st := Status{State: "idle", Seq: s.log.Seq(), SessionID: s.log.LastSessionID(), Version: Version, PID: os.Getpid(), PendingCalls: pending}
 	if cur != nil {
 		started := cur.started
 		st.State, st.TaskID, st.StartedAt = "running", cur.id, &started
+	} else {
+		st.IdleSince = &idle
 	}
 	return st
 }
@@ -233,6 +246,7 @@ func (s *Server) work(ctx context.Context, t *task) {
 	defer func() {
 		s.mu.Lock()
 		s.cur = nil
+		s.idleSince = time.Now().UTC()
 		s.mu.Unlock()
 	}()
 	t.msg.Token = "" // this copy; the runner's command environment is gone with the process

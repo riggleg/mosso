@@ -19,11 +19,15 @@ import (
 	"github.com/riggleg/mosso/internal/vercel"
 )
 
-// defaultWorkspaceTimeout is the sandbox session length for a workspace
-// when the request does not set one. Sessions are the unit Vercel bills
-// and limits (45 minutes on Hobby); the workspace itself persists across
-// sessions, so the longest allowed session is the most convenient.
-const defaultWorkspaceTimeout = vercel.MaxTimeout
+// defaultWorkspaceTimeout is the sandbox session length (the most a
+// session may last before Vercel stops it) for a workspace when the
+// request does not set one, whatever the plan: 45 minutes, the Hobby
+// maximum. Pro and Enterprise allow up to 24 hours per workspace; idle
+// shutdown (see idle.go) stops a session sooner once nothing runs in it.
+const defaultWorkspaceTimeout = vercel.HobbyMaxTimeout
+
+// minSession is the shortest session a workspace may ask for.
+const minSession = 5 * time.Minute
 
 // setupTimeout bounds provisioning, cloning and installing Claude Code; a
 // setup script gets setupScriptTimeout more.
@@ -73,7 +77,16 @@ type workspace struct {
 	// ExpiresAt is when Vercel stops the current sandbox session; unset
 	// while the sandbox is stopped.
 	ExpiresAt time.Time `json:"expires_at,omitzero"`
-	CreatedAt time.Time `json:"created_at"`
+	// SessionSeconds is the most each sandbox session may last before
+	// Vercel stops it, chosen at creation (45 minutes for workspaces from
+	// before it could be chosen). IdleTimeoutSeconds is how long the
+	// sandbox may sit idle before Mosso stops it, 0 for never; it can be
+	// changed. IdleStopAt is when Mosso stops it if it stays idle; unset
+	// while anything runs or idle shutdown is off. See idle.go.
+	SessionSeconds     int       `json:"session_seconds"`
+	IdleTimeoutSeconds int       `json:"idle_timeout_seconds"`
+	IdleStopAt         time.Time `json:"idle_stop_at,omitzero"`
+	CreatedAt          time.Time `json:"created_at"`
 	// ArchivedAt is set while the workspace is archived: still readable,
 	// but listed apart from the rest of the history.
 	ArchivedAt time.Time `json:"archived_at,omitzero"`
@@ -84,11 +97,13 @@ type workspace struct {
 	PullRequest  *github.PullRequest `json:"pull_request,omitempty"`
 	PullRequests []pullRequestRecord `json:"pull_requests,omitempty"`
 	// Status is "creating", "connecting" (checking the sandbox after a
-	// restart), "ready", "working" (Claude or a publish is running),
-	// "stopped" (the sandbox session ended; the next message resumes it),
-	// "terminated" (history: the sandbox was deleted) or "error" (the last
-	// turn or publish failed, or the sandbox is gone); Error says why. Both
-	// are computed by snapshotLocked.
+	// restart), "ready" (idle), "working" (Claude or a publish is running),
+	// "stopping" (Mosso is stopping the sandbox session), "stopped" (the
+	// sandbox session ended; the next message resumes it), "resuming" (a
+	// new session is starting from the snapshot), "terminated" (history:
+	// the sandbox was deleted) or "error" (the last turn or publish failed,
+	// or the sandbox is gone); Error says why. Both are computed by
+	// snapshotLocked.
 	Status string `json:"status"`
 	Error  string `json:"error,omitempty"`
 	// Unsaved says the last attempt to save the workspace in the database
@@ -134,6 +149,25 @@ type workspace struct {
 	sandboxState    string
 	follower        context.CancelFunc
 	interruptedTask string
+
+	// Session length and idle shutdown (see idle.go), guarded by
+	// Server.mu. sessionTimeout and idleTimeout are the settings (0: never
+	// stop when idle). lastActive is the last thing that happened in the
+	// workspace that the worker does not know about (a resume, a publish,
+	// the end of a turn); workerIdleSince is when the worker says it became
+	// idle. stopping is set while Mosso stops the session, and stopDone is
+	// closed when it is done; resuming while a session is being resumed.
+	// stopFailures counts failed stop attempts in a row; the next is not
+	// tried before nextStopTry.
+	sessionTimeout  time.Duration
+	idleTimeout     time.Duration
+	lastActive      time.Time
+	workerIdleSince time.Time
+	stopping        bool
+	stopDone        chan struct{}
+	resuming        bool
+	stopFailures    int
+	nextStopTry     time.Time
 }
 
 // snapshotLocked returns a copy of ws with its current status.
@@ -142,16 +176,23 @@ func (s *Server) snapshotLocked(ws *workspace) workspace {
 	c.PullRequests = slices.Clone(ws.PullRequests)
 	c.SandboxState = ws.sandboxState
 	c.Unsaved = ws.unsaved
+	c.SessionSeconds = int(ws.sessionTimeout.Seconds())
+	c.IdleTimeoutSeconds = int(ws.idleTimeout.Seconds())
+	c.IdleStopAt = s.idleStopAtLocked(ws)
 	expired := !ws.ExpiresAt.IsZero() && time.Now().After(ws.ExpiresAt)
 	switch {
 	case ws.creating:
 		c.Status, c.Step = "creating", ws.step
-	case ws.connecting:
-		c.Status = "connecting"
 	case ws.sandboxState == sandboxTerminated:
 		c.Status = "terminated"
 	case ws.sandboxState == sandboxGone:
 		c.Status, c.Error = "error", goneMessage
+	case ws.stopping:
+		c.Status = "stopping"
+	case ws.resuming:
+		c.Status = "resuming"
+	case ws.connecting:
+		c.Status = "connecting"
 	case s.busy[ws.Name]:
 		c.Status = "working"
 	case ws.sandboxState == sandboxStopped || expired:
@@ -348,8 +389,13 @@ func (s *Server) getWorkspace(w http.ResponseWriter, r *http.Request) {
 func (s *Server) createWorkspace(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		// Repo is required, unless the section has one.
-		Repo           string `json:"repo"`
-		TimeoutSeconds int    `json:"timeout_seconds"`
+		Repo string `json:"repo"`
+		// TimeoutSeconds is the session length; 0 for the default. The
+		// plan caps it (see plan.go).
+		TimeoutSeconds int `json:"timeout_seconds"`
+		// IdleTimeoutSeconds is how long the sandbox may idle before Mosso
+		// stops it: absent for the default, 0 for never.
+		IdleTimeoutSeconds *int `json:"idle_timeout_seconds"`
 		// Prompt is the first message for Claude; optional.
 		Prompt string `json:"prompt"`
 		// SectionID is the section to start from and list the workspace
@@ -410,15 +456,30 @@ func (s *Server) createWorkspace(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	image, script, instructions := cfg.Image, cfg.SetupScript, cfg.Instructions
-	switch maxSeconds := int(vercel.MaxTimeout.Seconds()); {
+	timeout := time.Duration(req.TimeoutSeconds) * time.Second
+	if timeout == 0 {
+		timeout = defaultWorkspaceTimeout
+	}
+	idle := defaultIdleTimeout
+	if req.IdleTimeoutSeconds != nil {
+		idle = time.Duration(*req.IdleTimeoutSeconds) * time.Second
+	}
+	plan := s.maxSessionFor(r.Context(), timeout)
+	switch {
 	case !github.ValidRepo(repoName):
 		writeError(w, http.StatusBadRequest, `repo must be a GitHub repository as "owner/repo"`)
 		return
 	case base != "" && !github.ValidBranch(base):
 		writeError(w, http.StatusBadRequest, "base is not a valid branch name")
 		return
-	case req.TimeoutSeconds < 0 || req.TimeoutSeconds > maxSeconds:
-		writeError(w, http.StatusBadRequest, fmt.Sprintf("timeout_seconds must be between 0 and %d", maxSeconds))
+	case req.TimeoutSeconds < 0 || timeout < minSession:
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("timeout_seconds must be at least %d", int(minSession.Seconds())))
+		return
+	case timeout > plan.maxSession():
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("timeout_seconds must be at most %d: sandbox sessions on %s last up to %s", plan.MaxSessionSeconds, planLabel(plan.Plan), fmtDuration(plan.maxSession())))
+		return
+	case !validIdleTimeout(idle):
+		writeError(w, http.StatusBadRequest, idleTimeoutRule)
 		return
 	case !claude.KnownModel(model) && req.Model == nil && req.SectionID != 0:
 		writeError(w, http.StatusBadRequest, fmt.Sprintf("the section's model %s is no longer offered: choose another model, or edit the section", model))
@@ -461,11 +522,6 @@ func (s *Server) createWorkspace(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	timeout := time.Duration(req.TimeoutSeconds) * time.Second
-	if timeout == 0 {
-		timeout = defaultWorkspaceTimeout
-	}
-
 	gh, ok := s.gitHub(w, r)
 	if !ok {
 		return
@@ -527,7 +583,9 @@ func (s *Server) createWorkspace(w http.ResponseWriter, r *http.Request) {
 		chat:         newChat(),
 		sandboxState: sandboxRunning,
 
-		attachments: map[string]attachment{},
+		attachments:    map[string]attachment{},
+		sessionTimeout: timeout,
+		idleTimeout:    idle,
 	}
 	if ws.ExpiresAt.IsZero() {
 		ws.ExpiresAt = sb.CreatedAt.Add(timeout)
@@ -649,6 +707,7 @@ func (s *Server) createWorkspace(w http.ResponseWriter, r *http.Request) {
 		if saveErr = s.saveLocked(ws); saveErr == nil {
 			ws.git = mirror
 			ws.creating, ws.step = false, ""
+			ws.lastActive = time.Now()
 			delete(s.busy, sb.Name)
 			ws.chat.notify()
 			snapshot = s.snapshotLocked(ws)
@@ -801,7 +860,7 @@ func (s *Server) workspacePullRequest(w http.ResponseWriter, r *http.Request) {
 		secrets = append(secrets, tok.Reveal())
 	}
 
-	if !s.acquire(ws.Name) {
+	if !s.acquireWaiting(ws) {
 		writeBusy(w)
 		return
 	}

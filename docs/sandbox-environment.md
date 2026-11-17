@@ -65,7 +65,7 @@ and runs it:
   is saved in Mosso's database and copied into the sandbox.
 - **for up to 20 minutes.** Longer, and it is stopped and the workspace is
   not created. It also counts against the sandbox session (45 minutes by
-  default).
+  default; see [idle-shutdown.md](idle-shutdown.md)).
 
 Its full output is also kept in `/vercel/sandbox/.mosso/setup.log`. The chat
 shows the first 256 KiB. Scripts can be up to 64 KiB.
