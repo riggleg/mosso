@@ -421,13 +421,15 @@ func (s *Server) resume(ctx context.Context, ws *workspace) error {
 
 // Resuming retries failures that may pass (vercel.Transient) up to
 // resumeAttempts times in all, waiting resumeBackoff before the first
-// retry and twice as long before each next one. Each request may take
-// resumeAttemptTimeout, so that a hung one is retried within resumeTimeout.
-// Variables so that tests can shorten them.
+// retry and twice as long before each next one. A request to resume may
+// take resumeAttemptTimeout and a lookup after a failure resumeCheckTimeout,
+// so that even when Vercel hangs all attempts fit in resumeTimeout with
+// time left to start the worker. Variables so that tests can shorten them.
 var (
 	resumeAttempts       = 3
 	resumeBackoff        = 2 * time.Second
-	resumeAttemptTimeout = 45 * time.Second
+	resumeAttemptTimeout = 30 * time.Second
+	resumeCheckTimeout   = 10 * time.Second
 )
 
 // resumeSandbox asks Vercel to resume the sandbox. It waits while the
@@ -459,11 +461,11 @@ func (s *Server) resumeSandbox(ctx context.Context, name string) (*vercel.Sandbo
 				err = fmt.Errorf("vercel did not answer within %s", resumeAttemptTimeout)
 			}
 			lastErr = err
-			cctx, cancel := context.WithTimeout(ctx, resumeAttemptTimeout)
+			cctx, cancel := context.WithTimeout(ctx, resumeCheckTimeout)
 			cur, cerr := s.vercel.Get(cctx, name, false)
 			cancel()
 			switch {
-			case cerr == nil && cur.Running():
+			case cerr == nil && cur.Status == "running":
 				log.Printf("workspace %s: resuming the sandbox failed (%v), but it did resume", name, err)
 				return cur, nil
 			case vercel.IsNotFound(cerr):

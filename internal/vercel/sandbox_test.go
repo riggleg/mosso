@@ -673,4 +673,11 @@ func TestTransientNetworkErrors(t *testing.T) {
 	if _, err := c.Get(ctx, "sb", true); Transient(err) {
 		t.Fatalf("cancelled: err = %v is transient", err)
 	}
+	// A certificate that does not verify will not verify next time either.
+	tlsSrv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	defer tlsSrv.Close()
+	c = NewClient(Config{Token: testToken, TeamID: "t", ProjectID: "p", BaseURL: tlsSrv.URL})
+	if _, err := c.Get(context.Background(), "sb", true); err == nil || Transient(err) {
+		t.Fatalf("bad certificate: err = %v, transient = %t", err, Transient(err))
+	}
 }
