@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"regexp"
 	"strings"
@@ -40,6 +39,15 @@ const (
 		"?name=Mosso&description=GitHub+access+for+Mosso+coding+workspaces&expires_in=90" +
 		"&contents=write&pull_requests=write&checks=read&statuses=read"
 
+	// NewClassicTokenURL opens GitHub's form for a classic personal access
+	// token with only the repo scope preselected. Unlike a fine-grained
+	// token, which belongs to a single resource owner (one account or one
+	// organization), a classic token reaches every repository the account
+	// can, across users and organizations. It is broader: use it when
+	// workspaces span several owners. Without the workflow scope it still
+	// cannot change .github/workflows.
+	NewClassicTokenURL = "https://github.com/settings/tokens/new?scopes=repo&description=Mosso"
+
 	keychainLabel = "Mosso: GitHub token"
 )
 
@@ -61,7 +69,7 @@ func ParseToken(s string) (Token, error) {
 	case s == "":
 		return "", errors.New("paste the token GitHub generated")
 	case !tokenPattern.MatchString(s):
-		return "", errors.New("that does not look like a GitHub personal access token; paste exactly the token GitHub showed (it starts with github_pat_)")
+		return "", errors.New("that does not look like a GitHub personal access token; paste exactly the token GitHub showed (it starts with github_pat_ or ghp_)")
 	}
 	return Token(s), nil
 }
@@ -76,6 +84,11 @@ func (Token) GoString() string             { return "[REDACTED]" }
 func (Token) MarshalJSON() ([]byte, error) { return []byte(`"[REDACTED]"`), nil }
 func (Token) MarshalText() ([]byte, error) { return []byte("[REDACTED]"), nil }
 func (t Token) Reveal() string             { return string(t) }
+
+// Classic reports whether t is a classic personal access token (ghp_…),
+// which reaches every repository its account can, rather than a
+// fine-grained one (github_pat_…), which reaches one resource owner's.
+func (t Token) Classic() bool { return strings.HasPrefix(string(t), "ghp_") }
 
 // redact replaces the token in s.
 func (t Token) redact(s string) string {
@@ -130,13 +143,4 @@ func SaveToken(ctx context.Context, tok Token) error {
 		return errors.New("malformed GitHub token")
 	}
 	return writeKeychain(ctx, tok.Reveal())
-}
-
-// StoreInKeychain saves a token in the login Keychain, replacing any
-// existing one. `security` prompts for it without echoing.
-func StoreInKeychain(ctx context.Context, stdin io.Reader, stdout, stderr io.Writer) error {
-	if !keychain.Available() {
-		return fmt.Errorf("the macOS Keychain is only available on macOS; set %s in the server's environment instead", EnvToken)
-	}
-	return keychain.Store(ctx, KeychainAccount, keychainLabel, stdin, stdout, stderr)
 }

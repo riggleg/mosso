@@ -92,8 +92,87 @@ func TestClientReportsTokenExpirationAndPermissionHints(t *testing.T) {
 	if got := c.TokenExpiration(); got.Format(time.RFC3339) != "2026-12-01T08:00:00Z" {
 		t.Fatalf("expiration = %v", got)
 	}
+	if _, known := c.Scopes(); known {
+		t.Fatal("a fine-grained token has no scopes")
+	}
 	_, _, err := c.OpenPullRequest(context.Background(), testRepo, NewPullRequest{Title: "x", Head: "mosso/x", Base: "main"})
 	if err == nil || !strings.Contains(err.Error(), "Pull requests set to Read and write") {
 		t.Fatalf("err = %v, want a permissions hint", err)
+	}
+}
+
+func TestClientReportsClassicTokenScopes(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-OAuth-Scopes", "repo, read:org")
+		_, _ = io.WriteString(w, `{"login":"octo","id":42}`)
+	}))
+	defer srv.Close()
+	tok := Token("ghp_CLASSIC00000000000000000000000000000")
+	if !tok.Classic() || Token(testGitHubToken).Classic() {
+		t.Fatal("Classic() is wrong")
+	}
+	c := NewClient(tok)
+	c.BaseURL = srv.URL
+	if _, err := c.User(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if scopes, known := c.Scopes(); !known || strings.Join(scopes, " ") != "repo read:org" {
+		t.Fatalf("scopes = %q, %v", scopes, known)
+	}
+}
+
+// TestCheckScopesFailsClosed: a classic token passes only if GitHub
+// reported the repo scope on the last response.
+func TestCheckScopesFailsClosed(t *testing.T) {
+	var scopes *string // nil: no X-OAuth-Scopes header
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if scopes != nil {
+			w.Header().Set("X-OAuth-Scopes", *scopes)
+		}
+		_, _ = io.WriteString(w, `{"login":"octo","id":42}`)
+	}))
+	defer srv.Close()
+	check := func(tok Token, header *string) error {
+		t.Helper()
+		scopes = header
+		c := NewClient(tok)
+		c.BaseURL = srv.URL
+		if _, err := c.User(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		return c.CheckScopes()
+	}
+	str := func(s string) *string { return &s }
+	const classic = Token("ghp_CLASSIC00000000000000000000000000000")
+
+	if err := check(testGitHubToken, nil); err != nil {
+		t.Errorf("fine-grained: %v", err)
+	}
+	if err := check(classic, str("read:org, repo")); err != nil {
+		t.Errorf("classic with repo: %v", err)
+	}
+	if err := check(classic, nil); err == nil || !strings.Contains(err.Error(), "cannot verify") {
+		t.Errorf("classic without the header: err = %v, want a refusal", err)
+	}
+	for _, h := range []string{"", "public_repo, workflow", "repo:status"} {
+		if err := check(classic, str(h)); err == nil || !strings.Contains(err.Error(), "lacks the repo scope") {
+			t.Errorf("classic with %q: err = %v, want a refusal", h, err)
+		}
+	}
+
+	// A later response without the header does not inherit the scopes an
+	// earlier one reported.
+	scopes = str("repo")
+	c := NewClient(classic)
+	c.BaseURL = srv.URL
+	if _, err := c.User(context.Background()); err != nil || c.CheckScopes() != nil {
+		t.Fatalf("first response: %v, %v", err, c.CheckScopes())
+	}
+	scopes = nil
+	if _, err := c.User(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.CheckScopes(); err == nil {
+		t.Fatal("scopes from an earlier response were trusted")
 	}
 }

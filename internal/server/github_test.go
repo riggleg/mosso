@@ -31,6 +31,8 @@ type authStatus struct {
 	ExpiresAt  string `json:"expires_at"`
 	Error      string `json:"error"`
 	CreateURL  string `json:"create_url"`
+	ClassicURL string `json:"classic_url"`
+	Kind       string `json:"kind"`
 	Storage    string `json:"storage"`
 }
 
@@ -74,7 +76,7 @@ func TestGitHubConnectWithoutKeychain(t *testing.T) {
 	rec := do(t, h, http.MethodPost, "/github/auth", `{"token":" `+testGitHubToken+` "}`)
 	st := authOf(t, rec.Body.Bytes())
 	if rec.Code != http.StatusOK || !st.Configured || st.Source != github.SourceMemory || st.Login != "octo" ||
-		st.ExpiresAt == "" || st.CreateURL != github.NewTokenURL {
+		st.ExpiresAt == "" || st.CreateURL != github.NewTokenURL || st.Kind != "fine-grained" {
 		t.Fatalf("connect: status = %d: %s", rec.Code, rec.Body)
 	}
 	st = authOf(t, do(t, h, http.MethodGet, "/github/auth", "").Body.Bytes())
@@ -133,6 +135,53 @@ func TestGitHubConnectStoresInKeychain(t *testing.T) {
 	if rec.Code != http.StatusInternalServerError || !strings.Contains(rec.Body.String(), "denied") ||
 		strings.Contains(rec.Body.String(), testGitHubToken) {
 		t.Fatalf("status = %d: %s", rec.Code, rec.Body)
+	}
+}
+
+// TestGitHubConnectClassicToken: a classic token reaches repositories of
+// every owner the account can, so it is accepted if it has the repo scope.
+func TestGitHubConnectClassicToken(t *testing.T) {
+	const classic = "ghp_CLASSICtoken0000000000000000000000"
+	srv, _ := newTestServer(t)
+	const previous = "github_pat_11PREVIOUS_workingtoken0"
+	api := &fakeGitHubAPI{token: classic}
+	withGitHub(t, srv, api)
+	srv.githubClient = srv.loadGitHubClient
+	saved := 0
+	srv.saveGitHubToken = func(context.Context, github.Token) error { saved++; return github.ErrNoKeychain }
+	srv.memoryToken = previous
+	h := srv.Handler()
+
+	// Refused, and the previous token kept: without an X-OAuth-Scopes
+	// header the repo scope cannot be verified (fail closed), and with
+	// one that lacks repo it is missing.
+	for scopes, want := range map[string]string{"": "cannot verify", "public_repo, read:org": "lacks the repo scope"} {
+		api.mu.Lock()
+		api.scopes = scopes
+		api.mu.Unlock()
+		rec := do(t, h, http.MethodPost, "/github/auth", `{"token":"`+classic+`"}`)
+		if rec.Code != http.StatusUnprocessableEntity || !strings.Contains(rec.Body.String(), want) ||
+			strings.Contains(rec.Body.String(), classic) || saved != 0 || srv.memoryToken != previous {
+			t.Fatalf("scopes %q: status = %d: %s", scopes, rec.Code, rec.Body)
+		}
+	}
+
+	api.mu.Lock()
+	api.scopes = "read:org, repo"
+	api.mu.Unlock()
+	rec := do(t, h, http.MethodPost, "/github/auth", `{"token":"`+classic+`"}`)
+	st := authOf(t, rec.Body.Bytes())
+	if rec.Code != http.StatusOK || st.Kind != "classic" || st.Login != "octo" || st.Error != "" ||
+		st.ClassicURL != github.NewClassicTokenURL {
+		t.Fatalf("with repo: status = %d: %s", rec.Code, rec.Body)
+	}
+
+	// The scope was removed on GitHub afterwards: the status says so.
+	api.mu.Lock()
+	api.scopes = "public_repo"
+	api.mu.Unlock()
+	if st = authOf(t, do(t, h, http.MethodGet, "/github/auth", "").Body.Bytes()); !strings.Contains(st.Error, "lacks the repo scope") {
+		t.Fatalf("status without repo: %+v", st)
 	}
 }
 

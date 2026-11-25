@@ -30,6 +30,7 @@ type fakeGitHubAPI struct {
 	mu       sync.Mutex
 	private  bool
 	token    string // accepted token; testGitHubToken if empty
+	scopes   string // X-OAuth-Scopes, as for a classic token, if set
 	requests []string
 	pulls    []map[string]any
 
@@ -222,6 +223,9 @@ func (f *fakeGitHubAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("GitHub-Authentication-Token-Expiration", "2026-12-01 00:00:00 UTC")
+	if f.scopes != "" {
+		w.Header().Set("X-OAuth-Scopes", f.scopes)
+	}
 	if f.pullsAPI(w, r, reply) {
 		return
 	}

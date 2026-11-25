@@ -160,6 +160,7 @@ details.archived > summary:hover { color: var(--text); }
 #checks .check-detail.soon { color: var(--danger); }
 dialog ol.steps { margin: 0 0 14px; padding-left: 20px; }
 dialog ol.steps li { margin-bottom: 4px; }
+dialog ol.steps ul { margin: 4px 0 0; padding-left: 18px; }
 .empty button + button { margin-left: 8px; }
 .limitation { color: var(--muted); margin: 0; line-height: 1.4; }
 

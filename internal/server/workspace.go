@@ -218,15 +218,21 @@ type githubAuth struct {
 	// ExpiresAt is when the token expires, if GitHub reports it.
 	ExpiresAt *time.Time `json:"expires_at,omitempty"`
 	Error     string     `json:"error,omitempty"`
-	// CreateURL opens GitHub's token form with Mosso's permissions.
-	CreateURL string `json:"create_url"`
+	// Kind is "classic" for a classic token, which reaches every
+	// repository the account can, or "fine-grained", which reaches one
+	// resource owner's (one account or organization).
+	Kind string `json:"kind,omitempty"`
+	// CreateURL opens GitHub's fine-grained token form with Mosso's
+	// permissions; ClassicURL the classic one with the repo scope.
+	CreateURL  string `json:"create_url"`
+	ClassicURL string `json:"classic_url"`
 	// Storage is where a token saved with POST /github/auth goes:
 	// "keychain", or "memory" (until Mosso stops) without a Keychain.
 	Storage string `json:"storage"`
 }
 
 func (s *Server) authStatus(gh *github.Client, source string, user *github.User, err error) githubAuth {
-	st := githubAuth{Configured: gh != nil, Source: source, CreateURL: github.NewTokenURL, Storage: "keychain"}
+	st := githubAuth{Configured: gh != nil, Source: source, CreateURL: github.NewTokenURL, ClassicURL: github.NewClassicTokenURL, Storage: "keychain"}
 	if !keychain.Available() {
 		st.Storage = github.SourceMemory
 	}
@@ -239,6 +245,13 @@ func (s *Server) authStatus(gh *github.Client, source string, user *github.User,
 	if gh != nil {
 		if t := gh.TokenExpiration(); !t.IsZero() {
 			st.ExpiresAt = &t
+		}
+		st.Kind = "fine-grained"
+		if gh.Token().Classic() {
+			st.Kind = "classic"
+		}
+		if err := gh.CheckScopes(); err != nil && st.Error == "" {
+			st.Error = err.Error()
 		}
 	}
 	return st
@@ -282,6 +295,12 @@ func (s *Server) githubConnect(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeError(w, http.StatusBadGateway, "could not check the token with GitHub: "+err.Error())
+		return
+	}
+	// Fails closed: a classic token whose repo scope cannot be verified
+	// is not saved.
+	if err := gh.CheckScopes(); err != nil {
+		writeError(w, http.StatusUnprocessableEntity, "the token was not saved: "+err.Error())
 		return
 	}
 	source := github.SourceKeychain
