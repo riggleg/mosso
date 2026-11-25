@@ -960,7 +960,7 @@ func gitHubError(op, repo string, err error) error {
 		strings.Contains(lower, "returned error: 403"):
 		hint = hintPermissions
 	case strings.Contains(lower, "repository not found") || strings.Contains(lower, "returned error: 404"):
-		hint = "repository " + repo + " was not found, or the GitHub token cannot access it: check the token's Repository access"
+		hint = "repository " + repo + " was not found, or the GitHub token cannot access it: check the token's Repository access (" + hintOwners + ")"
 	case strings.Contains(lower, "gh006") || strings.Contains(lower, "gh013") || strings.Contains(lower, "protected branch"):
 		hint = "a branch protection rule or ruleset rejected the push to the workspace's branch"
 	}

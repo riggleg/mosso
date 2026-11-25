@@ -92,8 +92,31 @@ func TestClientReportsTokenExpirationAndPermissionHints(t *testing.T) {
 	if got := c.TokenExpiration(); got.Format(time.RFC3339) != "2026-12-01T08:00:00Z" {
 		t.Fatalf("expiration = %v", got)
 	}
+	if _, known := c.Scopes(); known {
+		t.Fatal("a fine-grained token has no scopes")
+	}
 	_, _, err := c.OpenPullRequest(context.Background(), testRepo, NewPullRequest{Title: "x", Head: "mosso/x", Base: "main"})
 	if err == nil || !strings.Contains(err.Error(), "Pull requests set to Read and write") {
 		t.Fatalf("err = %v, want a permissions hint", err)
+	}
+}
+
+func TestClientReportsClassicTokenScopes(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-OAuth-Scopes", "repo, read:org")
+		_, _ = io.WriteString(w, `{"login":"octo","id":42}`)
+	}))
+	defer srv.Close()
+	tok := Token("ghp_CLASSIC00000000000000000000000000000")
+	if !tok.Classic() || Token(testGitHubToken).Classic() {
+		t.Fatal("Classic() is wrong")
+	}
+	c := NewClient(tok)
+	c.BaseURL = srv.URL
+	if _, err := c.User(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if scopes, known := c.Scopes(); !known || strings.Join(scopes, " ") != "repo read:org" {
+		t.Fatalf("scopes = %q, %v", scopes, known)
 	}
 }

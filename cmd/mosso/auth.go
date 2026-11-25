@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+	"slices"
 
 	"github.com/riggleg/mosso/internal/claude"
 	"github.com/riggleg/mosso/internal/github"
@@ -73,6 +74,9 @@ func authGitHub(ctx context.Context) error {
 	fmt.Println("and a 90-day expiration:")
 	fmt.Println("  " + github.NewTokenURL)
 	fmt.Println("Under Repository access, choose only the repositories Mosso should work on, then generate the token.")
+	fmt.Println("A fine-grained token reaches the repositories of one account or organization (its Resource owner).")
+	fmt.Println("To work on repositories of several, create a classic token with only the repo scope instead:")
+	fmt.Println("  " + github.NewClassicTokenURL)
 	fmt.Println("(You can also paste the token into Connect GitHub in the Mosso web UI instead.)")
 	fmt.Println()
 	fmt.Printf("Step 2/2: paste the token at both prompts below (input is hidden). It is saved in your login Keychain as service %q, account %q.\n",
@@ -84,9 +88,15 @@ func authGitHub(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("the stored token is not usable: %w", err)
 	}
-	user, err := github.NewClient(tok).User(ctx)
+	gh := github.NewClient(tok)
+	user, err := gh.User(ctx)
 	if err != nil {
 		return fmt.Errorf("the token was stored but GitHub rejected it: %w", err)
+	}
+	if tok.Classic() {
+		if scopes, ok := gh.Scopes(); ok && !slices.Contains(scopes, "repo") {
+			return errors.New("the token was stored, but this classic token lacks the repo scope Mosso needs: create one with the classic token link and run this again")
+		}
 	}
 	fmt.Printf("Token stored for GitHub user %s. Running Mosso servers pick it up on the next request; no restart needed.\n", user.Login)
 	return nil

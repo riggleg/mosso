@@ -13,8 +13,21 @@ and the Claude Code integration in [claude-code.md](claude-code.md).
 
 ## Connect GitHub
 
-Mosso uses a **fine-grained personal access token** that you create once and
-paste into Mosso.
+Mosso uses a **personal access token** that you create once and paste into
+Mosso. Pick the kind by where your repositories live:
+
+- A **fine-grained token** (`github_pat_…`, recommended) reaches only the
+  repositories you pick, with only Mosso's permissions. GitHub limits it to
+  **one resource owner**: your account *or* one organization. A token for
+  your company's organization cannot reach your personal repositories, and
+  the other way round.
+- A **classic token** (`ghp_…`) with the `repo` scope reaches every
+  repository your account can, across your account and all your
+  organizations. It is broader: full access to all of them, with no
+  per-repository selection. Use it when your workspaces span several
+  owners; see [Classic token](#classic-token-repositories-of-several-owners).
+
+The steps below create a fine-grained token.
 
 1. Start Mosso (`make run`) and open <http://127.0.0.1:8080>. In the sidebar,
    click **Connect** next to *GitHub* (or **Connect GitHub** on the welcome
@@ -65,12 +78,29 @@ From a terminal instead: `go run ./cmd/mosso auth github` prints the same
 link and stores the token in the Keychain with hidden prompts. By hand:
 `security add-generic-password -U -s mosso -a github-token -w`.
 
+### Classic token: repositories of several owners
+
+1. In the Connect GitHub dialog, click **Classic token**. GitHub opens
+   <https://github.com/settings/tokens/new?scopes=repo&description=Mosso>
+   with only the **repo** scope selected. Choose an expiration.
+2. Do not add **workflow** (see below) or any other scope; Mosso uses none.
+3. Click **Generate token**, then paste it into Mosso like a fine-grained
+   one. Mosso checks the token's scopes and refuses one without `repo`.
+4. If an organization enforces SAML single sign-on, click **Configure SSO**
+   next to the token on GitHub and **Authorize** it for that organization;
+   until then GitHub refuses the organization's repositories. An
+   organization may also forbid classic tokens altogether: then use a
+   fine-grained token with it as the resource owner.
+
+The sidebar shows *@login · all repos* for a classic token. Fetches and
+pushes still run on the Mosso server; the sandbox never gets the token.
+
 ### Optional permissions
 
 Mosso works with the permissions above. Do **not** grant more unless you
 need it:
 
-- **Workflows** (write): only needed for Claude to change
+- **Workflows** (write; the `workflow` scope for a classic token): only needed for Claude to change
   `.github/workflows`. Without it, GitHub rejects such pushes, which keeps
   Claude from adding or editing CI workflows that would run with your
   repository's secrets. Mosso reports this as a clear error; push workflow
@@ -203,8 +233,8 @@ restart. It needs `git` on the machine running Mosso (on macOS:
 
 | Method & path                                | Description |
 | -------------------------------------------- | ----------- |
-| `GET /github/auth`                           | `{"configured": true, "source": "keychain"\|"env"\|"memory", "login": "...", "expires_at": "...", "create_url": "https://github.com/settings/personal-access-tokens/new?...", "storage": "keychain"\|"memory"}`, plus `error` if GitHub rejects the token. Never returns the token. |
-| `POST /github/auth`                          | Body: `{"token": "github_pat_..."}`. Checks the token with GitHub, then stores it (Keychain, or memory without one) for all workspaces. `200` with the status above; `400` malformed; `422` GitHub rejected it; `500` the Keychain refused. |
+| `GET /github/auth`                           | `{"configured": true, "source": "keychain"\|"env"\|"memory", "login": "...", "expires_at": "...", "kind": "fine-grained"\|"classic", "create_url": "https://github.com/settings/personal-access-tokens/new?...", "classic_url": "https://github.com/settings/tokens/new?scopes=repo...", "storage": "keychain"\|"memory"}`, plus `error` if GitHub rejects the token or a classic token lacks the `repo` scope. Never returns the token. |
+| `POST /github/auth`                          | Body: `{"token": "github_pat_..."}` (or a classic `ghp_...`). Checks the token with GitHub, then stores it (Keychain, or memory without one) for all workspaces. `200` with the status above; `400` malformed; `422` GitHub rejected it, or a classic token lacks the `repo` scope; `500` the Keychain refused. |
 | `POST /workspaces`                           | Body: `{"repo": "owner/repo", "base": "main", "model": "claude-opus-5-5", "prompt": "...", "image": "...", "setup_script": "...", "section_id": 3, "instructions": "...", "timeout_seconds": 1800}`. With `section_id`, the section's configuration replaces the defaults below and the request's fields override it (see [sections.md](sections.md#how-the-configuration-is-chosen)); `instructions` are added to Claude's system prompt on every turn. `base` defaults to the repository's default branch; `model` to the default model (see [models.md](models.md)); `image` and `setup_script` to the default sandbox environment (see [sandbox-environment.md](sandbox-environment.md)); `timeout_seconds` defaults to 1800 (max 2700). `prompt`, optional, is the first message: it is in the chat while the workspace is set up, and Claude starts on it as soon as the workspace is ready (the response then has `"status": "working"`), even if the client has disconnected; with a prompt, `503` if there is no Claude token, checked before a sandbox is created. Clones, runs the setup script, installs Claude Code and returns `201` with the workspace, once it is saved; `500` if it could not be saved (the sandbox is then destroyed). Setup continues if the client disconnects. |
 | `GET /workspaces`, `GET /workspaces/{name}`  | Every saved workspace with its `status`, including ones still being created, terminated ones kept as history (`"status": "terminated"`) and archived ones (`archived_at` is set), `pull_request` (the working branch's into the base branch) once one exists, and `pull_requests`: all of the workspace's pull requests, by you or Claude. |
 | `POST /workspaces/{name}/claude/messages`    | Same body and response as `POST /sandboxes/{name}/claude/messages`, run in the checkout after syncing `origin/*`. The turn is also recorded in the workspace's chat. |
@@ -263,8 +293,10 @@ of uncompressed new content checked for credentials, and 64 MiB per sync.
 | ------- | ------------- |
 | *GitHub is not connected* | No token yet. Connect GitHub in the UI (or `mosso auth github`, or `MOSSO_GITHUB_TOKEN`). |
 | *the GitHub token is invalid, expired or revoked* | Create a new token with the link and click **Replace**. No restart needed. |
-| *the GitHub token lacks access: give it this repository…* | The repository is not under the token's *Repository access*, or *Contents* / *Pull requests* is not *Read and write*. Edit the token on GitHub (*Settings → Developer settings → Fine-grained tokens*) or create a new one. Organizations may need to approve the token. |
-| *repository … was not found, or the GitHub token cannot access it* | Wrong `owner/repo`, or the token does not include the repository (GitHub answers 404 for private repositories a token cannot see). |
+| *the GitHub token lacks access: give it this repository…* | The repository is not under the token's *Repository access*, or *Contents* / *Pull requests* is not *Read and write*. Edit the token on GitHub (*Settings → Developer settings → Fine-grained tokens*) or create a new one. Organizations may need to approve the token. A fine-grained token only reaches its resource owner's repositories: for another account's or organization's, use a [classic token](#classic-token-repositories-of-several-owners). |
+| *this classic token lacks the repo scope* | Create a classic token with the link (only `repo` is preselected) and click **Replace**. |
+| *Resource protected by organization SAML enforcement* | Authorize the classic token for the organization: *Configure SSO → Authorize* next to it on GitHub. |
+| *repository … was not found, or the GitHub token cannot access it* | Wrong `owner/repo`, or the token does not include the repository (GitHub answers 404 for private repositories a token cannot see), for example because it belongs to another owner than a fine-grained token's. |
 | *GitHub refused the push because it changes files in .github/workflows* | Expected without the Workflows permission. Ask Claude to drop those changes, or push them yourself. |
 | *the working branch on GitHub has commits that are not in the workspace* | Someone pushed to the `mosso/*` branch. Mosso fetched it as `origin/<branch>`; ask Claude to rebase onto or merge it, then publish again. |
 | *the branch changed on GitHub while Mosso was pushing; try again* | Another push won the race; publish (or push) again. |

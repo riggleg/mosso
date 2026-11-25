@@ -27,7 +27,9 @@ import (
 // Hints appended to GitHub errors so the user knows what to fix.
 const (
 	hintExpired     = "the GitHub token is invalid, expired or revoked: connect GitHub again in the Mosso web UI with a new token, or run `mosso auth github`"
-	hintPermissions = "the GitHub token lacks access: give it this repository under Repository access, with Contents and Pull requests set to Read and write"
+	hintPermissions = "the GitHub token lacks access: give it this repository under Repository access, with Contents and Pull requests set to Read and write (" + hintOwners + ")"
+	// hintOwners explains the most surprising cause of missing access.
+	hintOwners = "a fine-grained token only reaches the repositories of its resource owner, one account or organization; to work across several, connect a classic token with the repo scope"
 )
 
 // DefaultBaseURL is the GitHub REST API endpoint.
@@ -65,6 +67,11 @@ type Client struct {
 
 	mu         sync.Mutex
 	expiration time.Time // from the last response, if GitHub sent it
+	// scopes are a classic token's OAuth scopes from the last response;
+	// scopesKnown is false until GitHub reports them (never for
+	// fine-grained tokens).
+	scopes      []string
+	scopesKnown bool
 }
 
 // TokenExpiration returns when the token expires, as reported by GitHub on
@@ -73,6 +80,15 @@ func (c *Client) TokenExpiration() time.Time {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.expiration
+}
+
+// Scopes returns a classic token's OAuth scopes, as reported by GitHub on
+// the last API response, and false if GitHub did not report any (it never
+// does for fine-grained tokens).
+func (c *Client) Scopes() ([]string, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.scopes, c.scopesKnown
 }
 
 // parseExpiration reads GitHub's github-authentication-token-expiration
@@ -157,7 +173,7 @@ func (c *Client) Repo(ctx context.Context, repo string) (*Repository, error) {
 	var r Repository
 	if err := c.do(ctx, http.MethodGet, "/repos/"+repo, nil, &r); err != nil {
 		if IsNotFound(err) {
-			return nil, fmt.Errorf("repository %s not found, or the GitHub token cannot access it: %w", repo, err)
+			return nil, fmt.Errorf("repository %s not found, or the GitHub token cannot access it (%s): %w", repo, hintOwners, err)
 		}
 		return nil, fmt.Errorf("get repository %s: %w", repo, err)
 	}
@@ -568,6 +584,18 @@ func (c *Client) do(ctx context.Context, method, path string, in, out any) error
 			c.expiration = t
 			c.mu.Unlock()
 		}
+	}
+	// Present, possibly empty, for classic tokens only.
+	if v, ok := resp.Header[http.CanonicalHeaderKey("X-OAuth-Scopes")]; ok {
+		var scopes []string
+		for _, s := range strings.Split(strings.Join(v, ","), ",") {
+			if s = strings.TrimSpace(s); s != "" {
+				scopes = append(scopes, s)
+			}
+		}
+		c.mu.Lock()
+		c.scopes, c.scopesKnown = scopes, true
+		c.mu.Unlock()
 	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		return c.apiError(resp)

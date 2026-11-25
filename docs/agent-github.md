@@ -226,7 +226,7 @@ statuses: Read-only**; the token link in Mosso now preselects them. Without
 them, `github_checks` says which permission is missing, marks its result
 `complete: false` and reports `unknown` rather than `success`, since the
 results it cannot read may have failed; the other tools are unaffected. Changing the draft status uses GitHub's GraphQL API, which
-fine-grained tokens with Pull requests: Read and write can do.
+fine-grained tokens with Pull requests: Read and write can do. A classic token's `repo` scope covers all of these.
 
 ## In the web UI
 

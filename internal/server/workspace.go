@@ -218,15 +218,21 @@ type githubAuth struct {
 	// ExpiresAt is when the token expires, if GitHub reports it.
 	ExpiresAt *time.Time `json:"expires_at,omitempty"`
 	Error     string     `json:"error,omitempty"`
-	// CreateURL opens GitHub's token form with Mosso's permissions.
-	CreateURL string `json:"create_url"`
+	// Kind is "classic" for a classic token, which reaches every
+	// repository the account can, or "fine-grained", which reaches one
+	// resource owner's (one account or organization).
+	Kind string `json:"kind,omitempty"`
+	// CreateURL opens GitHub's fine-grained token form with Mosso's
+	// permissions; ClassicURL the classic one with the repo scope.
+	CreateURL  string `json:"create_url"`
+	ClassicURL string `json:"classic_url"`
 	// Storage is where a token saved with POST /github/auth goes:
 	// "keychain", or "memory" (until Mosso stops) without a Keychain.
 	Storage string `json:"storage"`
 }
 
 func (s *Server) authStatus(gh *github.Client, source string, user *github.User, err error) githubAuth {
-	st := githubAuth{Configured: gh != nil, Source: source, CreateURL: github.NewTokenURL, Storage: "keychain"}
+	st := githubAuth{Configured: gh != nil, Source: source, CreateURL: github.NewTokenURL, ClassicURL: github.NewClassicTokenURL, Storage: "keychain"}
 	if !keychain.Available() {
 		st.Storage = github.SourceMemory
 	}
@@ -240,8 +246,28 @@ func (s *Server) authStatus(gh *github.Client, source string, user *github.User,
 		if t := gh.TokenExpiration(); !t.IsZero() {
 			st.ExpiresAt = &t
 		}
+		st.Kind = "fine-grained"
+		if gh.Token().Classic() {
+			st.Kind = "classic"
+		}
+		if msg := missingRepoScope(gh); msg != "" && st.Error == "" {
+			st.Error = msg
+		}
 	}
 	return st
+}
+
+// missingRepoScope explains why a classic token cannot work, once GitHub
+// has reported its scopes: without repo it cannot reach private
+// repositories or push. It returns "" otherwise.
+func missingRepoScope(gh *github.Client) string {
+	if !gh.Token().Classic() {
+		return ""
+	}
+	if scopes, ok := gh.Scopes(); ok && !slices.Contains(scopes, "repo") {
+		return "this classic token lacks the repo scope, which Mosso needs to clone, push and open pull requests: generate one with the classic token link (repo is preselected)"
+	}
+	return ""
 }
 
 // githubAuthStatus reports whether a GitHub token is configured and which
@@ -282,6 +308,10 @@ func (s *Server) githubConnect(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeError(w, http.StatusBadGateway, "could not check the token with GitHub: "+err.Error())
+		return
+	}
+	if msg := missingRepoScope(gh); msg != "" {
+		writeError(w, http.StatusUnprocessableEntity, "GitHub accepted the token, but "+msg+".")
 		return
 	}
 	source := github.SourceKeychain
