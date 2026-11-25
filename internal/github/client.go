@@ -19,6 +19,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -68,7 +69,7 @@ type Client struct {
 	mu         sync.Mutex
 	expiration time.Time // from the last response, if GitHub sent it
 	// scopes are a classic token's OAuth scopes from the last response;
-	// scopesKnown is false until GitHub reports them (never for
+	// scopesKnown is whether that response reported them (never for
 	// fine-grained tokens).
 	scopes      []string
 	scopesKnown bool
@@ -83,12 +84,32 @@ func (c *Client) TokenExpiration() time.Time {
 }
 
 // Scopes returns a classic token's OAuth scopes, as reported by GitHub on
-// the last API response, and false if GitHub did not report any (it never
-// does for fine-grained tokens).
+// the last API response, and false if that response did not report them
+// (GitHub never does for fine-grained tokens).
 func (c *Client) Scopes() ([]string, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.scopes, c.scopesKnown
+}
+
+// CheckScopes returns an error unless the client's token can do what Mosso
+// needs, judging by the last API response; call it after a successful
+// request such as User. A fine-grained token's permissions are not
+// reported, so it passes. A classic token needs the repo scope, and fails
+// closed: if GitHub did not report its scopes, the scope cannot be
+// verified and it is refused.
+func (c *Client) CheckScopes() error {
+	if !c.token.Classic() {
+		return nil
+	}
+	scopes, known := c.Scopes()
+	switch {
+	case !known:
+		return errors.New("GitHub did not report this classic token's scopes, so Mosso cannot verify that it has the repo scope it needs; try again, or use a fine-grained token")
+	case !slices.Contains(scopes, "repo"):
+		return errors.New("this classic token lacks the repo scope, which Mosso needs to clone, push and open pull requests: generate one with the classic token link (repo is preselected)")
+	}
+	return nil
 }
 
 // parseExpiration reads GitHub's github-authentication-token-expiration
@@ -585,18 +606,19 @@ func (c *Client) do(ctx context.Context, method, path string, in, out any) error
 			c.mu.Unlock()
 		}
 	}
-	// Present, possibly empty, for classic tokens only.
-	if v, ok := resp.Header[http.CanonicalHeaderKey("X-OAuth-Scopes")]; ok {
-		var scopes []string
-		for _, s := range strings.Split(strings.Join(v, ","), ",") {
-			if s = strings.TrimSpace(s); s != "" {
-				scopes = append(scopes, s)
-			}
+	// Present, possibly empty, for classic tokens only. Every response
+	// replaces what the previous one reported, so a missing header is
+	// never mistaken for scopes an earlier response had.
+	v, scopesKnown := resp.Header[http.CanonicalHeaderKey("X-OAuth-Scopes")]
+	var scopes []string
+	for _, s := range strings.Split(strings.Join(v, ","), ",") {
+		if s = strings.TrimSpace(s); s != "" {
+			scopes = append(scopes, s)
 		}
-		c.mu.Lock()
-		c.scopes, c.scopesKnown = scopes, true
-		c.mu.Unlock()
 	}
+	c.mu.Lock()
+	c.scopes, c.scopesKnown = scopes, scopesKnown
+	c.mu.Unlock()
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		return c.apiError(resp)
 	}

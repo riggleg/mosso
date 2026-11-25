@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"regexp"
 	"strings"
@@ -144,13 +143,4 @@ func SaveToken(ctx context.Context, tok Token) error {
 		return errors.New("malformed GitHub token")
 	}
 	return writeKeychain(ctx, tok.Reveal())
-}
-
-// StoreInKeychain saves a token in the login Keychain, replacing any
-// existing one. `security` prompts for it without echoing.
-func StoreInKeychain(ctx context.Context, stdin io.Reader, stdout, stderr io.Writer) error {
-	if !keychain.Available() {
-		return fmt.Errorf("the macOS Keychain is only available on macOS; set %s in the server's environment instead", EnvToken)
-	}
-	return keychain.Store(ctx, KeychainAccount, keychainLabel, stdin, stdout, stderr)
 }

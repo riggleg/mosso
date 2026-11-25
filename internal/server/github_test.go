@@ -143,22 +143,33 @@ func TestGitHubConnectStoresInKeychain(t *testing.T) {
 func TestGitHubConnectClassicToken(t *testing.T) {
 	const classic = "ghp_CLASSICtoken0000000000000000000000"
 	srv, _ := newTestServer(t)
-	api := &fakeGitHubAPI{token: classic, scopes: "public_repo, read:org"}
+	const previous = "github_pat_11PREVIOUS_workingtoken0"
+	api := &fakeGitHubAPI{token: classic}
 	withGitHub(t, srv, api)
 	srv.githubClient = srv.loadGitHubClient
-	srv.saveGitHubToken = func(context.Context, github.Token) error { return github.ErrNoKeychain }
+	saved := 0
+	srv.saveGitHubToken = func(context.Context, github.Token) error { saved++; return github.ErrNoKeychain }
+	srv.memoryToken = previous
 	h := srv.Handler()
 
-	rec := do(t, h, http.MethodPost, "/github/auth", `{"token":"`+classic+`"}`)
-	if rec.Code != http.StatusUnprocessableEntity || !strings.Contains(rec.Body.String(), "lacks the repo scope") ||
-		strings.Contains(rec.Body.String(), classic) || srv.memoryToken != "" {
-		t.Fatalf("without repo: status = %d: %s", rec.Code, rec.Body)
+	// Refused, and the previous token kept: without an X-OAuth-Scopes
+	// header the repo scope cannot be verified (fail closed), and with
+	// one that lacks repo it is missing.
+	for scopes, want := range map[string]string{"": "cannot verify", "public_repo, read:org": "lacks the repo scope"} {
+		api.mu.Lock()
+		api.scopes = scopes
+		api.mu.Unlock()
+		rec := do(t, h, http.MethodPost, "/github/auth", `{"token":"`+classic+`"}`)
+		if rec.Code != http.StatusUnprocessableEntity || !strings.Contains(rec.Body.String(), want) ||
+			strings.Contains(rec.Body.String(), classic) || saved != 0 || srv.memoryToken != previous {
+			t.Fatalf("scopes %q: status = %d: %s", scopes, rec.Code, rec.Body)
+		}
 	}
 
 	api.mu.Lock()
 	api.scopes = "read:org, repo"
 	api.mu.Unlock()
-	rec = do(t, h, http.MethodPost, "/github/auth", `{"token":"`+classic+`"}`)
+	rec := do(t, h, http.MethodPost, "/github/auth", `{"token":"`+classic+`"}`)
 	st := authOf(t, rec.Body.Bytes())
 	if rec.Code != http.StatusOK || st.Kind != "classic" || st.Login != "octo" || st.Error != "" ||
 		st.ClassicURL != github.NewClassicTokenURL {

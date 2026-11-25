@@ -7,11 +7,11 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
-	"slices"
 
 	"github.com/riggleg/mosso/internal/claude"
 	"github.com/riggleg/mosso/internal/github"
 	"github.com/riggleg/mosso/internal/keychain"
+	"golang.org/x/term"
 )
 
 const authUsage = "usage: mosso auth claude|github"
@@ -63,8 +63,9 @@ func authClaude(ctx context.Context) error {
 	return nil
 }
 
-// authGitHub stores a GitHub personal access token in the macOS Keychain
-// and checks that it works.
+// authGitHub reads a GitHub personal access token from the terminal,
+// checks it with GitHub and only then stores it in the macOS Keychain, so a
+// token GitHub rejects never replaces a working one.
 func authGitHub(ctx context.Context) error {
 	if runtime.GOOS != "darwin" {
 		return fmt.Errorf("the macOS Keychain is not available on %s: export %s in the environment that starts Mosso", runtime.GOOS, github.EnvToken)
@@ -79,25 +80,42 @@ func authGitHub(ctx context.Context) error {
 	fmt.Println("  " + github.NewClassicTokenURL)
 	fmt.Println("(You can also paste the token into Connect GitHub in the Mosso web UI instead.)")
 	fmt.Println()
-	fmt.Printf("Step 2/2: paste the token at both prompts below (input is hidden). It is saved in your login Keychain as service %q, account %q.\n",
+	fmt.Printf("Step 2/2: paste the token below (input is hidden). Once GitHub accepts it, it is saved in your login Keychain as service %q, account %q.\n",
 		keychain.Service, github.KeychainAccount)
-	if err := github.StoreInKeychain(ctx, os.Stdin, os.Stdout, os.Stderr); err != nil {
+	fmt.Print("Token: ")
+	// The token is read without echo; it never reaches arguments or history.
+	raw, err := term.ReadPassword(int(os.Stdin.Fd()))
+	fmt.Println()
+	if err != nil {
+		return fmt.Errorf("read the token: %w", err)
+	}
+	user, err := saveCheckedGitHubToken(ctx, string(raw), github.NewClient, github.SaveToken)
+	if err != nil {
 		return err
-	}
-	tok, _, err := github.LoadToken(ctx)
-	if err != nil {
-		return fmt.Errorf("the stored token is not usable: %w", err)
-	}
-	gh := github.NewClient(tok)
-	user, err := gh.User(ctx)
-	if err != nil {
-		return fmt.Errorf("the token was stored but GitHub rejected it: %w", err)
-	}
-	if tok.Classic() {
-		if scopes, ok := gh.Scopes(); ok && !slices.Contains(scopes, "repo") {
-			return errors.New("the token was stored, but this classic token lacks the repo scope Mosso needs: create one with the classic token link and run this again")
-		}
 	}
 	fmt.Printf("Token stored for GitHub user %s. Running Mosso servers pick it up on the next request; no restart needed.\n", user.Login)
 	return nil
+}
+
+// saveCheckedGitHubToken checks a pasted token with GitHub (it must
+// authenticate, and a classic token must have the repo scope) and saves it
+// only if it passes. On any failure the stored token is left as it was.
+func saveCheckedGitHubToken(ctx context.Context, raw string, newClient func(github.Token) *github.Client,
+	save func(context.Context, github.Token) error) (*github.User, error) {
+	tok, err := github.ParseToken(raw)
+	if err != nil {
+		return nil, err
+	}
+	gh := newClient(tok)
+	user, err := gh.User(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("GitHub rejected the token, so it was not saved: %w", err)
+	}
+	if err := gh.CheckScopes(); err != nil {
+		return nil, fmt.Errorf("the token was not saved: %w", err)
+	}
+	if err := save(ctx, tok); err != nil {
+		return nil, fmt.Errorf("GitHub accepted the token, but it could not be saved: %w", err)
+	}
+	return user, nil
 }

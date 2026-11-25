@@ -250,24 +250,11 @@ func (s *Server) authStatus(gh *github.Client, source string, user *github.User,
 		if gh.Token().Classic() {
 			st.Kind = "classic"
 		}
-		if msg := missingRepoScope(gh); msg != "" && st.Error == "" {
-			st.Error = msg
+		if err := gh.CheckScopes(); err != nil && st.Error == "" {
+			st.Error = err.Error()
 		}
 	}
 	return st
-}
-
-// missingRepoScope explains why a classic token cannot work, once GitHub
-// has reported its scopes: without repo it cannot reach private
-// repositories or push. It returns "" otherwise.
-func missingRepoScope(gh *github.Client) string {
-	if !gh.Token().Classic() {
-		return ""
-	}
-	if scopes, ok := gh.Scopes(); ok && !slices.Contains(scopes, "repo") {
-		return "this classic token lacks the repo scope, which Mosso needs to clone, push and open pull requests: generate one with the classic token link (repo is preselected)"
-	}
-	return ""
 }
 
 // githubAuthStatus reports whether a GitHub token is configured and which
@@ -310,8 +297,10 @@ func (s *Server) githubConnect(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadGateway, "could not check the token with GitHub: "+err.Error())
 		return
 	}
-	if msg := missingRepoScope(gh); msg != "" {
-		writeError(w, http.StatusUnprocessableEntity, "GitHub accepted the token, but "+msg+".")
+	// Fails closed: a classic token whose repo scope cannot be verified
+	// is not saved.
+	if err := gh.CheckScopes(); err != nil {
+		writeError(w, http.StatusUnprocessableEntity, "the token was not saved: "+err.Error())
 		return
 	}
 	source := github.SourceKeychain

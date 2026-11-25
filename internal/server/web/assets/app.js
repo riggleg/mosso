@@ -163,7 +163,7 @@ async function loadChecks() {
   state.settings = settings;
   const ghOK = github.configured && !github.error;
   let ghDetail = !github.configured ? "not connected" : github.login ? "@" + github.login : "token problem";
-  if (ghOK && github.kind === "classic") ghDetail += " · all repos";
+  if (ghOK && github.kind === "classic") ghDetail += " · broad access";
   const days = github.expires_at ? Math.floor((new Date(github.expires_at).getTime() - Date.now()) / 86400000) : null;
   if (ghOK && days !== null && days < 14) ghDetail += days < 0 ? " · expired" : ` · expires in ${days}d`;
   const ghButton = h("button", { type: "button", class: "small check-action", text: github.configured ? "Replace" : "Connect", onclick: openGitHub });
@@ -194,7 +194,7 @@ function openGitHub() {
   const current = $("github-current");
   if (gh.configured) {
     const where = { keychain: "the macOS Keychain", env: "MOSSO_GITHUB_TOKEN", memory: "memory, until Mosso stops" }[gh.source] || gh.source;
-    const kind = { classic: "classic token (all your repositories)", "fine-grained": "fine-grained token" }[gh.kind] || "token";
+    const kind = { classic: "classic token (broad access, within your organizations' policies)", "fine-grained": "fine-grained token" }[gh.kind] || "token";
     let text = gh.login ? `Connected as @${gh.login}, with a ${kind} from ${where}.` : `A token is configured (${where}), but GitHub reports a problem: ${gh.error || "unknown"}.`;
     if (gh.expires_at) text += ` It expires on ${new Date(gh.expires_at).toLocaleDateString()}.`;
     current.textContent = text + " A new token replaces it for every workspace, without a restart.";

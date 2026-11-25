@@ -75,7 +75,9 @@ the page right away. Mosso never logs it or returns it. If your browser
 offers to save it as a password, decline.
 
 From a terminal instead: `go run ./cmd/mosso auth github` prints the same
-link and stores the token in the Keychain with hidden prompts. By hand:
+links, reads the token without echoing it, checks it with GitHub (and a
+classic token's `repo` scope) and only then stores it in the Keychain, so a
+rejected token never replaces a working one. By hand:
 `security add-generic-password -U -s mosso -a github-token -w`.
 
 ### Classic token: repositories of several owners
@@ -85,14 +87,18 @@ link and stores the token in the Keychain with hidden prompts. By hand:
    with only the **repo** scope selected. Choose an expiration.
 2. Do not add **workflow** (see below) or any other scope; Mosso uses none.
 3. Click **Generate token**, then paste it into Mosso like a fine-grained
-   one. Mosso checks the token's scopes and refuses one without `repo`.
+   one. Mosso checks the token's scopes and refuses one without `repo`. It
+   fails closed: if GitHub does not report a classic token's scopes, the
+   token is refused too, since `repo` cannot be verified.
 4. If an organization enforces SAML single sign-on, click **Configure SSO**
    next to the token on GitHub and **Authorize** it for that organization;
    until then GitHub refuses the organization's repositories. An
    organization may also forbid classic tokens altogether: then use a
    fine-grained token with it as the resource owner.
 
-The sidebar shows *@login · all repos* for a classic token. Fetches and
+The sidebar shows *@login · broad access* for a classic token: it reaches
+every repository the account can, except where an organization's policies
+or SSO restrict it. Fetches and
 pushes still run on the Mosso server; the sandbox never gets the token.
 
 ### Optional permissions
@@ -295,6 +301,7 @@ of uncompressed new content checked for credentials, and 64 MiB per sync.
 | *the GitHub token is invalid, expired or revoked* | Create a new token with the link and click **Replace**. No restart needed. |
 | *the GitHub token lacks access: give it this repository…* | The repository is not under the token's *Repository access*, or *Contents* / *Pull requests* is not *Read and write*. Edit the token on GitHub (*Settings → Developer settings → Fine-grained tokens*) or create a new one. Organizations may need to approve the token. A fine-grained token only reaches its resource owner's repositories: for another account's or organization's, use a [classic token](#classic-token-repositories-of-several-owners). |
 | *this classic token lacks the repo scope* | Create a classic token with the link (only `repo` is preselected) and click **Replace**. |
+| *GitHub did not report this classic token's scopes* | Mosso could not verify the `repo` scope, so it refused the token. Try again; if it persists, use a fine-grained token. |
 | *Resource protected by organization SAML enforcement* | Authorize the classic token for the organization: *Configure SSO → Authorize* next to it on GitHub. |
 | *repository … was not found, or the GitHub token cannot access it* | Wrong `owner/repo`, or the token does not include the repository (GitHub answers 404 for private repositories a token cannot see), for example because it belongs to another owner than a fine-grained token's. |
 | *GitHub refused the push because it changes files in .github/workflows* | Expected without the Workflows permission. Ask Claude to drop those changes, or push them yourself. |
